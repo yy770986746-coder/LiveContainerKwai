@@ -351,63 +351,122 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     setenv("LC_GLOBAL_TWEAKS_FOLDER", tweakFolder.UTF8String, 1);
 
-    // ===== 设备伪装：按容器生成参数，写入环境变量 =====
+    // ===== 设备伪装：按容器生成完整设备指纹（参数自洽）=====
     {
-        // 用容器路径做种子（同一容器永远一致）
         NSString *seedSrc = [NSString stringWithFormat:@"%@|%@", docPath, guestAppInfo[@"LCDataUUID"] ?: @""];
         unsigned long long h = 5381;
         for (NSUInteger i = 0; i < seedSrc.length; i++)
             h = ((h << 5) + h) + [seedSrc characterAtIndex:i];
 
-        // 可选机型池（与 iOS 版本无关，统一用 iOS 15+ 机型）
-        static const struct { const char *m; const char *p; const char *b; int c; long long mem; } pool[] = {
-            {"iPhone14,5","iPhone 13","D17AP",6,4LL*1024*1024*1024},
-            {"iPhone14,7","iPhone 14","D27AP",6,4LL*1024*1024*1024},
-            {"iPhone14,8","iPhone 14 Plus","D28AP",6,6LL*1024*1024*1024},
-            {"iPhone15,2","iPhone 14 Pro","D73AP",6,6LL*1024*1024*1024},
-            {"iPhone15,3","iPhone 14 Pro Max","D74AP",6,6LL*1024*1024*1024},
+        // 完整机型表：所有参数互相匹配
+        typedef struct {
+            const char *machine;   // hw.machine / hw.model
+            const char *product;   // hw.product
+            const char *board;     // hw.target
+            int ncpu;              // CPU 核数
+            long long mem;         // 内存字节
+            int socId;             // 芯片代号
+            int freqMHz;           // CPU 频率
+            int screenW, screenH;  // 逻辑分辨率
+            float scale;           // 缩放
+            float dpi;             // PPI
+            int batteryMAh;        // 电池容量
+            int minIOS;            // 最低支持 iOS
+            int archE;             // 1=arm64e 0=arm64
+        } LCDeviceProfile;
+
+        static const LCDeviceProfile pool[] = {
+            // iPhone 13 系列
+            {"iPhone14,5","iPhone 13","D17AP",6,4LL*1024*1024*1024,0x8101,3200,390,844,3.0f,460.0f,3240,15,1},
+            {"iPhone14,4","iPhone 13 mini","D16AP",6,4LL*1024*1024*1024,0x8101,3200,375,812,3.0f,476.0f,2406,15,1},
+            {"iPhone14,2","iPhone 13 Pro","D63AP",6,6LL*1024*1024*1024,0x8101,3200,390,844,3.0f,460.0f,3095,15,1},
+            {"iPhone14,3","iPhone 13 Pro Max","D64AP",6,6LL*1024*1024*1024,0x8101,3200,428,926,3.0f,458.0f,4352,15,1},
+            // iPhone 14 系列
+            {"iPhone14,7","iPhone 14","D27AP",6,6LL*1024*1024*1024,0x8110,3200,390,844,3.0f,460.0f,3279,16,1},
+            {"iPhone14,8","iPhone 14 Plus","D28AP",6,6LL*1024*1024*1024,0x8110,3200,428,926,3.0f,458.0f,4325,16,1},
+            {"iPhone15,2","iPhone 14 Pro","D73AP",6,6LL*1024*1024*1024,0x8110,3200,393,852,3.0f,460.0f,3200,16,1},
+            {"iPhone15,3","iPhone 14 Pro Max","D74AP",6,6LL*1024*1024*1024,0x8110,3200,430,932,3.0f,460.0f,4323,16,1},
+            // iPhone 15 系列
+            {"iPhone15,4","iPhone 15","D37AP",6,6LL*1024*1024*1024,0x8120,3200,393,852,3.0f,460.0f,3349,17,1},
+            {"iPhone15,5","iPhone 15 Plus","D38AP",6,6LL*1024*1024*1024,0x8120,3200,430,932,3.0f,460.0f,4383,17,1},
+            {"iPhone16,1","iPhone 15 Pro","D83AP",6,8LL*1024*1024*1024,0x8120,3780,393,852,3.0f,460.0f,3274,17,1},
+            {"iPhone16,2","iPhone 15 Pro Max","D84AP",6,8LL*1024*1024*1024,0x8120,3780,430,932,3.0f,460.0f,4441,17,1},
         };
         int n = (int)(sizeof(pool)/sizeof(pool[0]));
-        int idx = (int)(h % n);
-        const char *model = pool[idx].m;
-        const char *prod  = pool[idx].p;
-        const char *board = pool[idx].b;
-        int ncpu = pool[idx].c;
-        long long mem = pool[idx].mem;
+        const LCDeviceProfile *d = &pool[h % n];
 
-        // 序列号（12 位）
+        // ---- 序列号（12位，苹果格式，真实前缀）----
         static const char cs[] = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
-        char sn[13]; unsigned long long s = h ^ 0xA5A5A5A5ULL;
-        for (int i = 0; i < 12; i++) { s = s*6364136223846793005ULL + 1442695040888963407ULL; sn[i] = cs[(s>>33)%34]; }
+        const char *snPrefix = "RM";   // 常见前缀
+        char sn[16];
+        unsigned long long s1 = h ^ 0x9E3779B9ULL;
+        sn[0] = snPrefix[0]; sn[1] = snPrefix[1];
+        for (int i = 2; i < 12; i++) { s1 = s1*6364136223846793005ULL + 1442695040888963407ULL; sn[i] = cs[(s1>>33)%34]; }
         sn[12] = 0;
 
-        // 硬件 UUID
-        char uu[40]; unsigned long long u = h ^ 0x5A5A5A5AULL;
+        // ---- 硬件 UUID（IOPlatformUUID）----
+        char uu[40]; unsigned long long u1 = h ^ 0x5A5A5A5AULL;
         unsigned char ub[16];
-        for (int i = 0; i < 16; i++) { u = u*6364136223846793005ULL + 1442695040888963407ULL; ub[i] = (unsigned char)(u>>33); }
+        for (int i = 0; i < 16; i++) { u1 = u1*6364136223846793005ULL + 1442695040888963407ULL; ub[i] = (unsigned char)(u1>>33); }
         ub[6] = (ub[6] & 0x0F) | 0x40; ub[8] = (ub[8] & 0x3F) | 0x80;
         snprintf(uu, sizeof(uu), "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
                  ub[0],ub[1],ub[2],ub[3],ub[4],ub[5],ub[6],ub[7],ub[8],ub[9],ub[10],ub[11],ub[12],ub[13],ub[14],ub[15]);
 
-        // IDFV
-        unsigned long long v = h ^ 0x3C3C3C3CULL;
+        // ---- IDFV ----
+        unsigned long long v1 = h ^ 0x3C3C3C3CULL;
         unsigned char vb[16];
-        for (int i = 0; i < 16; i++) { v = v*6364136223846793005ULL + 1442695040888963407ULL; vb[i] = (unsigned char)(v>>33); }
+        for (int i = 0; i < 16; i++) { v1 = v1*6364136223846793005ULL + 1442695040888963407ULL; vb[i] = (unsigned char)(v1>>33); }
         vb[6] = (vb[6] & 0x0F) | 0x40; vb[8] = (vb[8] & 0x3F) | 0x80;
         char idfv[40];
         snprintf(idfv, sizeof(idfv), "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
                  vb[0],vb[1],vb[2],vb[3],vb[4],vb[5],vb[6],vb[7],vb[8],vb[9],vb[10],vb[11],vb[12],vb[13],vb[14],vb[15]);
 
-        setenv("LC_SPOOF_MODEL",   model, 1);
-        setenv("LC_SPOOF_PRODUCT", prod,  1);
-        setenv("LC_SPOOF_BOARD",   board, 1);
-        setenv("LC_SPOOF_SERIAL",  sn,    1);
-        setenv("LC_SPOOF_UUID",    uu,    1);
-        setenv("LC_SPOOF_IDFV",    idfv,  1);
-        char tmp[32];
-        snprintf(tmp, sizeof(tmp), "%d", ncpu); setenv("LC_SPOOF_NCPU", tmp, 1);
-        snprintf(tmp, sizeof(tmp), "%lld", mem); setenv("LC_SPOOF_MEM", tmp, 1);
-        NSLog(@"[LC-SPOOF] %s / %s / sn=%s", model, prod, sn);
+        // ---- IDFA ----
+        unsigned long long w1 = h ^ 0x7F7F7F7FULL;
+        unsigned char wb[16];
+        for (int i = 0; i < 16; i++) { w1 = w1*6364136223846793005ULL + 1442695040888963407ULL; wb[i] = (unsigned char)(w1>>33); }
+        wb[6] = (wb[6] & 0x0F) | 0x40; wb[8] = (wb[8] & 0x3F) | 0x80;
+        char idfa[40];
+        snprintf(idfa, sizeof(idfa), "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                 wb[0],wb[1],wb[2],wb[3],wb[4],wb[5],wb[6],wb[7],wb[8],wb[9],wb[10],wb[11],wb[12],wb[13],wb[14],wb[15]);
+
+        // ---- 设备名（"iPhone" 或 "张三的 iPhone"）----
+        char devName[64];
+        snprintf(devName, sizeof(devName), "iPhone");
+
+        // ---- 写入环境变量 ----
+        setenv("LC_SPOOF_MODEL",   d->machine, 1);
+        setenv("LC_SPOOF_PRODUCT", d->product, 1);
+        setenv("LC_SPOOF_BOARD",   d->board,   1);
+        setenv("LC_SPOOF_SERIAL",  sn,         1);
+        setenv("LC_SPOOF_UUID",    uu,         1);
+        setenv("LC_SPOOF_IDFV",    idfv,       1);
+        setenv("LC_SPOOF_IDFA",    idfa,       1);
+        setenv("LC_SPOOF_NAME",    devName,    1);
+        char tmp[64];
+        snprintf(tmp,sizeof(tmp),"%d",d->ncpu);      setenv("LC_SPOOF_NCPU", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%lld",d->mem);     setenv("LC_SPOOF_MEM", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->socId);     setenv("LC_SPOOF_SOC", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->freqMHz);   setenv("LC_SPOOF_FREQ", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->screenW);   setenv("LC_SPOOF_SCR_W", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->screenH);   setenv("LC_SPOOF_SCR_H", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->batteryMAh);setenv("LC_SPOOF_BATT", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->archE);     setenv("LC_SPOOF_ARME", tmp, 1);
+        snprintf(tmp,sizeof(tmp),"%d",d->minIOS);    setenv("LC_SPOOF_MINIOS", tmp, 1);
+
+        // ---- 进程伪装：让 guest 以为自己是原生安装 ----
+        {
+            NSString *appName = appBundle.bundlePath.lastPathComponent;   // com_kwai_gif.app
+            NSString *fakeBundlePath = [NSString stringWithFormat:@"/var/containers/Bundle/Application/%@/%@",
+                                        [[NSUUID UUID] UUIDString], appName];
+            setenv("LC_SPOOF_BUNDLE", fakeBundlePath.UTF8String, 1);
+            setenv("LC_SPOOF_EXEC", [fakeBundlePath stringByAppendingPathComponent:appBundle.executablePath.lastPathComponent].UTF8String, 1);
+            setenv("LC_SPOOF_PROCID", appBundle.bundleIdentifier.UTF8String, 1);
+        }
+
+        NSLog(@"[LC-SPOOF] %s | %s | %s | sn=%s soc=0x%X %dMHz %dx%d@%dx batt=%dmAh",
+              d->machine, d->product, d->board, sn, d->socId, d->freqMHz,
+              d->screenW, d->screenH, (int)d->scale, d->batteryMAh);
     }
 
 

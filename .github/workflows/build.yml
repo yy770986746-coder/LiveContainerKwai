@@ -7,54 +7,72 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
-    timeout-minutes: 60
+    runs-on: macos-15
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Setup
+      - name: Select Xcode 16
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app 2>/dev/null || sudo xcode-select -s /Applications/Xcode.app
+          ls /Applications | grep -i xcode
+          sudo xcode-select -s /Applications/Xcode_16.1.app 2>/dev/null || \
+          sudo xcode-select -s /Applications/Xcode_16.0.app 2>/dev/null || \
+          sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
-          brew install ldid xz
 
-      - name: Build LiveContainer
+      - name: Install tools
         run: |
+          brew install ldid xz || true
+
+      - name: Resolve packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project LiveContainer.xcodeproj \
+            -scheme LiveContainer 2>&1 | tail -20 || true
+
+      - name: Build
+        run: |
+          set -o pipefail
           xcodebuild \
             -project LiveContainer.xcodeproj \
             -scheme LiveContainer \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath ./build \
-            -archivePath ./build/LiveContainer.xcarchive \
+            -archivePath ./build/LC.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            archive 2>&1 | tail -60
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            archive \
+            2>&1 | tail -80
 
-      - name: Locate archive
+      - name: Locate
         run: |
-          find ./build -name "*.xcarchive" -type d
-          find ./build -name "LiveContainer.app" -type d
+          echo "=== archive ==="
+          find ./build -name "*.xcarchive" -type d 2>/dev/null
+          echo "=== app ==="
+          find ./build -name "LiveContainer.app" -type d 2>/dev/null
 
-      - name: Package IPA
+      - name: Package
+        if: success()
         run: |
           APP=$(find ./build -path "*.xcarchive/Products/Applications/LiveContainer.app" -type d | head -1)
           if [ -z "$APP" ]; then
             APP=$(find ./build -name "LiveContainer.app" -type d | head -1)
           fi
           echo "APP=$APP"
+          if [ -z "$APP" ]; then echo "::error::App not found"; exit 1; fi
           mkdir -p Payload
           cp -R "$APP" Payload/
-          # 基础签名
-          find Payload -name "*.dylib" -exec ldid -S {} \; 2>/dev/null || true
-          ldid -S Payload/LiveContainer.app/LiveContainer 2>/dev/null || true
           zip -qr LiveContainer_Patched.ipa Payload
           ls -la LiveContainer_Patched.ipa
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: LiveContainer-Patched
           path: LiveContainer_Patched.ipa
