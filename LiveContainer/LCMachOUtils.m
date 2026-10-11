@@ -152,12 +152,26 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
             struct segment_command_64* seglc = (struct segment_command_64*)command;
             loadCommandSegCount++;
             if (strcmp("__TEXT", seglc->segname) == 0) {
+                // 修复 #1: 优先 __text；若不存在（如快手 14.8.40），
+                // 用「__TEXT 段内第一个 section 的最小 offset」
+                uint32_t minOffset = 0;
+                uint32_t textOffset = 0;
                 for (uint32_t j = 0; j < seglc->nsects; j++) {
                     struct section_64* sect = (struct section_64*)(((void*)command + sizeof(struct segment_command_64) + sizeof(struct section_64) * j));
                     if (0 == strcmp("__text", sect->sectname)) {
-                        textSectionOffest = sect->offset;
+                        textOffset = sect->offset;
+                    }
+                    // 只考虑有实际文件内容的 section（offset > 0）
+                    if (sect->offset > 0) {
+                        if (minOffset == 0 || sect->offset < minOffset) {
+                            minOffset = sect->offset;
+                        }
                     }
                 }
+                // 优先 __text；没有就用最小 offset
+                textSectionOffest = (textOffset > 0) ? textOffset : minOffset;
+                NSLog(@"[LCPatch] __TEXT: __text=%u minSection=%u -> using=%u",
+                      textOffset, minOffset, textSectionOffest);
             }
         } else if (command->cmd == LC_CODE_SIGNATURE) {
             codeSignatureCommandFound = true;
