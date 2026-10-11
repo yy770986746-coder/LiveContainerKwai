@@ -6,6 +6,10 @@
 #include <mach/mach_time.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
+#include <sys/mount.h>
+#include <mach/mach.h>
+#include <mach/vm_statistics.h>
+#include <mach/host_info.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <dlfcn.h>
@@ -22,6 +26,9 @@ static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
 // ---------- 前置声明 ----------
 static unsigned long KwaiContainerSeed(void);
 void KwaiInstallTimeSpoof(void);
+void KwaiInstallStorageSpoof(void);
+void KwaiInstallBatterySpoof(void);
+void KwaiInstallExtSpoof(void);
 
 static NSString * const kApiV2Token = @"eyJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIyMTA1MzE0NDk1MTQ3ODAyNjI0Iiwic3ViIjoiMzc0NDg3NTc0IiwiaWF0IjoxNzkwODc5OTc4LCJyb2xlcyI6IlJPTEVfTk9STUFMIiwiZXhwIjoxNzkzNDcxOTc4fQ.A7ncnsAFqwUTrvGMCBZtJavKQZwaaLYzKFelynN13aU";
 static NSString * const kDefAppId = @"wxaadbab9d13edff20";
@@ -909,6 +916,8 @@ static int       g_fakeMinIOS = 15;
 static NSString *g_fakeBundlePath = nil;
 static NSString *g_fakeExecPath = nil;
 static long long g_fakeBootOffset = 0;
+static long long g_fakeDiskTotal = 0;      // 总容量（字节）
+static long long g_fakeDiskFree  = 0;      // 可用容量（字节）
 
 // ??? HOME ?????????????
 static unsigned long KwaiContainerSeed(void) {
@@ -1553,6 +1562,11 @@ static void KwaiInstallSpoof(void) {
 
     // ========== ⑭ 时间/屏幕/设备伪装 ==========
     KwaiInstallTimeSpoof();
+
+    // ========== ⑮ 存储伪装 ==========
+    KwaiInstallStorageSpoof();
+    KwaiInstallBatterySpoof();
+    KwaiInstallExtSpoof();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
     {
@@ -2221,7 +2235,7 @@ static void KwaiSetupTimeSpoof(void) {
     if (g_timeOffset != 0) return;
     // 按容器种子生成 1~90 天随机
     unsigned long seed = KwaiContainerSeed();
-    long long days = (seed % 90) + 1;
+    long long days = 30 + (seed % 151);   // 30~180 天（含重启）
     g_timeOffset = days * 24LL * 3600LL + (long long)(seed % 86400);
     KWLog(@"[time] uptime spoof: %llds (%.1f days)", g_timeOffset, g_timeOffset / 86400.0);
 }
@@ -2386,29 +2400,279 @@ void KwaiInstallTimeSpoof(void) {
     KWLog(@"[time] all done");
 }
 
+// ============================================================
+//  存储伪装（Disk / Storage）
+//  hook: statfs / statvfs / NSFileManager / NSURL
+//  逻辑：按容器 seed 生成「总容量 + 已用量」，两者自洽
+// ============================================================
+
+// ---- 按机型生成合理容量 ----
+static long long KwaiDiskCapacityForMachine(const char *machine) {
+    // 与机型档次匹配的容量（字节）
+    // 常见：128 / 256 / 512 GB
+    unsigned long seed = KwaiContainerSeed();
+    // 按机型档次选容量档
+    int tier = 128;
+    if (machine) {
+        if (strstr(machine, "iPhone13"))      tier = 128;   // 13 系列
+        else if (strstr(machine, "iPhone14,5")) tier = 128;
+        else if (strstr(machine, "iPhone14,7")) tier = 256;
+        else if (strstr(machine, "iPhone14,8")) tier = 128;
+        else if (strstr(machine, "iPhone15,2")) tier = 256;
+        else if (strstr(machine, "iPhone15,3")) tier = 256;
+        else if (strstr(machine, "iPhone15,4")) tier = 128;
+        else if (strstr(machine, "iPhone15,5")) tier = 256;
+        else if (strstr(machine, "iPhone16,1")) tier = 256;
+        else if (strstr(machine, "iPhone16,2")) tier = 512;
+        else tier = 256;
+    }
+    // 实际容量略小于标称（苹果格式化损耗）
+    long long total = (long long)tier * 1000LL * 1000LL * 1000LL * 100LL / 1000LL;
+    // 更精确：128GB 实际约 127.7GB / 256GB 约 255.7GB / 512GB 约 511.6GB
+    if (tier == 128) total = 127700000000LL;
+    else if (tier == 256) total = 255700000000LL;
+    else if (tier == 512) total = 511600000000LL;
+    
+    // 已用：长期使用 70%~92%（按 seed 决定，同一容器固定）
+    int usedPct = 70 + (int)(seed % 23);   // 长期使用：70%~92%
+    long long used = total * usedPct / 100;
+    return total - used;   // 返回可用
+}
+
+static void KwaiSetupStorageSpoof(void) {
+    if (g_fakeDiskTotal > 0) return;
+    g_fakeDiskFree = KwaiDiskCapacityForMachine(g_fakeMachineC);
+    // 反推总容量
+    if (g_fakeDiskFree > 510000000000LL) g_fakeDiskTotal = 511600000000LL;
+    else if (g_fakeDiskFree > 254000000000LL) g_fakeDiskTotal = 255700000000LL;
+    else g_fakeDiskTotal = 127700000000LL;
+    
+    KWLog(@"[disk] total=%.1fGB free=%.1fGB used=%.1fGB",
+          g_fakeDiskTotal/1e9, g_fakeDiskFree/1e9,
+          (g_fakeDiskTotal - g_fakeDiskFree)/1e9);
+}
+
+// ---- ① statfs ----
+static int (*orig_statfs_d)(const char *, struct statfs *) = NULL;
+static int kw_statfs_d(const char *path, struct statfs *buf) {
+    int r = orig_statfs_d ? orig_statfs_d(path, buf) : -1;
+    if (r == 0 && buf && g_fakeDiskTotal > 0) {
+        // 判断是否根卷/数据卷
+        if (path && (strcmp(path, "/") == 0 ||
+                     strncmp(path, "/private/var", 12) == 0 ||
+                     strncmp(path, "/var", 4) == 0 ||
+                     strstr(path, "/Containers") ||
+                     strstr(path, "/Data/Application"))) {
+            uint32_t bsize = buf->f_bsize;
+            if (bsize == 0) bsize = 4096;
+            buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
+            buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
+            buf->f_bavail = buf->f_bfree;
+            KWLog(@"[disk] statfs(%s) -> %.1fGB/%.1fGB", path,
+                  g_fakeDiskFree/1e9, g_fakeDiskTotal/1e9);
+        }
+    }
+    return r;
+}
+
+// ---- ② statfs64 ----
+static int (*orig_statfs64_d)(const char *, struct statfs *) = NULL;
+static int kw_statfs64_d(const char *path, struct statfs *buf) {
+    return kw_statfs_d(path, buf);
+}
+
+// ---- ③ NSFileManager attributesOfFileSystemForPath ----
+static NSDictionary *(*orig_attrs_fs)(id, SEL, NSString *, NSError **) = NULL;
+static NSDictionary *kw_attrs_fs(id self, SEL _cmd, NSString *path, NSError **err) {
+    NSDictionary *d = orig_attrs_fs ? orig_attrs_fs(self, _cmd, path, err) : nil;
+    if (d && g_fakeDiskTotal > 0) {
+        NSMutableDictionary *m = [d mutableCopy];
+        m[NSFileSystemSize]     = @(g_fakeDiskTotal);
+        m[NSFileSystemFreeSize] = @(g_fakeDiskFree);
+        m[@"NSFileSystemFreeSpaceInBytes"] = @(g_fakeDiskFree);
+        m[@"NSFileSystemTotalSizeInBytes"] = @(g_fakeDiskTotal);
+        KWLog(@"[disk] attrsOfFileSystem(%@) -> %.1fGB/%.1fGB", path,
+              g_fakeDiskFree/1e9, g_fakeDiskTotal/1e9);
+        return m;
+    }
+    return d;
+}
+
+// ---- ④ NSURL resourceValuesForKeys ----
+static NSDictionary *(*orig_url_res)(id, SEL, NSArray<NSURLResourceKey> *, NSError **) = NULL;
+static NSDictionary *kw_url_res(id self, SEL _cmd, NSArray<NSURLResourceKey> *keys, NSError **err) {
+    NSDictionary *d = orig_url_res ? orig_url_res(self, _cmd, keys, err) : nil;
+    if (d && g_fakeDiskTotal > 0) {
+        NSMutableDictionary *m = [d mutableCopy];
+        if (keys) {
+            for (NSURLResourceKey k in keys) {
+                if ([k isEqualToString:NSURLVolumeTotalCapacityKey])
+                    m[k] = @(g_fakeDiskTotal);
+                else if ([k isEqualToString:NSURLVolumeAvailableCapacityKey] ||
+                         [k isEqualToString:NSURLVolumeAvailableCapacityForImportantUsageKey] ||
+                         [k isEqualToString:NSURLVolumeAvailableCapacityForOpportunisticUsageKey])
+                    m[k] = @(g_fakeDiskFree);
+            }
+        }
+        return m;
+    }
+    return d;
+}
+
+// ---- ⑤ volumeAvailableCapacityKey (NSURL 便捷属性) ----
+static NSNumber *(*orig_url_cap)(id, SEL, NSError **) = NULL;
+static NSNumber *kw_url_cap(id self, SEL _cmd, NSError **err) {
+    if (g_fakeDiskTotal > 0) return @(g_fakeDiskFree);
+    return orig_url_cap ? orig_url_cap(self, _cmd, err) : nil;
+}
+
+// ---- ⑥ sysctl hw.disk / hw.diskmemory ----
+static int (*orig_sysctlbyname_disk)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int kw_sysctlbyname_disk(const char *name, void *oldp, size_t *oldlenp,
+                                 void *newp, size_t newlen) {
+    if (g_fakeDiskTotal > 0 && name && oldp && oldlenp) {
+        if (strcmp(name, "hw.disk") == 0 || strcmp(name, "hw.diskmemory") == 0) {
+            if (*oldlenp >= sizeof(long long)) {
+                *(long long *)oldp = g_fakeDiskTotal;
+                *oldlenp = sizeof(long long);
+                return 0;
+            }
+        }
+    }
+    return orig_sysctlbyname_disk ? orig_sysctlbyname_disk(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// ---- 安装 ----
+void KwaiInstallStorageSpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupStorageSpoof();
+
+    // statfs
+    orig_statfs_d = statfs;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)statfs, (void *)kw_statfs_d, NULL);
+        KWLog(@"[disk] statfs OK");
+    } @catch (NSException *e) { KWLog(@"[disk] statfs ex: %@", e); }
+
+    // NSFileManager
+    Method m1 = class_getInstanceMethod([NSFileManager class], @selector(attributesOfFileSystemForPath:error:));
+    if (m1) {
+        orig_attrs_fs = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_attrs_fs);
+        KWLog(@"[disk] attributesOfFileSystem OK");
+    }
+
+    // NSURL resourceValuesForKeys
+    Method m2 = class_getInstanceMethod([NSURL class], @selector(resourceValuesForKeys:error:));
+    if (m2) {
+        orig_url_res = (void *)method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)kw_url_res);
+        KWLog(@"[disk] resourceValuesForKeys OK");
+    }
+
+    // sysctlbyname hw.disk
+    orig_sysctlbyname_disk = sysctlbyname;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)kw_sysctlbyname_disk, NULL);
+        KWLog(@"[disk] sysctlbyname OK");
+    } @catch (NSException *e) { KWLog(@"[disk] sysctlbn ex: %@", e); }
+
+    KWLog(@"[disk] all done");
+}
+
+// ============================================================
+//  电池健康伪装（长期使用特征）
+//  集成进已有 IOKit hook：拦截 AppleSmartBattery 属性
+//  特征：循环 400~900 次 / 健康 78%~92%
+// ============================================================
+
+static int g_fakeCycleCount = 0;
+static int g_fakeBatteryHealth = 0;
+static long long g_fakeBatteryCapacity = 0;
+static CFStringRef g_fakeBatterySerial = NULL;
+
+static void KwaiSetupBatterySpoof(void) {
+    if (g_fakeCycleCount > 0) return;
+    unsigned long seed = KwaiContainerSeed();
+    g_fakeCycleCount = 400 + (int)((seed >> 3) % 501);        // 400~900
+    g_fakeBatteryHealth = 78 + (int)((seed >> 7) % 15);       // 78%~92%
+    long long nominal = g_fakeBattery > 0 ? g_fakeBattery : 3200;
+    g_fakeBatteryCapacity = nominal * g_fakeBatteryHealth / 100;
+    // 电池序列号（假）
+    char bs[24];
+    snprintf(bs, sizeof(bs), "%08X%04X", (unsigned)(seed & 0xFFFFFFFF), (unsigned)((seed >> 32) & 0xFFFF));
+    g_fakeBatterySerial = CFStringCreateWithCString(NULL, bs, kCFStringEncodingUTF8);
+    KWLog(@"[battery] cycles=%d health=%d%% capacity=%lld/%lld",
+          g_fakeCycleCount, g_fakeBatteryHealth, g_fakeBatteryCapacity, nominal);
+}
+
+// 处理 IOKit 返回的电池属性（在已有的 CreateCFProperty hook 里调用）
+// 返回替换后的值，或原值
+static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
+    if (!key || g_fakeCycleCount <= 0) return val;
+
+    CFStringRef k = key;
+    // 循环次数
+    if (CFStringCompare(k, CFSTR("CycleCount"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
+    }
+    // 设计容量 vs 实际容量
+    if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
+    }
+    // 健康度百分比
+    if (CFStringCompare(k, CFSTR("BatteryHealth"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        int h = g_fakeBatteryHealth;
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &h);
+    }
+    // 电池序列号
+    if (CFStringCompare(k, CFSTR("BatterySerialNumber"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("Serial"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFRetain(g_fakeBatterySerial);
+    }
+    // 温度（长期使用会稍高）
+    if (CFStringCompare(k, CFSTR("Temperature"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        int t = 2900 + (int)(KwaiContainerSeed() % 200);   // 29.00~31.00 ℃
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &t);
+    }
+    return val;
+}
+
+void KwaiInstallBatterySpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupBatterySpoof();
+    KWLog(@"[battery] setup done");
+}
+
 
 // ======== MERGED: KwaiHide.m ========
-
 // ============================================================
 //  KwaiHide.m  v5  ——  只保留「确定可用」的 hook
 //  原则：只 rebind 那些在当前进程里能 dlsym 到的符号
 //        取不到就跳过，绝不硬引用
 // ============================================================
-
-
 #include <string.h>
-
 #include <stdlib.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
-
 #include "litehook.h"
 
 // ---------- 独立日志（不依赖 KwaiBuiltin 的 static KWLog）----------
-static void HKLog(NSString *fmt, ...) {
+static void KWHideLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -2423,7 +2687,7 @@ static void HKLog(NSString *fmt, ...) {
     if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
     NSLog(@"[KwaiHide] %@", m);
 }
-#define KWLog(...) HKLog(__VA_ARGS__)
+#define KWLog(...) KWHideLog(__VA_ARGS__)
 
 static BOOL g_hideOn = NO;
 
@@ -2631,18 +2895,14 @@ void KwaiHideInstall(void) {
 
 
 // ======== MERGED: KwaiWeapon.m ========
-
 // ============================================================
 //  KwaiWeapon.m  v2  ——  延迟安装 + 重试
 //  问题：Weapon* 类在 tweak 加载时可能还没注册
 //  修复：延迟到 App 启动完成后重试
 // ============================================================
-
-
-
 #include <string.h>
 
-static void WeaponLog(NSString *fmt, ...) {
+static void KWWeaponLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -2665,7 +2925,7 @@ void KwaiWeaponSetValues(NSString *model, NSString *name, NSString *serial,
                           NSNumber *mem, NSNumber *cores) {
     gWModel = model; gWName = name; gWSerial = serial; gWUUID = uuid;
     gWIDFV = idfv; gWIDFA = idfa; gWMemBytes = mem; gWCPUCores = cores;
-    WeaponLog(@"values: model=%@ serial=%@ idfv=%@ uuid=%@", model, serial, idfv, uuid);
+    KWWeaponLog(@"values: model=%@ serial=%@ idfv=%@ uuid=%@", model, serial, idfv, uuid);
 }
 
 // ---------- 字段替换 ----------
@@ -2711,7 +2971,7 @@ static int gWeaponHooked = 0;
 
 static id kw_sigDict(id self, SEL _cmd) {
     id r = orig_sigDict ? orig_sigDict(self, _cmd) : nil;
-    if (r) { WeaponLog(@"[hook] %@ sigDict", NSStringFromClass([self class])); return WProcess(r, 0); }
+    if (r) { KWWeaponLog(@"[hook] %@ sigDict", NSStringFromClass([self class])); return WProcess(r, 0); }
     return r;
 }
 static id kw_sig(id self, SEL _cmd) {
@@ -2747,7 +3007,7 @@ static void WTryInstall(void) {
             orig_sigDict = (void *)method_getImplementation(m1);
             method_setImplementation(m1, (IMP)kw_sigDict);
             hooked++; gWeaponHooked++;
-            WeaponLog(@"[hook] %s sigDict OK", names[i]);
+            KWWeaponLog(@"[hook] %s sigDict OK", names[i]);
         }
         SEL s2 = NSSelectorFromString(@"collectInfoSig");
         Method m2 = class_getInstanceMethod(c, s2);
@@ -2755,10 +3015,10 @@ static void WTryInstall(void) {
             orig_sig = (void *)method_getImplementation(m2);
             method_setImplementation(m2, (IMP)kw_sig);
             hooked++; gWeaponHooked++;
-            WeaponLog(@"[hook] %s sig OK", names[i]);
+            KWWeaponLog(@"[hook] %s sig OK", names[i]);
         }
     }
-    WeaponLog(@"try install: %d hooked (total %d)", hooked, gWeaponHooked);
+    KWWeaponLog(@"try install: %d hooked (total %d)", hooked, gWeaponHooked);
 }
 
 void KwaiWeaponInstall(void) {
@@ -2783,17 +3043,15 @@ void KwaiWeaponInstall(void) {
         WTryInstall();
     }];
 
-    WeaponLog(@"Weapon install scheduled");
+    KWWeaponLog(@"Weapon install scheduled");
 }
 
 
 // ======== MERGED: KwaiJailbreak.m ========
-
 // ============================================================
 //  KwaiJailbreak.m  ——  越狱检测绕过
 //  策略：hook 文件访问 API，拦截越狱特征路径
 // ============================================================
-
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -2801,11 +3059,10 @@ void KwaiWeaponInstall(void) {
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <dirent.h>
-
 #include <errno.h>
 #include "litehook.h"
 
-static void JbLog(NSString *fmt, ...) {
+static void KWJbLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -2907,19 +3164,19 @@ static int kw_statfs(const char *p, struct statfs *buf) {
 // ---------- 安装 ----------
 static void JRebind(const char *name, void *target, void *repl, void **save) {
     void *sym = dlsym(RTLD_DEFAULT, name);
-    if (!sym) { JbLog(@"skip %s (not found)", name); return; }
+    if (!sym) { KWJbLog(@"skip %s (not found)", name); return; }
     *save = sym;
     @try {
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, target, repl, NULL);
-        JbLog(@"%s OK", name);
-    } @catch (NSException *e) { JbLog(@"%s ex: %@", name, e); }
+        KWJbLog(@"%s OK", name);
+    } @catch (NSException *e) { KWJbLog(@"%s ex: %@", name, e); }
 }
 
 void KwaiJailbreakInstall(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
-    JbLog(@"=== jailbreak bypass v1 ===");
+    KWJbLog(@"=== jailbreak bypass v1 ===");
 
     orig_stat = stat;
     JRebind("stat", (void *)stat, (void *)kw_stat, (void **)&orig_stat);
@@ -2939,32 +3196,26 @@ void KwaiJailbreakInstall(void) {
     orig_statfs = statfs;
     JRebind("statfs", (void *)statfs, (void *)kw_statfs, (void **)&orig_statfs);
 
-    JbLog(@"=== jailbreak bypass done ===");
+    KWJbLog(@"=== jailbreak bypass done ===");
 }
 
 
 // ======== MERGED: KwaiAntiDetect.m ========
-
 // ============================================================
 //  KwaiAntiDetect.m  ——  完整反检测模块
 //  覆盖：fishhook / runtime hook / 进程 / 镜像 / 模拟器 / 代理 / 重打包
 // ============================================================
-
-
-
-
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
-
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include "litehook.h"
 
-static void AdLog(NSString *fmt, ...) {
+static void KWAdLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -3072,7 +3323,7 @@ static CFDictionaryRef kw_CFNetworkCopySystemProxySettings(void) {
         if (d) {
             CFBooleanRef httpEnable = CFDictionaryGetValue(d, CFSTR("HTTPEnable"));
             if (httpEnable && CFBooleanGetValue(httpEnable)) {
-                AdLog(@"[anti] proxy detected -> cleared");
+                KWAdLog(@"[anti] proxy detected -> cleared");
                 CFRelease(d);
                 return CFDictionaryCreate(NULL, NULL, NULL, 0,
                                           &kCFTypeDictionaryKeyCallBacks,
@@ -3112,12 +3363,12 @@ static BOOL kw_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
 // ============================================================
 static void ARebind(const char *name, void *target, void *repl, void **save) {
     void *sym = dlsym(RTLD_DEFAULT, name);
-    if (!sym) { AdLog(@"skip %s", name); return; }
+    if (!sym) { KWAdLog(@"skip %s", name); return; }
     *save = sym;
     @try {
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, target, repl, NULL);
-        AdLog(@"%s OK", name);
-    } @catch (NSException *e) { AdLog(@"%s ex: %@", name, e); }
+        KWAdLog(@"%s OK", name);
+    } @catch (NSException *e) { KWAdLog(@"%s ex: %@", name, e); }
 }
 
 // ============================================================
@@ -3127,7 +3378,7 @@ void KwaiAntiDetectInstall(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
-    AdLog(@"=== anti-detect v1 ===");
+    KWAdLog(@"=== anti-detect v1 ===");
 
     // ① dyld 镜像隐藏
     orig_dyld_get_image_name = _dyld_get_image_name;
@@ -3148,8 +3399,8 @@ void KwaiAntiDetectInstall(void) {
             @try {
                 litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s,
                     (void *)kw_CFNetworkCopySystemProxySettings, NULL);
-                AdLog(@"CFNetworkCopySystemProxySettings OK");
-            } @catch (NSException *e) { AdLog(@"CFNetwork ex: %@", e); }
+                KWAdLog(@"CFNetworkCopySystemProxySettings OK");
+            } @catch (NSException *e) { KWAdLog(@"CFNetwork ex: %@", e); }
         }
     }
 
@@ -3158,8 +3409,96 @@ void KwaiAntiDetectInstall(void) {
     if (m) {
         orig_fileExistsAtPath = (void *)method_getImplementation(m);
         method_setImplementation(m, (IMP)kw_fileExistsAtPath);
-        AdLog(@"NSFileManager fileExistsAtPath OK");
+        KWAdLog(@"NSFileManager fileExistsAtPath OK");
     }
 
-    AdLog(@"=== anti-detect done ===");
+    KWAdLog(@"=== anti-detect done ===");
+}
+// ============================================================
+//  补充伪装：可用内存 / 屏幕物理像素 / 出厂日期
+// ============================================================
+
+// ---- ① host_statistics64（可用内存）----
+static int (*orig_host_stat) (host_t, host_flavor_t, host_info64_t, mach_msg_type_number_t *) = NULL;
+
+static int kw_host_stat(host_t host, host_flavor_t flavor, host_info64_t info,
+                         mach_msg_type_number_t *count) {
+    int r = orig_host_stat ? orig_host_stat(host, flavor, info, count) : -1;
+    if (r == KERN_SUCCESS && info && g_fakeMemSize > 0) {
+        // HOST_VM_INFO64 = 4
+        if (flavor == 4 && *count >= sizeof(vm_statistics64_data_t) / sizeof(integer_t)) {
+            vm_statistics64_data_t *vs = (vm_statistics64_data_t *)info;
+            // 长期使用：可用内存约为总量的 20%~45%
+            unsigned long seed = KwaiContainerSeed();
+            long long freePct = 20 + (seed % 26);
+            long long wantFree = g_fakeMemSize * freePct / 100;
+            // 通过调整 free_count（页数）实现
+            vm_size_t pageSize = 16384;
+            host_page_size(host, &pageSize);
+            uint64_t pages = (uint64_t)(wantFree / pageSize);
+            vs->free_count = (natural_t)pages;
+            vs->inactive_count = (natural_t)(pages / 3);
+            KWLog(@"[mem] host_statistics64 -> free=%.2fGB (%.0f%%)",
+                  wantFree / 1e9, (double)freePct);
+        }
+    }
+    return r;
+}
+
+// ---- ② UIScreen nativeBounds / nativeScale（物理像素）----
+static CGRect (*orig_nat_bounds)(id, SEL) = NULL;
+static CGRect kw_nat_bounds(id self, SEL _cmd) {
+    if (g_fakeScrW > 0 && g_fakeScrH > 0 && g_fakeScale > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]])
+            return CGRectMake(0, 0, g_fakeScrW * g_fakeScale, g_fakeScrH * g_fakeScale);
+    }
+    return orig_nat_bounds ? orig_nat_bounds(self, _cmd) : CGRectZero;
+}
+
+static CGFloat (*orig_nat_scale)(id, SEL) = NULL;
+static CGFloat kw_nat_scale(id self, SEL _cmd) {
+    if (g_fakeScale > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]]) return g_fakeScale;
+    }
+    return orig_nat_scale ? orig_nat_scale(self, _cmd) : 3.0;
+}
+
+// ---- 安装 ----
+void KwaiInstallExtSpoof(void) {
+    static BOOL done = NO;
+    done = YES;
+
+    // host_statistics64
+    orig_host_stat = host_statistics64;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)host_statistics64,
+                               (void *)kw_host_stat, NULL);
+        KWLog(@"[mem] host_statistics64 OK");
+    } @catch (NSException *e) { KWLog(@"[mem] ex: %@", e); }
+
+    // nativeBounds
+    Method m1 = class_getInstanceMethod([UIScreen class], @selector(nativeBounds));
+    if (m1) {
+        orig_nat_bounds = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_nat_bounds);
+        KWLog(@"[screen] nativeBounds OK");
+    }
+    Method m2 = class_getInstanceMethod([UIScreen class], @selector(nativeScale));
+    if (m2) {
+        orig_nat_scale = (void *)method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)kw_nat_scale);
+        KWLog(@"[screen] nativeScale OK");
+    }
+
+    // NSProcessInfo.physicalMemory
+    Method m3 = class_getInstanceMethod([NSProcessInfo class], @selector(physicalMemory));
+    if (m3) {
+        orig_phys_mem = (void *)method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)kw_phys_mem);
+        KWLog(@"[mem] physicalMemory OK");
+    }
+
+    KWLog(@"[ext] all done");
 }
