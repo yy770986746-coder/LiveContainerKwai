@@ -67,7 +67,7 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             -disableAutomaticPackageResolution=false \
             archive \
-            2>&1 | tail -120
+            2>&1 | tee /tmp/build_full.log | tail -150
 
       - name: Locate
         if: always()
