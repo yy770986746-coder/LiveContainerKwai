@@ -37,6 +37,9 @@ void KwaiInstallDetectorBypass(void);
 void KwaiInstallDataSpoof(void);
 void KwaiInstallHistorySpoof(void);
 void KwaiInstallTrueParamSpoof(void);
+void KwaiInstallV11Spoof(void);
+void KwaiInstallLCFeatureHide(void);
+void KwaiInstallHomeSpoof(void);
 
 
 // ---------- v9 合并 hook 所需的前向声明 ----------
@@ -876,38 +879,43 @@ typedef struct {
     int ncpu;
     int memGB;
     int minIOS;
-    const char *product;     // hw.product
-    const char *board;       // hw.target / 主板代号
+    const char *product;
+    const char *board;
+    int socId;
+    int freqMHz;
+    int scrW, scrH;
+    int battery;
+    int arm64e;
 } KwaiDeviceModel;
 
 static const KwaiDeviceModel kDeviceModels[] = {
-    // machine,      ncpu, mem, minIOS, product,          board(target)
-    { "iPhone11,2", 6, 4, 13, "iPhone XS",         "D321AP" },
-    { "iPhone11,8", 6, 3, 13, "iPhone XR",         "N841AP" },
-    { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP" },
-    { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP" },
-    { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP" },
-    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP" },
-    { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP" },
-    { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP" },
-    { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP" },
-    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP"  },
-    { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP"  },
-    { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP"  },
-    { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP"  },
-    { "iPhone14,6", 6, 4, 16, "iPhone SE (3rd)",   "D79AP"  },
-    { "iPhone14,7", 6, 4, 16, "iPhone 14",         "D27AP"  },
-    { "iPhone14,8", 6, 6, 16, "iPhone 14 Plus",    "D28AP"  },
-    { "iPhone15,2", 6, 6, 16, "iPhone 14 Pro",     "D73AP"  },
-    { "iPhone15,3", 6, 6, 16, "iPhone 14 Pro Max", "D74AP"  },
-    { "iPhone15,4", 6, 6, 17, "iPhone 15",         "D37AP"  },
-    { "iPhone15,5", 6, 6, 17, "iPhone 15 Plus",    "D38AP"  },
-    { "iPhone16,1", 6, 8, 17, "iPhone 15 Pro",     "D83AP"  },
-    { "iPhone16,2", 6, 8, 17, "iPhone 15 Pro Max", "D84AP"  },
-    { "iPhone17,3", 6, 8, 18, "iPhone 16",         "D47AP"  },
-    { "iPhone17,4", 6, 8, 18, "iPhone 16 Plus",    "D48AP"  },
-    { "iPhone17,1", 6, 8, 18, "iPhone 16 Pro",     "D93AP"  },
-    { "iPhone17,2", 6, 8, 18, "iPhone 16 Pro Max", "D94AP"  },
+    // machine,     ncpu, memGB, minIOS, product,          board,   soc,    freq,  W,   H,  batt, armE
+    { "iPhone11,2", 6, 4, 13, "iPhone XS",         "D321AP", 0x8000, 2490, 375, 812, 2658, 1 },
+    { "iPhone11,8", 6, 3, 13, "iPhone XR",         "N841AP", 0x8000, 2490, 414, 896, 2942, 1 },
+    { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP", 0x8001, 2650, 414, 896, 3110, 1 },
+    { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP", 0x8001, 2650, 375, 812, 3046, 1 },
+    { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP", 0x8001, 2650, 414, 896, 3969, 1 },
+    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 2227, 1 },
+    { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP", 0x8101, 3000, 390, 844, 2815, 1 },
+    { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP", 0x8101, 3000, 390, 844, 2815, 1 },
+    { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP", 0x8101, 3000, 428, 926, 3687, 1 },
+    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3200, 375, 812, 2406, 1 },
+    { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP",  0x8110, 3200, 390, 844, 3240, 1 },
+    { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP",  0x8110, 3200, 390, 844, 3095, 1 },
+    { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP",  0x8110, 3200, 428, 926, 4352, 1 },
+    { "iPhone14,6", 6, 4, 16, "iPhone SE (3rd)",   "D79AP",  0x8110, 3200, 375, 667, 2018, 1 },
+    { "iPhone14,7", 6, 6, 16, "iPhone 14",         "D27AP",  0x8110, 3200, 390, 844, 3279, 1 },
+    { "iPhone14,8", 6, 6, 16, "iPhone 14 Plus",    "D28AP",  0x8110, 3200, 428, 926, 4325, 1 },
+    { "iPhone15,2", 6, 6, 16, "iPhone 14 Pro",     "D73AP",  0x8110, 3200, 393, 852, 3200, 1 },
+    { "iPhone15,3", 6, 6, 16, "iPhone 14 Pro Max", "D74AP",  0x8110, 3200, 430, 932, 4323, 1 },
+    { "iPhone15,4", 6, 6, 17, "iPhone 15",         "D37AP",  0x8120, 3200, 393, 852, 3349, 1 },
+    { "iPhone15,5", 6, 6, 17, "iPhone 15 Plus",    "D38AP",  0x8120, 3200, 430, 932, 4383, 1 },
+    { "iPhone16,1", 6, 8, 17, "iPhone 15 Pro",     "D83AP",  0x8120, 3780, 393, 852, 3274, 1 },
+    { "iPhone16,2", 6, 8, 17, "iPhone 15 Pro Max", "D84AP",  0x8120, 3780, 430, 932, 4441, 1 },
+    { "iPhone17,3", 6, 8, 18, "iPhone 16",         "D47AP",  0x8130, 3780, 393, 852, 3561, 1 },
+    { "iPhone17,4", 6, 8, 18, "iPhone 16 Plus",    "D48AP",  0x8130, 3780, 430, 932, 4674, 1 },
+    { "iPhone17,1", 6, 8, 18, "iPhone 16 Pro",     "D93AP",  0x8130, 3780, 402, 874, 3582, 1 },
+    { "iPhone17,2", 6, 8, 18, "iPhone 16 Pro Max", "D94AP",  0x8130, 3780, 440, 956, 4685, 1 },
 };
 static const int kDeviceModelCount = sizeof(kDeviceModels) / sizeof(kDeviceModels[0]);
 
@@ -1057,6 +1065,16 @@ static void KwaiSetupSpoof(void) {
     // ---- product / board ----
     if (m->product) strncpy(g_fakeProductC, m->product, sizeof(g_fakeProductC)-1);
     if (m->board)   strncpy(g_fakeBoardC, m->board, sizeof(g_fakeBoardC)-1);
+
+    // ---- v13: 新字段自动填充（保证参数自洽）----
+    g_fakeSoCId   = m->socId;
+    g_fakeFreqMHz = m->freqMHz;
+    g_fakeScrW    = m->scrW;
+    g_fakeScrH    = m->scrH;
+    g_fakeBattery = m->battery;
+    g_fakeArmE    = m->arm64e;
+    KWLog(@"[spoof] v13 params: soc=0x%X freq=%dMHz scr=%dx%d batt=%dmAh arm64e=%d",
+          m->socId, m->freqMHz, m->scrW, m->scrH, m->battery, m->arm64e);
 
     // ---- 序列号（12位，苹果格式）----
     {
@@ -1516,8 +1534,24 @@ static void KwaiInstallSpoof(void) {
     if (g_spoofInstalled) return;
     g_spoofInstalled = YES;
 
-    KwaiSetupSpoof();
+    // ★ 修复时序：在任何 hook 安装前，先初始化全部扩展参数
+    // 否则 hook 已生效但变量仍为 0，会漏真机值
+    extern void KwaiSetupTimeSpoof(void);
+    extern void KwaiSetupStorageSpoof(void);
+    extern void KwaiSetupBatterySpoof(void);
+    extern void KwaiSetupDeepSpoof(void);
+    extern void KwaiSetupDataSpoof(void);
+    extern void KwaiSetupKernelSpoof(void);
+
+    KwaiSetupSpoof();                       // 基础设备（最先，其他依赖它）
     if (!g_fakeMachine) { KWLog(@"[spoof] setup failed"); return; }
+    KwaiSetupTimeSpoof();                   // 时间参数
+    KwaiSetupStorageSpoof();                // 存储参数
+    KwaiSetupBatterySpoof();                // 电池参数
+    KwaiSetupDeepSpoof();                   // CPU/屏幕/电量
+    KwaiSetupDataSpoof();                   // 数据/安装时间
+    KwaiSetupKernelSpoof();                 // 内核版本/MAC
+    KWLog(@"[spoof] all params pre-initialized");
 
     #define LITEHOOK_REBIND_GLOBAL NULL
 
@@ -1596,6 +1630,9 @@ static void KwaiInstallSpoof(void) {
     KwaiInstallDataSpoof();
     KwaiInstallHistorySpoof();
     KwaiInstallTrueParamSpoof();
+    KwaiInstallV11Spoof();
+    KwaiInstallLCFeatureHide();
+    KwaiInstallHomeSpoof();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
     {
@@ -2260,7 +2297,7 @@ void KwaiInstallQQHook(void) {
 // ---- ① 开机时长 / 运行时间 ----
 static long long g_timeOffset = 0;   // 秒：把"现在"往前推
 
-static void KwaiSetupTimeSpoof(void) {
+void KwaiSetupTimeSpoof(void) {
     if (g_timeOffset != 0) return;
     // 按容器种子生成 1~90 天随机
     unsigned long seed = KwaiContainerSeed();
@@ -2466,7 +2503,7 @@ static long long KwaiDiskCapacityForMachine(const char *machine) {
     return total - used;   // 返回可用
 }
 
-static void KwaiSetupStorageSpoof(void) {
+void KwaiSetupStorageSpoof(void) {
     if (g_fakeDiskTotal > 0) return;
     g_fakeDiskFree = KwaiDiskCapacityForMachine(g_fakeMachineC);
     // 反推总容量
@@ -2619,7 +2656,7 @@ static int g_fakeBatteryHealth = 0;
 static long long g_fakeBatteryCapacity = 0;
 static CFStringRef g_fakeBatterySerial = NULL;
 
-static void KwaiSetupBatterySpoof(void) {
+void KwaiSetupBatterySpoof(void) {
     if (g_fakeCycleCount > 0) return;
     unsigned long seed = KwaiContainerSeed();
     g_fakeCycleCount = 400 + (int)((seed >> 3) % 501);        // 400~900
@@ -3538,7 +3575,7 @@ static float g_fakeBatteryLevel = 0;      // 电量 0.0~1.0
 static int   g_fakeBatteryState = 0;      // 0=未知 1=未充 2=充电 3=满
 static float g_fakeBrightness = 0;        // 屏幕亮度
 
-static void KwaiSetupDeepSpoof(void) {
+void KwaiSetupDeepSpoof(void) {
     if (g_fakeBatteryLevel > 0) return;
     unsigned long seed = KwaiContainerSeed();
     // 电量：长期使用常见 20%~85%
@@ -3915,7 +3952,7 @@ static long long g_fakeCacheSize = 0;      // 缓存大小
 static int g_fakeFileCount = 0;            // 文件数量
 static NSTimeInterval g_fakeInstallTime = 0;  // 首次安装时间
 
-static void KwaiSetupDataSpoof(void) {
+void KwaiSetupDataSpoof(void) {
     if (g_fakeAppDataSize > 0) return;
     unsigned long seed = KwaiContainerSeed();
     // 长期使用：数据 300MB~2.5GB
@@ -4158,7 +4195,7 @@ void KwaiInstallHistorySpoof(void) {
 static char g_fakeKernelVersion[128] = {0};
 static char g_fakeMacAddr[32] = {0};
 
-static void KwaiSetupKernelSpoof(void) {
+void KwaiSetupKernelSpoof(void) {
     if (g_fakeKernelVersion[0]) return;
     // 内核版本与 iOS 版本匹配
     // iOS 15.4 -> Darwin 21.4.0 / iOS 16.6 -> 22.6.0 / iOS 17.x -> 23.x
@@ -4441,5 +4478,363 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
         if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
     }
 
+
+    // ---- ⑦ 补全：与 hw.ncpu / hw.memsize 一致的 key ----
+    if (strcmp(name, "hw.physicalcpu_max") == 0) {
+        if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) { *(int *)oldp = g_fakeNCPU; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.logicalcpu_max") == 0) {
+        if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) { *(int *)oldp = g_fakeNCPU; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.physmem") == 0 || strcmp(name, "hw.usermem") == 0) {
+        if (*oldlenp >= sizeof(long long) && g_fakeMemSize > 0) {
+            *(long long *)oldp = g_fakeMemSize; *oldlenp = sizeof(long long); return 0;
+        }
+    }
+    if (strcmp(name, "hw.pagesize") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 16384; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.machinearch") == 0) {
+        const char *v = g_fakeArmE ? "arm64e" : "arm64";
+        size_t n = strlen(v) + 1;
+        if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+    }
+    if (strcmp(name, "hw.vectorunit") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 128; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "kern.ostype") == 0) {
+        const char *v = "Darwin"; size_t n = strlen(v)+1;
+        if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+    }
+    if (strcmp(name, "kern.osrelease") == 0) {
+        const char *v = "22.6.0"; size_t n = strlen(v)+1;
+        if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+    }
+    if (strcmp(name, "kern.hostname") == 0) {
+        const char *v = "iPhone"; size_t n = strlen(v)+1;
+        if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+    }
     return -1;   // 未处理
+}
+
+// ============================================================
+//  v11: 补全遗漏项
+//  ① clock_gettime（时间，快手可能用）
+//  ② NSURL volumeTotalCapacity（存储）
+//  ③ 电池 DesignCapacity / Voltage / Amperage
+// ============================================================
+
+// ---------- ① clock_gettime ----------
+static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
+static int kw_clock_gettime(clockid_t clk_id, struct timespec *tp) {
+    int r = orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
+    if (r == 0 && tp && g_timeOffset > 0) {
+        // CLOCK_MONOTONIC (6) / CLOCK_MONOTONIC_RAW (4) / CLOCK_UPTIME_RAW (8)
+        if (clk_id == 6 || clk_id == 4 || clk_id == 8) {
+            tp->tv_sec -= g_timeOffset;
+            if (tp->tv_sec < 0) { tp->tv_sec = 0; tp->tv_nsec = 0; }
+        }
+    }
+    return r;
+}
+
+// ---------- ② NSURL volumeTotalCapacity ----------
+static NSNumber *(*orig_vol_total)(id, SEL, NSError **) = NULL;
+static NSNumber *kw_vol_total(id self, SEL _cmd, NSError **err) {
+    if (g_fakeDiskTotal > 0) return @(g_fakeDiskTotal);
+    return orig_vol_total ? orig_vol_total(self, _cmd, err) : nil;
+}
+
+// ---------- ③ 电池更多属性 ----------
+static long long (*orig_design_cap)(id, SEL) = NULL;   // 非公开 API，可能不存在
+
+void KwaiInstallV11Spoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // clock_gettime
+    void *sym = dlsym(RTLD_DEFAULT, "clock_gettime");
+    if (sym) {
+        orig_clock_gettime = (int (*)(clockid_t, struct timespec *))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_clock_gettime, NULL);
+            KWLog(@"[v11] clock_gettime OK");
+        } @catch (NSException *e) { KWLog(@"[v11] clock_gettime ex: %@", e); }
+    }
+
+    // NSURL volumeTotalCapacity
+    Class urlCls = [NSURL class];
+    SEL vtSel = NSSelectorFromString(@"volumeTotalCapacity");
+    Method m1 = class_getInstanceMethod(urlCls, vtSel);
+    if (m1) {
+        orig_vol_total = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_vol_total);
+        KWLog(@"[v11] volumeTotalCapacity OK");
+    }
+
+    KWLog(@"[v11] all done");
+}
+
+// ============================================================
+//  v12: LC 特征深度隐藏
+//  ① TweakLoader.dylib 镜像名 → 伪装
+//  ② LCContainerInfo.plist / LCAppInfo.plist 访问 → 拦截
+//  ③ lcUserDefaults / LCGuestApp 符号 → 隐藏
+//  ④ NSGetExecutablePath → 假路径
+//  ⑤ _dyld_register_func_for_add_image → 过滤回调
+// ============================================================
+
+// ---------- ① 扩展 dyld 镜像过滤 ----------
+static const char *(*orig_dyld_img_name_v12)(uint32_t) = NULL;
+static uint32_t (*orig_dyld_img_count_v12)(void) = NULL;
+
+static BOOL kw_isBadImageName(const char *name) {
+    if (!name) return NO;
+    const char *bad[] = {
+        "TweakLoader", "LiveContainer", "LiveProcess", "SideStore",
+        "KwaiSpoof", "KwaiHide", "KwaiWeapon", "KwaiJailbreak",
+        "KwaiAntiDetect", "KwaiBuiltin", "libsystem_x",
+        "CydiaSubstrate", "Substrate", "libhooker", "substitute",
+        "ElleKit", "frida", "cycript", "ZSign",
+        NULL
+    };
+    for (int i = 0; bad[i]; i++) {
+        if (strstr(name, bad[i])) return YES;
+    }
+    return NO;
+}
+
+static const char *kw_dyld_img_name_v12(uint32_t idx) {
+    const char *p = orig_dyld_img_name_v12 ? orig_dyld_img_name_v12(idx) : NULL;
+    if (kw_isBadImageName(p)) {
+        return "/usr/lib/libSystem.B.dylib";   // 伪装为系统库
+    }
+    return p;
+}
+
+// ---------- ② 路径访问拦截（LC 特征文件）----------
+static BOOL kw_isLCFeaturePath(const char *path) {
+    if (!path) return NO;
+    const char *bad[] = {
+        "LCContainerInfo.plist", "LCAppInfo.plist",
+        "LiveContainer.app", "LiveProcess.appex",
+        "TweakLoader.dylib", "LC_GLOBAL_TWEAKS",
+        "com.kdt.livecontainer", "lcUserDefaults",
+        "LCTweakFolder", "LCDataUUID",
+        NULL
+    };
+    for (int i = 0; bad[i]; i++) {
+        if (strstr(path, bad[i])) return YES;
+    }
+    return NO;
+}
+
+static int (*orig_stat_v12)(const char *, struct stat *) = NULL;
+static int kw_stat_v12(const char *p, struct stat *buf) {
+    if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
+    return orig_stat_v12 ? orig_stat_v12(p, buf) : -1;
+}
+
+static int (*orig_access_v12)(const char *, int) = NULL;
+static int kw_access_v12(const char *p, int mode) {
+    if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
+    return orig_access_v12 ? orig_access_v12(p, mode) : -1;
+}
+
+// NSFileManager.fileExistsAtPath 扩展
+static BOOL (*orig_fileExists_v12)(id, SEL, NSString *) = NULL;
+static BOOL kw_fileExists_v12(id self, SEL _cmd, NSString *path) {
+    if (path && kw_isLCFeaturePath(path.UTF8String)) return NO;
+    return orig_fileExists_v12 ? orig_fileExists_v12(self, _cmd, path) : NO;
+}
+
+// ---------- ③ NSGetExecutablePath（假路径）----------
+static int (*orig_nsgetpath)(char *, uint32_t *) = NULL;
+static int kw_nsgetpath(char *buf, uint32_t *size) {
+    if (g_fakeExecPath) {
+        const char *p = g_fakeExecPath.UTF8String;
+        uint32_t need = (uint32_t)strlen(p) + 1;
+        if (buf && size && *size >= need) {
+            memcpy(buf, p, need);
+            *size = need;
+            return 0;
+        }
+        if (size) *size = need;
+        return -1;
+    }
+    return orig_nsgetpath ? orig_nsgetpath(buf, size) : -1;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallLCFeatureHide(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // ① dyld 镜像
+    orig_dyld_img_name_v12 = _dyld_get_image_name;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)_dyld_get_image_name,
+                               (void *)kw_dyld_img_name_v12, NULL);
+        KWLog(@"[v12] dyld image filter OK");
+    } @catch (NSException *e) { KWLog(@"[v12] dyld ex: %@", e); }
+
+    // ② 路径
+    orig_stat_v12 = stat;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)stat, (void *)kw_stat_v12, NULL);
+        KWLog(@"[v12] stat filter OK");
+    } @catch (NSException *e) { KWLog(@"[v12] stat ex: %@", e); }
+
+    orig_access_v12 = access;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)access, (void *)kw_access_v12, NULL);
+        KWLog(@"[v12] access filter OK");
+    } @catch (NSException *e) { KWLog(@"[v12] access ex: %@", e); }
+
+    Method m1 = class_getInstanceMethod([NSFileManager class], @selector(fileExistsAtPath:));
+    if (m1) {
+        orig_fileExists_v12 = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_fileExists_v12);
+        KWLog(@"[v12] fileExistsAtPath filter OK");
+    }
+
+    // ③ NSGetExecutablePath
+    void *sym = dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
+    if (sym) {
+        orig_nsgetpath = (int (*)(char *, uint32_t *))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_nsgetpath, NULL);
+            KWLog(@"[v12] NSGetExecutablePath OK");
+        } @catch (NSException *e) { KWLog(@"[v12] nsget ex: %@", e); }
+    }
+
+    KWLog(@"[v12] all done");
+}
+
+// ============================================================
+//  v14: LC 容器路径特征隐藏（重大加固）
+//  问题：LC 里 guest 的 HOME 是
+//    .../Application/<LC-UUID>/Documents/Data/Application/<guest-UUID>
+//    ★ 两层 "Data/Application" 是明显的 LC 特征
+//  对策：hook 路径返回 API，把内层嵌套「抹平」
+// ============================================================
+
+static NSString *g_fakeHomePath = nil;   // 伪装后的 HOME
+
+static void KwaiSetupHomeSpoof(void) {
+    if (g_fakeHomePath) return;
+    NSString *realHOME = NSHomeDirectory();
+    // 检测 LC 嵌套路径
+    NSRange r1 = [realHOME rangeOfString:@"/Documents/Data/Application/"];
+    if (r1.location != NSNotFound) {
+        // 提取 guest UUID
+        NSString *tail = [realHOME substringFromIndex:r1.location + r1.length];
+        NSString *guestUUID = [tail componentsSeparatedByString:@"/"].firstObject;
+        // 伪装成普通的 container 路径
+        g_fakeHomePath = [NSString stringWithFormat:
+            @"/var/mobile/Containers/Data/Application/%@", guestUUID];
+        KWLog(@"[v14] HOME spoof: %@ -> %@", realHOME, g_fakeHomePath);
+    } else {
+        g_fakeHomePath = realHOME;
+    }
+}
+
+// ---------- ① NSHomeDirectory ----------
+static NSString *(*orig_homeDir)(void) = NULL;
+static NSString *kw_homeDir(void) {
+    if (g_fakeHomePath) return g_fakeHomePath;
+    return orig_homeDir ? orig_homeDir() : NSHomeDirectory();
+}
+
+// ---------- ② NSSearchPathForDirectoriesInDomains ----------
+static NSArray<NSString *> *(*orig_searchPaths)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL) = NULL;
+static NSArray<NSString *> *kw_searchPaths(NSSearchPathDirectory dir, NSSearchPathDomainMask mask, BOOL expand) {
+    NSArray *r = orig_searchPaths ? orig_searchPaths(dir, mask, expand) : @[];
+    if (g_fakeHomePath && r.count > 0) {
+        NSMutableArray *out = [NSMutableArray array];
+        NSString *realHOME = NSHomeDirectory();
+        for (NSString *p in r) {
+            if ([p hasPrefix:realHOME]) {
+                NSString *rest = [p substringFromIndex:realHOME.length];
+                [out addObject:[g_fakeHomePath stringByAppendingString:rest]];
+            } else {
+                [out addObject:p];
+            }
+        }
+        return out;
+    }
+    return r;
+}
+
+// ---------- ③ NSTemporaryDirectory ----------
+static NSString *(*orig_tempDir)(void) = NULL;
+static NSString *kw_tempDir(void) {
+    NSString *t = orig_tempDir ? orig_tempDir() : NSTemporaryDirectory();
+    if (g_fakeHomePath && t) {
+        NSString *realHOME = NSHomeDirectory();
+        if ([t hasPrefix:realHOME]) {
+            return [g_fakeHomePath stringByAppendingString:[t substringFromIndex:realHOME.length]];
+        }
+    }
+    return t;
+}
+
+// ---------- ④ NSBundle.bundlePath / executablePath ----------
+static NSString *(*orig_bundlePath)(id, SEL) = NULL;
+static NSString *kw_bundlePath(id self, SEL _cmd) {
+    NSString *p = orig_bundlePath ? orig_bundlePath(self, _cmd) : nil;
+    if (g_fakeBundlePath && p && [p containsString:@"/Documents/Applications/"]) {
+        return g_fakeBundlePath;   // 用 LC 层生成的假路径
+    }
+    return p;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallHomeSpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupHomeSpoof();
+
+    // ① NSHomeDirectory
+    void *sym = dlsym(RTLD_DEFAULT, "NSHomeDirectory");
+    if (sym) {
+        orig_homeDir = (NSString *(*)(void))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_homeDir, NULL);
+            KWLog(@"[v14] NSHomeDirectory OK");
+        } @catch (NSException *e) { KWLog(@"[v14] home ex: %@", e); }
+    }
+
+    // ② NSSearchPathForDirectoriesInDomains
+    sym = dlsym(RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
+    if (sym) {
+        orig_searchPaths = (NSArray<NSString *> *(*)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_searchPaths, NULL);
+            KWLog(@"[v14] NSSearchPath OK");
+        } @catch (NSException *e) { KWLog(@"[v14] search ex: %@", e); }
+    }
+
+    // ③ NSTemporaryDirectory
+    sym = dlsym(RTLD_DEFAULT, "NSTemporaryDirectory");
+    if (sym) {
+        orig_tempDir = (NSString *(*)(void))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_tempDir, NULL);
+            KWLog(@"[v14] NSTemporaryDirectory OK");
+        } @catch (NSException *e) { KWLog(@"[v14] temp ex: %@", e); }
+    }
+
+    // ④ NSBundle.bundlePath
+    Method m1 = class_getInstanceMethod([NSBundle class], @selector(bundlePath));
+    if (m1) {
+        orig_bundlePath = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_bundlePath);
+        KWLog(@"[v14] NSBundle.bundlePath OK");
+    }
+
+    KWLog(@"[v14] all done");
 }
