@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #include <mach-o/loader.h>
+#include <mach-o/dyld_images.h>
+#include <mach/mach.h>
+#include <mach/task_info.h>
 #include <objc/runtime.h>
 #include <os/lock.h>
 #define PrivClass(name) ((Class)objc_lookUpClass(#name))

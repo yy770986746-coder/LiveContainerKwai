@@ -12,7 +12,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/sysctl.h>
-#include <mach-o/dyld_images.h>
 #import "../../litehook/src/litehook.h"
 @import Darwin;
 @import Foundation;
