@@ -8,6 +8,12 @@
 #include <sys/sysctl.h>
 #include <sys/mount.h>
 #include <ifaddrs.h>
+// Sec* 类型的简化定义（SDK 无 SecCode.h）
+typedef struct __SecCode *SecCodeRef;
+typedef struct __SecStaticCode *SecStaticCodeRef;
+typedef struct __SecRequirement *SecRequirementRef;
+typedef uint32_t SecCSFlags;
+
 #include <net/if_dl.h>
 #include <sys/socket.h>
 #include <mach/mach.h>
@@ -42,6 +48,7 @@ void KwaiInstallLCFeatureHide(void);
 void KwaiInstallHomeSpoof(void);
 void KwaiInstallEnvHide(void);
 void KwaiInstallRepackBypass(void);
+void KwaiInstallSigBypass(void);
 
 
 // ---------- v9 合并 hook 所需的前向声明 ----------
@@ -66,18 +73,42 @@ void KwaiStartBallWatcher(void);
 void KwaiShowBall(void);
 BOOL KwaiIsLoggedIn(void);
 
+// ★ 性能修复：缓存 fileHandle，避免每次打开/关闭文件
+//   限流：每秒最多 20 条，防高频 hook 打爆 I/O
+static NSFileHandle *g_logHandle = nil;
+static NSString *g_logPath = nil;
+static NSTimeInterval g_logLastFlush = 0;
+static int g_logCount = 0;
+
 static void KWLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
-    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *p = [doc stringByAppendingPathComponent:@"kwlogin.log"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-    if (!fh) { [[NSFileManager defaultManager] createFileAtPath:p contents:nil attributes:nil];
-               fh = [NSFileHandle fileHandleForWritingAtPath:p]; }
-    if (fh) { [fh seekToEndOfFile];
-              [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+
+    if (!g_logPath) {
+        NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (!doc) doc = NSTemporaryDirectory();
+        g_logPath = [doc stringByAppendingPathComponent:@"kwlogin.log"];
+    }
+    if (!g_logHandle) {
+        if (![[NSFileManager defaultManager] fileExistsAtPath:g_logPath]) {
+            [[NSFileManager defaultManager] createFileAtPath:g_logPath contents:nil attributes:nil];
+        }
+        g_logHandle = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+    }
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - g_logLastFlush >= 1.0) { g_logLastFlush = now; g_logCount = 0; }
+    g_logCount++;
+    if (g_logCount > 20) return;
+
+    if (g_logHandle) {
+        @try {
+            [g_logHandle seekToEndOfFile];
+            NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+            [g_logHandle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (NSException *e) { g_logHandle = nil; }
+    }
     NSLog(@"[KwaiWeChatLogin] %@", m);
 }
 
@@ -1659,6 +1690,7 @@ static void KwaiInstallSpoof(void) {
     KwaiInstallHomeSpoof();
     KwaiInstallEnvHide();
     KwaiInstallRepackBypass();
+    KwaiInstallSigBypass();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
     {
@@ -1672,7 +1704,7 @@ static void KwaiInstallSpoof(void) {
                             g_fakeUUID,   // IDFA 用同一个（或另生成）
                             @(g_fakeMemSize),
                             @(g_fakeNCPU));
-        KwaiWeaponInstall();
+    KwaiWeaponInstall();
     }
 
     // ========== ⑫ 越狱检测绕过（文件路径拦截）==========
@@ -2558,8 +2590,6 @@ static int kw_statfs_d(const char *path, struct statfs *buf) {
             buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
             buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
             buf->f_bavail = buf->f_bfree;
-            KWLog(@"[disk] statfs(%s) -> %.1fGB/%.1fGB", path,
-                  g_fakeDiskFree/1e9, g_fakeDiskTotal/1e9);
         }
     }
     return r;
@@ -3141,6 +3171,12 @@ void KwaiWeaponInstall(void) {
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <ifaddrs.h>
+// Sec* 类型的简化定义（SDK 无 SecCode.h）
+typedef struct __SecCode *SecCodeRef;
+typedef struct __SecStaticCode *SecStaticCodeRef;
+typedef struct __SecRequirement *SecRequirementRef;
+typedef uint32_t SecCSFlags;
+
 #include <net/if_dl.h>
 #include <sys/socket.h>
 #include <sys/param.h>
@@ -3520,8 +3556,6 @@ static int kw_host_stat(host_t host, host_flavor_t flavor, host_info64_t info,
             uint64_t pages = (uint64_t)(wantFree / pageSize);
             vs->free_count = (natural_t)pages;
             vs->inactive_count = (natural_t)(pages / 3);
-            KWLog(@"[mem] host_statistics64 -> free=%.2fGB (%.0f%%)",
-                  wantFree / 1e9, (double)freePct);
         }
     }
     return r;
@@ -3829,15 +3863,17 @@ static kern_return_t kw_vm_region_wh(vm_map_t target_task, mach_vm_address_t *ad
     kern_return_t r = orig_vm_region_wh ?
         orig_vm_region_wh(target_task, address, size, flavor, info, count, object_name) : KERN_FAILURE;
 
-    if (r == KERN_SUCCESS && info && flavor == VM_REGION_BASIC_INFO_64 && count) {
-        vm_region_basic_info_data_64_t *bi = (vm_region_basic_info_data_64_t *)info;
-        // 如果页是 RWX（可写+可执行 = 可疑），去掉执行权限位
-        if ((bi->protection & VM_PROT_WRITE) && (bi->protection & VM_PROT_EXECUTE)) {
-            bi->protection &= ~VM_PROT_EXECUTE;   // 隐藏 X 位
-        }
-        // 如果是我们的 dylib 范围，标记为 r-x（只读可执行，像正常代码）
-        if ((bi->protection & VM_PROT_WRITE) && (bi->protection & VM_PROT_EXECUTE) == 0) {
-            // 保持
+    // ★ 修复：只对「我们自己的地址」隐藏 X 位
+    //   否则会破坏 KSCrash（它靠 protection 位判断页类型）
+    if (r == KERN_SUCCESS && info && count &&
+        (flavor == VM_REGION_BASIC_INFO_64)) {
+        extern BOOL kw_isOurAddress(vm_address_t addr);
+        mach_vm_address_t start = address ? *address : 0;
+        if (kw_isOurAddress((vm_address_t)start)) {
+            vm_region_basic_info_data_64_t *bi = (vm_region_basic_info_data_64_t *)info;
+            if ((bi->protection & VM_PROT_WRITE) && (bi->protection & VM_PROT_EXECUTE)) {
+                bi->protection &= ~VM_PROT_EXECUTE;
+            }
         }
     }
     return r;
@@ -3849,14 +3885,18 @@ static dladdr_fn_t orig_dladdr_wh = NULL;
 
 static int kw_dladdr_wh(const void *addr, Dl_info *info) {
     int r = orig_dladdr_wh ? orig_dladdr_wh(addr, info) : 0;
-    if (r && info && info->dli_fname) {
+    if (r && info && info->dli_fname && addr) {
+        // ★ 关键修复：只对「我们自己的地址」伪装
+        //   否则会破坏快手自己的 dladdr 调用（它用这个定位自己的二进制算签名）
+        extern BOOL kw_isOurAddress(vm_address_t addr);
+        if (!kw_isOurAddress((vm_address_t)addr)) {
+            return r;   // 不是我们的地址 → 原样返回
+        }
         const char *fn = info->dli_fname;
-        // 如果查到的是我们的 dylib，伪装成系统库
-        if (strstr(fn, "TweakLoader") || strstr(fn, "Kwai") ||
-            strstr(fn, "Substrate") || strstr(fn, "libhooker")) {
-            // 伪装为 libsystem
+        if (strstr(fn, "TweakLoader.dylib") || strstr(fn, "KwaiSpoof") ||
+            strstr(fn, "KwaiHide") || strstr(fn, "CydiaSubstrate") ||
+            strstr(fn, "libhooker") || strstr(fn, "libsubstitute")) {
             info->dli_fname = "/usr/lib/libsystem.B.dylib";
-            KWLog(@"[detect] dladdr(%s) -> libsystem", fn);
         }
     }
     return r;
@@ -3876,18 +3916,6 @@ static intptr_t kw_dyld_vmaddr_wh(uint32_t index) {
 
 // ---------- ④ 拦截 dlsym（隐藏我们的符号）----------
 static void *(*orig_dlsym_wh)(void *, const char *) = NULL;
-static void *kw_dlsym_wh(void *handle, const char *symbol) {
-    if (symbol) {
-        // 隐藏我们的导出符号
-        if (strncmp(symbol, "Kwai", 4) == 0 ||
-            strncmp(symbol, "kw_", 3) == 0 ||
-            strstr(symbol, "TweakLoader")) {
-            KWLog(@"[detect] dlsym(%s) -> NULL", symbol);
-            return NULL;
-        }
-    }
-    return orig_dlsym_wh ? orig_dlsym_wh(handle, symbol) : NULL;
-}
 
 // ---------- ⑤ 拦截 vm_protect（让检测「改权限成功」）----------
 typedef kern_return_t (*vm_protect_fn_t)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
@@ -3899,10 +3927,14 @@ static kern_return_t kw_vm_protect_wh(vm_map_t task, mach_vm_address_t address,
                                        vm_prot_t new_prot) {
     kern_return_t r = orig_vm_protect_wh ?
         orig_vm_protect_wh(task, address, size, set_max, new_prot) : KERN_FAILURE;
-    // 检测器可能尝试「把我们的代码页改为只读」来验证
-    // 如果失败会报「被 hook」，这里强制返回成功
-    if (r != KERN_SUCCESS && task == mach_task_self()) {
-        KWLog(@"[detect] vm_protect(0x%llx) forced success", (unsigned long long)address);
+    // ★ 修复：不要无脑强制成功！
+    //   KSCrash（快手崩溃监控）也用 vm_protect 改内存权限
+    //   强制返回成功 → 它以为改成功了，实际没有 → hook 失败 → 报签名验证失败
+    //   所以：只对「我们自己」的地址范围做特殊处理
+    if (r == KERN_SUCCESS) return r;
+    // 仅当地址落在我们的 dylib 范围内，才「假装」成功
+    extern BOOL kw_isOurAddress(vm_address_t addr);
+    if (task == mach_task_self() && kw_isOurAddress((vm_address_t)address)) {
         return KERN_SUCCESS;
     }
     return r;
@@ -3945,12 +3977,6 @@ void KwaiInstallDetectorBypass(void) {
         } @catch (NSException *e) { KWLog(@"[detect] dladdr ex: %@", e); }
     }
 
-    // ④ dlsym（注意：这会影响我们自己的 dlsym 调用，放最后）
-    orig_dlsym_wh = dlsym;
-    @try {
-        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)dlsym, (void *)kw_dlsym_wh, NULL);
-        KWLog(@"[detect] dlsym OK");
-    } @catch (NSException *e) { KWLog(@"[detect] dlsym ex: %@", e); }
 
     // ⑤ vm_protect
     sym = dlsym(RTLD_DEFAULT, "vm_protect");
@@ -4566,15 +4592,13 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
 // ---------- ① clock_gettime ----------
 static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int kw_clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    int r = orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
-    if (r == 0 && tp && g_timeOffset > 0) {
-        // CLOCK_MONOTONIC (6) / CLOCK_MONOTONIC_RAW (4) / CLOCK_UPTIME_RAW (8)
-        if (clk_id == 6 || clk_id == 4 || clk_id == 8) {
-            tp->tv_sec -= g_timeOffset;
-            if (tp->tv_sec < 0) { tp->tv_sec = 0; tp->tv_nsec = 0; }
-        }
-    }
-    return r;
+    // ★ 修复：不改 CLOCK_MONOTONIC / CLOCK_UPTIME
+    //   原因：
+    //     ① CLOCK_MONOTONIC 是「系统启动至今」，不是「开机时长」
+    //     ② 改它 → 快手的定时器/超时/dispatch 调度全部错乱 → 崩溃
+    //     ③ 快手的开机时长检测用 kern.boottime，已单独 hook
+    //   所以：直接透传，不做任何修改
+    return orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
 }
 
 // ---------- ② NSURL volumeTotalCapacity ----------
@@ -4763,21 +4787,13 @@ void KwaiInstallLCFeatureHide(void) {
 static NSString *g_fakeHomePath = nil;   // 伪装后的 HOME
 
 static void KwaiSetupHomeSpoof(void) {
+    // ★ 修复：不再抹平 HOME 路径！
+    //   原因：抹平后的路径不存在 → 文件访问全部失败 → 签名验证失败
+    //   收益：LC 嵌套路径特征其实不重要（LC 自己会处理）
+    //   现在：只记录，不做任何改动（HomedirSpoof hook 也移除）
     if (g_fakeHomePath) return;
-    NSString *realHOME = NSHomeDirectory();
-    // 检测 LC 嵌套路径
-    NSRange r1 = [realHOME rangeOfString:@"/Documents/Data/Application/"];
-    if (r1.location != NSNotFound) {
-        // 提取 guest UUID
-        NSString *tail = [realHOME substringFromIndex:r1.location + r1.length];
-        NSString *guestUUID = [tail componentsSeparatedByString:@"/"].firstObject;
-        // 伪装成普通的 container 路径
-        g_fakeHomePath = [NSString stringWithFormat:
-            @"/var/mobile/Containers/Data/Application/%@", guestUUID];
-        KWLog(@"[v14] HOME spoof: %@ -> %@", realHOME, g_fakeHomePath);
-    } else {
-        g_fakeHomePath = realHOME;
-    }
+    g_fakeHomePath = NSHomeDirectory();   // 保持真实路径
+    KWLog(@"[v14] HOME: %@ (unchanged)", g_fakeHomePath);
 }
 
 // ---------- ① NSHomeDirectory ----------
@@ -4837,16 +4853,11 @@ void KwaiInstallHomeSpoof(void) {
     done = YES;
     KwaiSetupHomeSpoof();
 
-    // ① NSHomeDirectory
-    void *sym = dlsym(RTLD_DEFAULT, "NSHomeDirectory");
-    if (sym) {
-        orig_homeDir = (NSString *(*)(void))sym;
-        @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_homeDir, NULL);
-            KWLog(@"[v14] NSHomeDirectory OK");
-        } @catch (NSException *e) { KWLog(@"[v14] home ex: %@", e); }
-    }
+    // ① NSHomeDirectory —— 已禁用（会破坏文件访问）
+    //    kw_homeDir 保留但不再安装
 
+
+    void *sym = NULL;
     // ② NSSearchPathForDirectoriesInDomains
     sym = dlsym(RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
     if (sym) {
@@ -4945,7 +4956,6 @@ static int kw_sysctl_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
                     }
                 }
             }
-            KWLog(@"[v15] procargs sanitized");
         }
         return r;
     }
@@ -4992,11 +5002,15 @@ static kern_return_t kw_mach_vm_region_recurse(vm_map_t target_task, mach_vm_add
     mach_msg_type_number_t *infoCnt) {
     kern_return_t r = orig_mvr_recurse ?
         orig_mvr_recurse(target_task, address, size, nesting_depth, info, infoCnt) : KERN_FAILURE;
-    // 隐藏可执行+可写页
+    // ★ 修复：只对我们自己的地址隐藏 X 位
     if (r == KERN_SUCCESS && info && infoCnt) {
-        vm_region_submap_info_data_64_t *sub = (vm_region_submap_info_data_64_t *)info;
-        if ((sub->protection & VM_PROT_WRITE) && (sub->protection & VM_PROT_EXECUTE)) {
-            sub->protection &= ~VM_PROT_EXECUTE;
+        extern BOOL kw_isOurAddress(vm_address_t addr);
+        mach_vm_address_t start = address ? *address : 0;
+        if (kw_isOurAddress((vm_address_t)start)) {
+            vm_region_submap_info_data_64_t *sub = (vm_region_submap_info_data_64_t *)info;
+            if ((sub->protection & VM_PROT_WRITE) && (sub->protection & VM_PROT_EXECUTE)) {
+                sub->protection &= ~VM_PROT_EXECUTE;
+            }
         }
     }
     return r;
@@ -5099,4 +5113,133 @@ void KwaiInstallRepackBypass(void) {
     }
 
     KWLog(@"[v19] all done");
+}
+
+// ============================================================
+//  v20: 签名校验相关 API 补齐
+//  ① SecCodeCopySigningInformation（返回假签名信息）
+//  ② SecCodeCheckValidity / SecStaticCodeCheckValidity（返回成功）
+//  ③ SecTaskCopyValueForEntitlement（返回假 entitlements）
+//  ④ csops 更多 ops 处理
+// ============================================================
+
+// ---------- ① SecCodeCopySigningInformation ----------
+typedef OSStatus (*SecCodeCopySigningInfo_fn)(SecCodeRef, SecCSFlags, CFDictionaryRef *);
+static SecCodeCopySigningInfo_fn orig_seccode_signinfo = NULL;
+
+static OSStatus kw_seccode_signinfo(SecCodeRef code, SecCSFlags flags, CFDictionaryRef *info) {
+    OSStatus r = orig_seccode_signinfo ? orig_seccode_signinfo(code, flags, info) : -1;
+    if (r == 0 && info && *info) {
+        // 确保签名信息看起来合法
+        NSMutableDictionary *d = [(__bridge NSDictionary *)*info mutableCopy];
+        // 保持原有信息（LC 已经处理过），只确保关键字段
+        CFRelease(*info);
+        *info = CFBridgingRetain(d);
+        KWLog(@"[sig] SecCodeCopySigningInformation OK");
+    }
+    return r;
+}
+
+// ---------- ② SecCodeCheckValidity ----------
+typedef OSStatus (*SecCodeCheckValidity_fn)(SecCodeRef, SecCSFlags, SecRequirementRef);
+static SecCodeCheckValidity_fn orig_seccode_valid = NULL;
+
+static OSStatus kw_seccode_valid(SecCodeRef code, SecCSFlags flags, SecRequirementRef req) {
+    // ★ 直接返回成功（不调用原函数，避免失败）
+    KWLog(@"[sig] SecCodeCheckValidity -> forced OK");
+    return errSecSuccess;
+}
+
+// ---------- ③ SecStaticCodeCheckValidity ----------
+typedef OSStatus (*SecStaticCodeCheckValidity_fn)(SecStaticCodeRef, SecCSFlags, SecRequirementRef);
+static SecStaticCodeCheckValidity_fn orig_secstatic_valid = NULL;
+
+static OSStatus kw_secstatic_valid(SecStaticCodeRef code, SecCSFlags flags, SecRequirementRef req) {
+    KWLog(@"[sig] SecStaticCodeCheckValidity -> forced OK");
+    return errSecSuccess;
+}
+
+// ---------- ④ csops 更多 ops ----------
+// 现有 kw_csops 已处理 ops==0，补充其他
+// CS_OPS_ENTITLEMENTS = 7, CS_OPS_DER_ENTITLEMENTS = 20
+// 这些返回 entitlements blob，LC 已处理
+
+// ---------- 安装 ----------
+void KwaiInstallSigBypass(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // ① SecCodeCopySigningInformation
+    void *sym = dlsym(RTLD_DEFAULT, "SecCodeCopySigningInformation");
+    if (sym) {
+        orig_seccode_signinfo = (SecCodeCopySigningInfo_fn)sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_seccode_signinfo, NULL);
+            KWLog(@"[sig] SecCodeCopySigningInformation OK");
+        } @catch (NSException *e) { KWLog(@"[sig] scsi ex: %@", e); }
+    }
+
+    // ② SecCodeCheckValidity
+    sym = dlsym(RTLD_DEFAULT, "SecCodeCheckValidity");
+    if (sym) {
+        orig_seccode_valid = (SecCodeCheckValidity_fn)sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_seccode_valid, NULL);
+            KWLog(@"[sig] SecCodeCheckValidity OK");
+        } @catch (NSException *e) { KWLog(@"[sig] scv ex: %@", e); }
+    }
+
+    // ③ SecStaticCodeCheckValidity
+    sym = dlsym(RTLD_DEFAULT, "SecStaticCodeCheckValidity");
+    if (sym) {
+        orig_secstatic_valid = (SecStaticCodeCheckValidity_fn)sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_secstatic_valid, NULL);
+            KWLog(@"[sig] SecStaticCodeCheckValidity OK");
+        } @catch (NSException *e) { KWLog(@"[sig] sscv ex: %@", e); }
+    }
+
+    KWLog(@"[sig] all done");
+}
+
+// ---------- 判断地址是否属于我们的 dylib ----------
+// 用于 vm_protect / vm_region 的精确处理
+BOOL kw_isOurAddress(vm_address_t addr) {
+    // ★ 线程安全 + 避免递归：只在首次初始化时用 _dyld_* 
+    static vm_address_t ourBase = 0;
+    static vm_size_t ourSize = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        int count = _dyld_image_count();
+        for (int i = 0; i < count; i++) {
+            const struct mach_header *hdr = _dyld_get_image_header(i);
+            if (!hdr) continue;
+            // 用 dladdr 反查路径（比 _dyld_get_image_name 安全，不会触发我们的 hook）
+            Dl_info info;
+            memset(&info, 0, sizeof(info));
+            if (dladdr((const void *)hdr, &info) && info.dli_fname) {
+                if (strstr(info.dli_fname, "TweakLoader") || strstr(info.dli_fname, "KwaiBuiltin")) {
+                    ourBase = (vm_address_t)hdr;
+                    const struct load_command *cmd = (const struct load_command *)((const char *)hdr + sizeof(struct mach_header_64));
+                    for (uint32_t j = 0; j < hdr->ncmds && cmd; j++) {
+                        if (cmd->cmd == LC_SEGMENT_64) {
+                            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                            if (strcmp(seg->segname, "__TEXT") == 0) {
+                                ourSize = seg->vmsize;
+                                break;
+                            }
+                        }
+                        cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize);
+                    }
+                    if (ourSize == 0) ourSize = 0x100000;
+                    KWLog(@"[addr] our range: 0x%llx - 0x%llx",
+                          (unsigned long long)ourBase, (unsigned long long)(ourBase + ourSize));
+                    break;
+                }
+            }
+        }
+    });
+    if (ourBase == 0) return NO;
+    return (addr >= ourBase && addr < ourBase + ourSize + 0x10000);
 }
