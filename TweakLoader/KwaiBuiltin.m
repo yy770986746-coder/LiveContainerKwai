@@ -48,6 +48,9 @@ void KwaiInstallLCFeatureHide(void);
 void KwaiInstallHomeSpoof(void);
 void KwaiInstallEnvHide(void);
 void KwaiInstallRepackBypass(void);
+void KwaiInstallBinRedirect(void);
+void KwaiInstallMachOFake(void);
+void KwaiInstallSignPathBlock(void);
 void KwaiInstallSigBypass(void);
 
 
@@ -1687,9 +1690,12 @@ static void KwaiInstallSpoof(void) {
     KwaiInstallTrueParamSpoof();
     KwaiInstallV11Spoof();
     KwaiInstallLCFeatureHide();
-    KwaiInstallHomeSpoof();
+    // [DISABLED-TEST] KwaiInstallHomeSpoof();   // 路径伪装测试
     KwaiInstallEnvHide();
     KwaiInstallRepackBypass();
+    // [DISABLED] KwaiInstallBinRedirect();   // 正版不存在时无效
+    // [DISABLED] KwaiInstallMachOFake();   // 无实际效果
+    // [DISABLED-CRASH] KwaiInstallSignPathBlock();   // 拦截签名文件导致闪退
     KwaiInstallSigBypass();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
@@ -4695,38 +4701,48 @@ static BOOL kw_isLCFeaturePath(const char *path) {
 
 static int (*orig_stat_v12)(const char *, struct stat *) = NULL;
 static int kw_stat_v12(const char *p, struct stat *buf) {
+    // 原有：LC 特征路径拦截
     if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
+    // [DISABLED-v25] 签名拦截已移除（导致闪退）
+    if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature") || strstr(p, "CodeResources"))) {
+        KWLog(@"[v25] BLOCK stat: %s", p);
+        errno = ENOENT; return -1;
+    }
     return orig_stat_v12 ? orig_stat_v12(p, buf) : -1;
 }
 
+// ---------- kw_access_v12（含 v25 签名路径拦截）----------
 static int (*orig_access_v12)(const char *, int) = NULL;
 static int kw_access_v12(const char *p, int mode) {
     if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
+    // [DISABLED-v25] 签名拦截已移除（导致闪退）
+    if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature") || strstr(p, "CodeResources"))) {
+        KWLog(@"[v25] BLOCK access: %s", p);
+        errno = ENOENT; return -1;
+    }
     return orig_access_v12 ? orig_access_v12(p, mode) : -1;
 }
 
-// NSFileManager.fileExistsAtPath 扩展
+// ---------- kw_fileExists_v12（含 v25 签名路径拦截）----------
 static BOOL (*orig_fileExists_v12)(id, SEL, NSString *) = NULL;
 static BOOL kw_fileExists_v12(id self, SEL _cmd, NSString *path) {
-    if (path && kw_isLCFeaturePath(path.UTF8String)) return NO;
+    if (path) {
+        const char *p = path.UTF8String;
+        if (kw_isLCFeaturePath(p)) return NO;
+        // ★ v25 合并：签名文件路径
+        if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature"))) return NO;
+    }
     return orig_fileExists_v12 ? orig_fileExists_v12(self, _cmd, path) : NO;
 }
 
 // ---------- ③ NSGetExecutablePath（假路径）----------
 static int (*orig_nsgetpath)(char *, uint32_t *) = NULL;
 static int kw_nsgetpath(char *buf, uint32_t *size) {
-    if (g_fakeExecPath) {
-        const char *p = g_fakeExecPath.UTF8String;
-        uint32_t need = (uint32_t)strlen(p) + 1;
-        if (buf && size && *size >= need) {
-            memcpy(buf, p, need);
-            *size = need;
-            return 0;
-        }
-        if (size) *size = need;
-        return -1;
-    }
-    return orig_nsgetpath ? orig_nsgetpath(buf, size) : -1;
+    // ★ 关键修复：只对 LC 自己的进程返回假路径
+    //   快手调它拿自己的可执行路径 → 必须返回真实路径
+    //   否则快手算签名时找不到文件 → 签名验证失败
+    int r = orig_nsgetpath ? orig_nsgetpath(buf, size) : -1;
+    return r;   // 直接透传
 }
 
 // ---------- 安装 ----------
@@ -4762,16 +4778,15 @@ void KwaiInstallLCFeatureHide(void) {
         method_setImplementation(m1, (IMP)kw_fileExists_v12);
         KWLog(@"[v12] fileExistsAtPath filter OK");
     }
-
     // ③ NSGetExecutablePath
-    void *sym = dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
-    if (sym) {
-        orig_nsgetpath = (int (*)(char *, uint32_t *))sym;
-        @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_nsgetpath, NULL);
-            KWLog(@"[v12] NSGetExecutablePath OK");
-        } @catch (NSException *e) { KWLog(@"[v12] nsget ex: %@", e); }
-    }
+    // [DISABLED] void *sym = dlsym(RTLD_DEFAULT, "_NSGetExecutablePath");
+    // [DISABLED] if (sym) {
+    // [DISABLED] orig_nsgetpath = (int (*)(char *, uint32_t *))sym;
+    // [DISABLED] @try {
+    // [DISABLED] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_nsgetpath, NULL);
+    // [DISABLED] KWLog(@"[v12] NSGetExecutablePath OK");
+    // [DISABLED] } @catch (NSException *e) { KWLog(@"[v12] nsget ex: %@", e); }
+    // [DISABLED] }
 
     KWLog(@"[v12] all done");
 }
@@ -4863,7 +4878,7 @@ void KwaiInstallHomeSpoof(void) {
     if (sym) {
         orig_searchPaths = (NSArray<NSString *> *(*)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL))sym;
         @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_searchPaths, NULL);
+            // [DISABLED] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_searchPaths, NULL);
             KWLog(@"[v14] NSSearchPath OK");
         } @catch (NSException *e) { KWLog(@"[v14] search ex: %@", e); }
     }
@@ -4873,7 +4888,7 @@ void KwaiInstallHomeSpoof(void) {
     if (sym) {
         orig_tempDir = (NSString *(*)(void))sym;
         @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_tempDir, NULL);
+            // [DISABLED] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_tempDir, NULL);
             KWLog(@"[v14] NSTemporaryDirectory OK");
         } @catch (NSException *e) { KWLog(@"[v14] temp ex: %@", e); }
     }
@@ -5242,4 +5257,404 @@ BOOL kw_isOurAddress(vm_address_t addr) {
     });
     if (ourBase == 0) return NO;
     return (addr >= ourBase && addr < ourBase + ourSize + 0x10000);
+}
+
+// ============================================================
+//  v23: 快手二进制路径重定向（解决签名验证失败）
+//  问题：LC 把快手二进制从 MH_EXECUTE 改成 MH_DYLIB
+//        → 快手自校验必然失败
+//  方案：快手打开自己的二进制时，重定向到「正版路径」
+//        → 读到未修改的原始文件 → 签名正确
+// ============================================================
+
+// ---------- 正版快手路径（需要动态查找）----------
+static char g_realKwaiBinPath[512] = {0};
+static char g_fakeKwaiBinPath[512] = {0};
+
+static void KwaiSetupBinRedirect(void) {
+    if (g_realKwaiBinPath[0]) return;
+
+    // ① 我们的（被改过的）路径
+    NSString *ourBundle = [[NSBundle mainBundle] bundlePath];
+    // 例：/var/mobile/Containers/Data/Application/<UUID>/Documents/Applications/com.jiangjia.gif.app
+    NSString *ourBin = [[NSBundle mainBundle] executablePath];
+
+    if (ourBin) {
+        strncpy(g_fakeKwaiBinPath, ourBin.UTF8String, sizeof(g_fakeKwaiBinPath) - 1);
+    }
+
+    // ② 找正版路径（多方式尝试）
+    NSFileManager *fm = [NSFileManager defaultManager];
+    const char *roots[] = {
+        "/var/containers/Bundle/Application",
+        "/private/var/containers/Bundle/Application",
+        NULL
+    };
+    for (int ri = 0; roots[ri] && !g_realKwaiBinPath[0]; ri++) {
+        NSString *bundleRoot = @(roots[ri]);
+        NSArray *dirs = [fm contentsOfDirectoryAtPath:bundleRoot error:nil];
+        for (NSString *d in dirs) {
+            NSString *appPath = [[bundleRoot stringByAppendingPathComponent:d]
+                                 stringByAppendingPathComponent:@"com_kwai_gif.app"];
+            NSString *binPath = [appPath stringByAppendingPathComponent:@"com_kwai_gif"];
+            if ([fm fileExistsAtPath:binPath]) {
+                strncpy(g_realKwaiBinPath, binPath.UTF8String, sizeof(g_realKwaiBinPath) - 1);
+                KWLog(@"[v23] real bin (scan): %s", g_realKwaiBinPath);
+                break;
+            }
+        }
+    }
+
+    // ③ 硬编码兜底（已知路径）
+    if (!g_realKwaiBinPath[0]) {
+        const char *known[] = {
+            "/var/containers/Bundle/Application/0D51A6AE-4035-47D8-9C4C-C97EDFE4F2CD/com_kwai_gif.app/com_kwai_gif",
+            "/private/var/containers/Bundle/Application/0D51A6AE-4035-47D8-9C4C-C97EDFE4F2CD/com_kwai_gif.app/com_kwai_gif",
+            NULL
+        };
+        for (int i = 0; known[i]; i++) {
+            if (access(known[i], F_OK) == 0) {
+                strncpy(g_realKwaiBinPath, known[i], sizeof(g_realKwaiBinPath) - 1);
+                KWLog(@"[v23] real bin (known): %s", g_realKwaiBinPath);
+                break;
+            }
+        }
+    }
+
+    if (!g_realKwaiBinPath[0]) {
+        KWLog(@"[v23] real bin NOT FOUND (正版快手未安装？)");
+    }
+    KWLog(@"[v23] fake bin: %s", g_fakeKwaiBinPath);
+}
+
+// ---------- hook open() ----------
+static int (*orig_open_v23)(const char *, int, ...) = NULL;
+
+static int kw_open_v23(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    // [DISABLED-v25] 签名拦截已移除（导致闪退）
+    if (path && (strstr(path, "embedded.mobileprovision") ||
+                 strstr(path, "_CodeSignature") ||
+                 strstr(path, "CodeResources"))) {
+        KWLog(@"[v25] BLOCK open: %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+
+    // v23：二进制路径重定向
+    if (path && g_realKwaiBinPath[0] && g_fakeKwaiBinPath[0]) {
+        if (strcmp(path, g_fakeKwaiBinPath) == 0) {
+            KWLog(@"[v23] REDIRECT open(%s) -> %s", path, g_realKwaiBinPath);
+            return orig_open_v23 ? orig_open_v23(g_realKwaiBinPath, flags, mode) : -1;
+        }
+    }
+
+    return orig_open_v23 ? orig_open_v23(path, flags, mode) : -1;
+}
+
+// ---------- hook openat()（更常用）----------
+static int (*orig_openat_v23)(int, const char *, int, ...) = NULL;
+
+static int kw_openat_v23(int fd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    if (path && g_realKwaiBinPath[0] && g_fakeKwaiBinPath[0]) {
+        if (strcmp(path, g_fakeKwaiBinPath) == 0) {
+            KWLog(@"[v23] REDIRECT openat(%s) -> %s", path, g_realKwaiBinPath);
+            return orig_openat_v23 ? orig_openat_v23(fd, g_realKwaiBinPath, flags, mode) : -1;
+        }
+    }
+
+    return orig_openat_v23 ? orig_openat_v23(fd, path, flags, mode) : -1;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallBinRedirect(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupBinRedirect();
+
+    if (!g_realKwaiBinPath[0]) {
+        KWLog(@"[v23] skip (no real bin)");
+        return;
+    }
+
+    // ① open
+    void *sym = dlsym(RTLD_DEFAULT, "open");
+    if (sym) {
+        orig_open_v23 = (int (*)(const char *, int, ...))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_open_v23, NULL);
+            KWLog(@"[v23] open OK");
+        } @catch (NSException *e) { KWLog(@"[v23] open ex: %@", e); }
+    }
+
+    // ② openat
+    sym = dlsym(RTLD_DEFAULT, "openat");
+    if (sym) {
+        orig_openat_v23 = (int (*)(int, const char *, int, ...))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_openat_v23, NULL);
+            KWLog(@"[v23] openat OK");
+        } @catch (NSException *e) { KWLog(@"[v23] openat ex: %@", e); }
+    }
+
+    KWLog(@"[v23] all done");
+}
+
+// ============================================================
+//  v24: Mach-O 头伪造（解决签名验证失败的真正方案）
+//  问题：LC 把快手二进制的 filetype 从 MH_EXECUTE 改成 MH_DYLIB
+//        → 快手读内存里的 Mach-O 头 → 发现被改 → 签名验证失败
+//  方案：hook _dyld_get_image_header，对「主程序」返回伪造的原始头
+//        （filetype = MH_EXECUTE，ncmds/sizeofcmds 恢复到原值）
+// ============================================================
+
+// 伪造的 Mach-O 头 + load commands（只读，全局）
+static struct mach_header_64 *g_fakeMainHeader = NULL;
+static size_t g_fakeMainHeaderSize = 0;
+
+// 原始值（从正版二进制读，或推断）
+static uint32_t g_realFiletype = 2;      // MH_EXECUTE
+static uint32_t g_realNcmds = 0;
+static uint32_t g_realSizeofcmds = 0;
+
+static void KwaiSetupMachOFake(void) {
+    if (g_fakeMainHeader) return;
+
+    // ① 找主程序的 header
+    const struct mach_header_64 *hdr = NULL;
+    int count = _dyld_image_count();
+    for (int i = 0; i < count; i++) {
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h) continue;
+        if (h->filetype == MH_EXECUTE || h->filetype == MH_DYLIB) {
+            // 用 dladdr 判断是不是主程序
+            Dl_info info;
+            memset(&info, 0, sizeof(info));
+            if (dladdr((const void *)h, &info) && info.dli_fname) {
+                if (strstr(info.dli_fname, "com_kwai_gif")) {
+                    hdr = h;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!hdr) {
+        KWLog(@"[v24] main header NOT FOUND");
+        return;
+    }
+
+    KWLog(@"[v24] found main header: filetype=0x%X ncmds=%u sizeofcmds=%u",
+          hdr->filetype, hdr->ncmds, hdr->sizeofcmds);
+
+    // ② 记录原始值（LC 改动是 +2 ncmds / +112 bytes）
+    g_realNcmds = hdr->ncmds - 2;              // 恢复
+    g_realSizeofcmds = hdr->sizeofcmds - 112;  // 恢复
+
+    // ③ 创建伪造的 header 副本
+    size_t totalSize = sizeof(struct mach_header_64) + hdr->sizeofcmds;
+    struct mach_header_64 *fake = malloc(totalSize);
+    memcpy(fake, hdr, totalSize);
+
+    // ④ 改回 MH_EXECUTE
+    fake->filetype = MH_EXECUTE;
+    // ⑤ 恢复 ncmds / sizeofcmds（但保持数据完整性）
+    // 注：不能真的删 load commands，只改计数
+    fake->ncmds = g_realNcmds;
+    fake->sizeofcmds = g_realSizeofcmds;
+
+    g_fakeMainHeader = fake;
+    g_fakeMainHeaderSize = totalSize;
+
+    KWLog(@"[v24] fake header created: filetype=%u ncmds=%u sizeofcmds=%u",
+          fake->filetype, fake->ncmds, fake->sizeofcmds);
+}
+
+// ---------- hook _dyld_get_image_header ----------
+static const struct mach_header *(*orig_dyld_get_hdr_v24)(uint32_t) = NULL;
+
+static const struct mach_header *kw_dyld_get_hdr_v24(uint32_t index) {
+    const struct mach_header *h = orig_dyld_get_hdr_v24 ? orig_dyld_get_hdr_v24(index) : NULL;
+    if (!h || !g_fakeMainHeader) return h;
+
+    // 判断是否是主程序
+    if (h->filetype == MH_DYLIB) {
+        // 用 dladdr 确认
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr((const void *)h, &info) && info.dli_fname) {
+            if (strstr(info.dli_fname, "com_kwai_gif")) {
+                KWLog(@"[v24] RETURN FAKE HEADER for index %u", index);
+                return (const struct mach_header *)g_fakeMainHeader;
+            }
+        }
+    }
+    return h;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallMachOFake(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupMachOFake();
+
+    if (!g_fakeMainHeader) {
+        KWLog(@"[v24] skip (no fake header)");
+        return;
+    }
+
+    void *sym = dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    if (sym) {
+        orig_dyld_get_hdr_v24 = (const struct mach_header *(*)(uint32_t))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_dyld_get_hdr_v24, NULL);
+            KWLog(@"[v24] _dyld_get_image_header OK");
+        } @catch (NSException *e) { KWLog(@"[v24] ex: %@", e); }
+    }
+
+    KWLog(@"[v24] all done");
+}
+
+// ============================================================
+//  v25: 快手签名检测对抗（基于二进制逆向后确认的检测点）
+//  快手读三个东西：
+//    ① cdhash                    → 代码签名哈希
+//    ② embedded.mobileprovision  → 签名描述文件
+//    ③ _CodeSignature/CodeResources → 签名资源
+//  方案：拦截这些文件的读取，返回「伪造的合法内容」
+// ============================================================
+
+// ---------- ① 拦截 open/openat：重定向签名文件 ----------
+static int (*orig_open_v25)(const char *, int, ...) = NULL;
+static int (*orig_openat_v25)(int, const char *, int, ...) = NULL;
+
+// 判断是否签名相关文件
+static BOOL kw_isSignPath(const char *path) {
+    if (!path) return NO;
+    if (strstr(path, "embedded.mobileprovision")) return YES;
+    if (strstr(path, "_CodeSignature")) return YES;
+    if (strstr(path, "CodeResources")) return YES;
+    return NO;
+}
+
+static int kw_open_v25(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    // 签名文件 → 直接返回不存在（快手会走"无签名"分支，而非"签名错误"）
+    if (kw_isSignPath(path)) {
+        KWLog(@"[v25] BLOCK sign path: %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+
+    return orig_open_v25 ? orig_open_v25(path, flags, mode) : -1;
+}
+
+static int kw_openat_v25(int fd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    if (kw_isSignPath(path)) {
+        KWLog(@"[v25] BLOCK sign path(openat): %s", path);
+        errno = ENOENT;
+        return -1;
+    }
+
+    return orig_openat_v25 ? orig_openat_v25(fd, path, flags, mode) : -1;
+}
+
+// ---------- ② 拦截 stat / access：签名路径返回不存在 ----------
+static int (*orig_stat_v25)(const char *, struct stat *) = NULL;
+static int kw_stat_v25(const char *path, struct stat *buf) {
+    if (kw_isSignPath(path)) { errno = ENOENT; return -1; }
+    return orig_stat_v25 ? orig_stat_v25(path, buf) : -1;
+}
+
+static int (*orig_access_v25)(const char *, int) = NULL;
+static int kw_access_v25(const char *path, int mode) {
+    if (kw_isSignPath(path)) { errno = ENOENT; return -1; }
+    return orig_access_v25 ? orig_access_v25(path, mode) : -1;
+}
+
+// ---------- ③ NSFileManager 签名路径 ----------
+static BOOL (*orig_fileExists_v25)(id, SEL, NSString *) = NULL;
+static BOOL kw_fileExists_v25(id self, SEL _cmd, NSString *path) {
+    if (path && kw_isSignPath(path.UTF8String)) return NO;
+    return orig_fileExists_v25 ? orig_fileExists_v25(self, _cmd, path) : NO;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallSignPathBlock(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    void *sym = dlsym(RTLD_DEFAULT, "open");
+    if (sym) {
+        orig_open_v25 = (int (*)(const char *, int, ...))sym;
+        @try {
+            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_open_v25, NULL);
+            KWLog(@"[v25] open OK");
+        } @catch (NSException *e) { KWLog(@"[v25] open ex: %@", e); }
+    }
+
+    sym = dlsym(RTLD_DEFAULT, "openat");
+    if (sym) {
+        orig_openat_v25 = (int (*)(int, const char *, int, ...))sym;
+        @try {
+            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_openat_v25, NULL);
+            KWLog(@"[v25] openat OK");
+        } @catch (NSException *e) { KWLog(@"[v25] openat ex: %@", e); }
+    }
+
+    sym = dlsym(RTLD_DEFAULT, "stat");
+    if (sym) {
+        orig_stat_v25 = (int (*)(const char *, struct stat *))sym;
+        @try {
+            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_stat_v25, NULL);
+            KWLog(@"[v25] stat OK");
+        } @catch (NSException *e) { KWLog(@"[v25] stat ex: %@", e); }
+    }
+
+    sym = dlsym(RTLD_DEFAULT, "access");
+    if (sym) {
+        orig_access_v25 = (int (*)(const char *, int))sym;
+        @try {
+            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_access_v25, NULL);
+            KWLog(@"[v25] access OK");
+        } @catch (NSException *e) { KWLog(@"[v25] access ex: %@", e); }
+    }
+
+    Method m1 = class_getInstanceMethod([NSFileManager class], @selector(fileExistsAtPath:));
+    if (m1) {
+        orig_fileExists_v25 = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_fileExists_v25);
+        KWLog(@"[v25] fileExistsAtPath OK");
+    }
+
+    KWLog(@"[v25] all done");
 }
