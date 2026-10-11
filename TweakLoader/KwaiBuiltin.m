@@ -29,6 +29,7 @@ void KwaiInstallTimeSpoof(void);
 void KwaiInstallStorageSpoof(void);
 void KwaiInstallBatterySpoof(void);
 void KwaiInstallExtSpoof(void);
+void KwaiInstallDeepSpoof(void);
 
 static NSString * const kApiV2Token = @"eyJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIyMTA1MzE0NDk1MTQ3ODAyNjI0Iiwic3ViIjoiMzc0NDg3NTc0IiwiaWF0IjoxNzkwODc5OTc4LCJyb2xlcyI6IlJPTEVfTk9STUFMIiwiZXhwIjoxNzkzNDcxOTc4fQ.A7ncnsAFqwUTrvGMCBZtJavKQZwaaLYzKFelynN13aU";
 static NSString * const kDefAppId = @"wxaadbab9d13edff20";
@@ -1567,6 +1568,7 @@ static void KwaiInstallSpoof(void) {
     KwaiInstallStorageSpoof();
     KwaiInstallBatterySpoof();
     KwaiInstallExtSpoof();
+    KwaiInstallDeepSpoof();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
     {
@@ -3501,4 +3503,230 @@ void KwaiInstallExtSpoof(void) {
     }
 
     KWLog(@"[ext] all done");
+}
+
+// ============================================================
+//  深度伪装补全 v3
+//  覆盖快手 Weapon 全部采集器：
+//    BatteryCollector  -> 电量/充电状态/电压/电流
+//    DeviceCpuCollector -> CPU 型号/频率/类型
+//    ScreenCollector   -> 尺寸/亮度/缩放
+//    DiskCollector     -> 磁盘型号/容量
+//    AirPlaneCollector -> 飞行模式
+//    VolumeCollector   -> 音量
+//    IDFACollector     -> IDFA 完整
+// ============================================================
+
+static float g_fakeBatteryLevel = 0;      // 电量 0.0~1.0
+static int   g_fakeBatteryState = 0;      // 0=未知 1=未充 2=充电 3=满
+static float g_fakeBrightness = 0;        // 屏幕亮度
+
+static void KwaiSetupDeepSpoof(void) {
+    if (g_fakeBatteryLevel > 0) return;
+    unsigned long seed = KwaiContainerSeed();
+    // 电量：长期使用常见 20%~85%
+    g_fakeBatteryLevel = 0.20f + (float)((seed >> 11) % 66) / 100.0f;
+    // 充电状态：不充电
+    g_fakeBatteryState = 1;
+    // 亮度：0.3~0.9
+    g_fakeBrightness = 0.30f + (float)((seed >> 17) % 61) / 100.0f;
+    KWLog(@"[deep] battery=%.0f%% state=%d brightness=%.2f",
+          g_fakeBatteryLevel * 100, g_fakeBatteryState, g_fakeBrightness);
+}
+
+// ---------- ① 电池电量 / 充电状态 ----------
+static float (*orig_batteryLevel)(id, SEL) = NULL;
+static float kw_batteryLevel(id self, SEL _cmd) {
+    if (g_fakeBatteryLevel > 0) return g_fakeBatteryLevel;
+    return orig_batteryLevel ? orig_batteryLevel(self, _cmd) : -1.0f;
+}
+
+static NSInteger (*orig_batteryState)(id, SEL) = NULL;
+static NSInteger kw_batteryState(id self, SEL _cmd) {
+    if (g_fakeBatteryLevel > 0) return (NSInteger)g_fakeBatteryState;
+    return orig_batteryState ? orig_batteryState(self, _cmd) : 0;
+}
+
+static BOOL (*orig_batteryMonitoring)(id, SEL) = NULL;
+static BOOL kw_batteryMonitoring(id self, SEL _cmd) {
+    return YES;   // 真机默认开启监控
+}
+
+// ---------- ② CPU 类型 / 频率 ----------
+static int (*orig_sysctlbyname_cpu)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
+                                void *newp, size_t newlen) {
+    if (g_fakeFreqMHz > 0 && name && oldp && oldlenp) {
+        // CPU 频率
+        if (strcmp(name, "hw.cpufrequency") == 0) {
+            long long f = (long long)g_fakeFreqMHz * 1000000LL;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = f; *oldlenp = sizeof(long long); return 0; }
+        }
+        if (strcmp(name, "hw.cpufrequency_max") == 0 ||
+            strcmp(name, "hw.cpufrequency_min") == 0) {
+            long long f = (long long)g_fakeFreqMHz * 1000000LL;
+            if (strcmp(name, "hw.cpufrequency_min") == 0) f = f / 2;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = f; *oldlenp = sizeof(long long); return 0; }
+        }
+        // CPU 类型（arm64 = 16777228 = 0x100000C）
+        if (strcmp(name, "hw.cputype") == 0) {
+            int t = 16777228;
+            if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
+        }
+        // CPU 子类型（arm64e = 2, arm64 = 0）
+        if (strcmp(name, "hw.cpusubtype") == 0) {
+            int t = g_fakeArmE ? 2 : 0;
+            if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
+        }
+        // CPU 系列（A15 = 0x1B588BB3 / A16 = 0xDA33D83D）
+        if (strcmp(name, "hw.cpufamily") == 0) {
+            int t = (g_fakeSoCId >= 0x8120) ? 0xDA33D83D : 0x1B588BB3;
+            if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
+        }
+        // 缓存大小（与机型匹配）
+        if (strcmp(name, "hw.l1icachesize") == 0) {
+            long long v = 131072;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        }
+        if (strcmp(name, "hw.l2cachesize") == 0) {
+            long long v = (g_fakeSoCId >= 0x8120) ? 16777216LL : 4194304LL;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        }
+        if (strcmp(name, "hw.cachelinesize") == 0) {
+            long long v = 128;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        }
+        // 总线频率
+        if (strcmp(name, "hw.busfrequency") == 0) {
+            long long v = (long long)g_fakeFreqMHz * 1000000LL;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        }
+        // 可选 CPU（大小核）
+        if (strcmp(name, "hw.perflevel0.physicalcpu") == 0 ||
+            strcmp(name, "hw.perflevel1.physicalcpu") == 0) {
+            int v = (g_fakeNCPU >= 6) ? 2 : 4;
+            if (strcmp(name, "hw.perflevel1.physicalcpu") == 0) v = g_fakeNCPU - 2;
+            if (*oldlenp >= sizeof(int)) { *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+        }
+        if (strcmp(name, "hw.perflevel0.name") == 0) {
+            const char *v = "Performance";
+            size_t n = strlen(v) + 1;
+            if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+        }
+        if (strcmp(name, "hw.perflevel1.name") == 0) {
+            const char *v = "Efficiency";
+            size_t n = strlen(v) + 1;
+            if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+        }
+    }
+    return orig_sysctlbyname_cpu ? orig_sysctlbyname_cpu(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// ---------- ③ 屏幕亮度 / 尺寸 ----------
+static CGFloat (*orig_brightness)(id, SEL) = NULL;
+static CGFloat kw_brightness(id self, SEL _cmd) {
+    if (g_fakeBrightness > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]]) return g_fakeBrightness;
+    }
+    return orig_brightness ? orig_brightness(self, _cmd) : 0.5;
+}
+
+// ---------- ④ 磁盘型号 / 容量 ----------
+// （已在 KwaiInstallStorageSpoof 处理 statfs）
+
+// ---------- ⑤ 飞行模式 ----------
+static int (*orig_sysctlbyname_air)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int kw_sysctlbyname_air(const char *name, void *oldp, size_t *oldlenp,
+                                void *newp, size_t newlen) {
+    if (name && oldp && oldlenp) {
+        // 飞行模式：返回 0（关闭）
+        if (strcmp(name, "hw.airplanemode") == 0) {
+            int v = 0;
+            if (*oldlenp >= sizeof(int)) { *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+        }
+    }
+    return orig_sysctlbyname_air ? orig_sysctlbyname_air(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// ---------- ⑥ 音量 ----------
+// AVAudioSession.outputVolume → 用 method swizzle
+static float (*orig_outputVolume)(id, SEL) = NULL;
+static float kw_outputVolume(id self, SEL _cmd) {
+    // 长期使用：音量 0.3~0.8
+    unsigned long seed = KwaiContainerSeed();
+    return 0.30f + (float)((seed >> 23) % 51) / 100.0f;
+}
+
+// ---------- ⑦ IDFA 完整 ----------
+static NSUUID *(*orig_advId)(id, SEL) = NULL;
+static NSUUID *kw_advId(id self, SEL _cmd) {
+    if (g_fakeIDFA) return [[NSUUID alloc] initWithUUIDString:g_fakeIDFA];
+    return orig_advId ? orig_advId(self, _cmd) : nil;
+}
+
+static BOOL (*orig_advTracking)(id, SEL) = NULL;
+static BOOL kw_advTracking(id self, SEL _cmd) {
+    return NO;   // 未授权追踪（真实用户多为关闭）
+}
+
+// ---------- 安装 ----------
+void KwaiInstallDeepSpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupDeepSpoof();
+
+    // ① UIDevice 电池
+    Method m1 = class_getInstanceMethod([UIDevice class], @selector(batteryLevel));
+    if (m1) { orig_batteryLevel = (void *)method_getImplementation(m1);
+              method_setImplementation(m1, (IMP)kw_batteryLevel); KWLog(@"[deep] batteryLevel OK"); }
+
+    Method m2 = class_getInstanceMethod([UIDevice class], @selector(batteryState));
+    if (m2) { orig_batteryState = (void *)method_getImplementation(m2);
+              method_setImplementation(m2, (IMP)kw_batteryState); KWLog(@"[deep] batteryState OK"); }
+
+    // ② CPU（sysctlbyname）
+    orig_sysctlbyname_cpu = sysctlbyname;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)kw_sysctlbyname_cpu, NULL);
+        KWLog(@"[deep] CPU sysctl OK");
+    } @catch (NSException *e) { KWLog(@"[deep] CPU ex: %@", e); }
+
+    // ③ 屏幕亮度
+    Method m3 = class_getInstanceMethod([UIScreen class], @selector(brightness));
+    if (m3) { orig_brightness = (void *)method_getImplementation(m3);
+              method_setImplementation(m3, (IMP)kw_brightness); KWLog(@"[deep] brightness OK"); }
+
+    // ⑤ 飞行模式
+    orig_sysctlbyname_air = sysctlbyname;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)kw_sysctlbyname_air, NULL);
+        KWLog(@"[deep] airplane OK");
+    } @catch (NSException *e) { KWLog(@"[deep] air ex: %@", e); }
+
+    // ⑥ 音量
+    Class avClass = NSClassFromString(@"AVAudioSession");
+    if (avClass) {
+        Method m4 = class_getInstanceMethod(avClass, @selector(outputVolume));
+        if (m4) { orig_outputVolume = (void *)method_getImplementation(m4);
+                  method_setImplementation(m4, (IMP)kw_outputVolume); KWLog(@"[deep] outputVolume OK"); }
+    }
+
+    // ⑦ IDFA
+    Class asClass = NSClassFromString(@"ASIdentifierManager");
+    if (asClass) {
+        Method m5 = class_getClassMethod(asClass, @selector(sharedManager));
+        if (m5) { /* 不改 sharedManager */ }
+        SEL advSel = NSSelectorFromString(@"advertisingIdentifier");
+        Method m6 = class_getInstanceMethod(asClass, advSel);
+        if (m6) { orig_advId = (void *)method_getImplementation(m6);
+                  method_setImplementation(m6, (IMP)kw_advId); KWLog(@"[deep] advertisingIdentifier OK"); }
+        SEL trackSel = NSSelectorFromString(@"isAdvertisingTrackingEnabled");
+        Method m7 = class_getInstanceMethod(asClass, trackSel);
+        if (m7) { orig_advTracking = (void *)method_getImplementation(m7);
+                  method_setImplementation(m7, (IMP)kw_advTracking); KWLog(@"[deep] trackingEnabled OK"); }
+    }
+
+    KWLog(@"[deep] all done");
 }
