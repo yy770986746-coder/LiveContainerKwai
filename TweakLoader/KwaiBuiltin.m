@@ -1150,7 +1150,7 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
         if (r == 0 && *oldlenp > 0) {
             char *p = (char *)oldp;
             size_t len = *oldlenp;
-            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_HOME_PATH", "DYLD_INSERT_LIBRARIES",
+            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
                                  "LC_DATA_UUID", "JB_ROOT", "DOPAMINE", "SUBSTRATE",
                                  "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER", NULL};
             for (int i = 0; bad[i]; i++) {
@@ -4887,24 +4887,23 @@ void KwaiInstallHomeSpoof(void) {
 
 // ---------- ① 彻底清理环境变量 ----------
 static void KwaiCleanEnv(void) {
-    // LC 注入的变量（快手可从 KERN_PROCARGS2 读到）
+    // ★ 关键：只清理「越狱/注入」相关变量
+    //   ★★ 绝不能清 LC_HOME_PATH / HOME / LC_GLOBAL_TWEAKS_FOLDER
+    //       因为 LC 自己的 NSFileManager+GuestHooks 依赖它们
+    //       清了会 getenv 返回 NULL → stringWithUTF8String:NULL → 崩溃
     const char *vars[] = {
-        "LC_GLOBAL_TWEAKS_FOLDER", "LC_HOME_PATH", "LC_APP_GROUP_PATH",
-        "LC_DATA_UUID", "LC_SELECTED_CONTAINER", "LC_TWEAK_FOLDER",
-        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
-        "DYLD_ROOT_PATH", "DYLD_SHARED_CACHE_DIR", "DYLD_SHARED_REGION",
-        "_MSSafeMode", "JB_ROOT", "DOPAMINE_ROOT", "SUBSTRATE_ROOT",
+        "JB_ROOT", "DOPAMINE_ROOT", "SUBSTRATE_ROOT",
         "THEOS", "LIBHOOKER", "ellekit", "DISABLE_TWEAKS",
+        "_MSSafeMode",
+        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+        "DYLD_ROOT_PATH", "DYLD_SHARED_CACHE_DIR",
         NULL
     };
     int cleared = 0;
     for (int i = 0; vars[i]; i++) {
-        if (getenv(vars[i])) {
-            unsetenv(vars[i]);
-            cleared++;
-        }
+        if (getenv(vars[i])) { unsetenv(vars[i]); cleared++; }
     }
-    KWLog(@"[v15] cleared %d env vars", cleared);
+    KWLog(@"[v15] cleared %d env vars (LC_* preserved)", cleared);
 }
 
 // ---------- ② dlopen 反检测 ----------
@@ -4934,7 +4933,7 @@ static int kw_sysctl_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
             char *p = (char *)oldp;
             size_t len = *oldlenp;
             // 清理敏感字符串
-            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_HOME_PATH", "DYLD_INSERT_LIBRARIES",
+            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
                                  "LC_DATA_UUID", "JB_ROOT", "DOPAMINE", NULL};
             const char *good[] = {"", "", "", "", "", "", NULL};
             for (int i = 0; bad[i]; i++) {
