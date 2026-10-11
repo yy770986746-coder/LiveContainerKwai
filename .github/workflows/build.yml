@@ -78,7 +78,9 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             -disableAutomaticPackageResolution=false \
             archive \
-            2>&1 | tee /tmp/build_full.log | tail -150
+            2>&1 | tee /tmp/b.log
+          # 只显示关键行
+          grep -E "error:|warning: .*deprecated|BUILD FAILED|ARCHIVE" /tmp/b.log | head -60 || true
 
       - name: Locate
         if: always()
