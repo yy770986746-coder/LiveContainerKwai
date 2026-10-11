@@ -330,6 +330,14 @@
                 if(patchResult & PATCH_EXEC_RESULT_NO_SPACE_FOR_TWEAKLOADER) {
                     info[@"LCTweakLoaderCantInject"] = @YES;
                     info[@"dontInjectTweakLoader"] = @YES;
+                } else if(patchResult == 0) {
+                    // 修复：注入成功时清除旧的失败标记（否则用户永远开不了开关）
+                    if([info[@"LCTweakLoaderCantInject"] boolValue] ||
+                       [info[@"dontInjectTweakLoader"] boolValue]) {
+                        [info removeObjectForKey:@"LCTweakLoaderCantInject"];
+                        [info removeObjectForKey:@"dontInjectTweakLoader"];
+                        NSLog(@"[LCPatch] cleared stale dontInjectTweakLoader flag");
+                    }
                 }
                 if(patchResult & PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH) {
                     info[@"segCountMismatch"] = @YES;
