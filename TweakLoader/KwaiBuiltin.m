@@ -1,11 +1,39 @@
-// KwaiWeChatLogin.m 鈥斺€?蹇墜寰俊鐧诲綍鍔╂墜 v1.0
-// 鐢ㄩ€旓細LiveContainer 鍐呭揩鎵嬨€屽井淇＄櫥褰曘€嶈嚜鍔ㄦ巿鏉?// 杩愯鐜锛歀iveContainer TweakLoader锛堟棤闇€瓒婄嫳锛?#import <Foundation/Foundation.h>
+// KwaiWeChatLogin.m   v1.0
+// LiveContainer 
+// LiveContainer TweakLoader
+#import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#include <mach/mach_time.h>
+#include <sys/time.h>
+#include <sys/sysctl.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#include <dlfcn.h>
+#import "litehook.h"
 
-static NSString * const kDefApi   = @"http://211.154.19.45:9092";
+static NSString * const kDefApi   = @"http://121.229.205.215:9092";
+static NSString * const kApiV2Base = @"http://cnc.cn1001.top/openapi/cl-service/partner/v1";
+static NSString * const kEryueApi  = @"https://www.eryueop.com/api.php";
+static NSString * const kQQGameId  = @"100228415";   // 快手普通版
+// 缓存的 QQ 授权 URL（避免每次请求 eryueop）
+static NSString * const kQQUrlCache = @"tencent100228415://qzapp/mqzone/0?objectlocation=url&pasteboard=YnBsaXN0MDBieWJpcGxpc3QxLjDUAQIDBAUGBwhZJGFyY2hpdmVyWCRvYmplY3RzVCR0b3BYJHZlcnNpb25fEA9OU0tleWVkQXJjaGl2ZXKvEBwJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkVSRudWxs0yUmJygpKlYkY2xhc3NXTlMua2V5c1pOUy5vYmplY3RzgBusKywtLi8wMTIzNDU2gAKAA4AEgAWABoAHgAiACYAKgAuADIANrDc4OTo7PD0+P0BBQoAOgA+AEIARgBOAFIAVgBaAF4AYgBmAGlpleHBpcmVzX2luXxASYXBwc2lnbl9idW5kbGVudWxsWmVuY3J5dG9rZW5ccGFzc0RhdGFSZXNwU3JldFZvcGVuaWRScGZedXNlcl9jYW5jZWxsZWRVcGZrZXlZcGF5X3Rva2VuU21zZ1xhY2Nlc3NfdG9rZW4SAHanAFEyXxAgZGQwMmMxMTMwMmUwOWY4NTQwMGI4MzRiYmQzYWMwNGTSJSdDRIASoNJFRkdIWCRjbGFzc2VzWiRjbGFzc25hbWWjSElKV05TQXJyYXlYTlNPYmplY3ReTlNNdXRhYmxlQXJyYXkQAF8QIERDMjMxREVFMEUxRjFFQUVFQTc0ODIzMjRERUEyMkRFXm9wZW5tb2JpbGVfaW9zUk5PXxAgNjVkMGEzMGJlZGJjNzNmNTNkODM3MDE0MWU2MjIwZGZfECA1MUUxRTRGOEExMTM5NUVEN0YwNUE4RkUyMjFGOUM1RVBfECA1MEZGN0ExRDMzQTNDNTU4RjJFQjA5REM4RDEzNDFDONJFRktMo0xNSlxOU0RpY3Rpb25hcnlfEBNOU011dGFibGVEaWN0aW9uYXJ50U5PVHJvb3SAARIAAYagABQAHQAnADAANQA+AFAClAKeAG8AdQDiAO0BAgENARoBHgElASgBNwE9AUcBSwFYAV0BXwGCAYoBxwHJAewB+wH+AiECRAJFAmgAfACDAIsAlgCYAL0ApQCnAKkAqwCtAK8AsQCzALUAtwC5ALsAygDMAM4A0ADSANQA1gDYANoA3ADeAOABhwGJAY8BmAGjAbgBpwGvAm0CfgJxApcCnAAAAAAAAAIBAAAAAAAAAFAAAAAAAAAAAAAAAAAAAAKj";
+static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
+
+// ---------- 前置声明 ----------
+static unsigned long KwaiContainerSeed(void);
+void KwaiInstallTimeSpoof(void);
+
+static NSString * const kApiV2Token = @"eyJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIyMTA1MzE0NDk1MTQ3ODAyNjI0Iiwic3ViIjoiMzc0NDg3NTc0IiwiaWF0IjoxNzkwODc5OTc4LCJyb2xlcyI6IlJPTEVfTk9STUFMIiwiZXhwIjoxNzkzNDcxOTc4fQ.A7ncnsAFqwUTrvGMCBZtJavKQZwaaLYzKFelynN13aU";
 static NSString * const kDefAppId = @"wxaadbab9d13edff20";
 static NSString * const kDefGrade = @"1";
+// ---- ????????? ----
+static void KwaiReadFromCache(void);
+static void KwaiDumpKeychain(void);
+static void KwaiDumpPlist(void);
+static NSString *KwaiGetFiveString(void);
+void KwaiStartBallWatcher(void);
+void KwaiShowBall(void);
+BOOL KwaiIsLoggedIn(void);
 
 static void KWLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -22,17 +50,46 @@ static void KWLog(NSString *fmt, ...) {
     NSLog(@"[KwaiWeChatLogin] %@", m);
 }
 
-// ---------- 閰嶇疆 ----------
+// ----------  ----------
+// ??????guest ?? + LC ????????????
 static NSString *CfgPath(void) {
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     return [doc stringByAppendingPathComponent:@"kwlogin.plist"];
 }
-static NSMutableDictionary *CfgLoad(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
-    return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+static NSString *CfgSharedPath(void) {
+    // ?? LC ?????
+    @try {
+        Class cls = NSClassFromString(@"NSUserDefaults");
+        SEL sel = NSSelectorFromString(@"lcAppGroupPath");
+        if ([cls respondsToSelector:sel]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            NSString *p = [cls performSelector:sel];
+            #pragma clang diagnostic pop
+            if (p.length) return [p stringByAppendingPathComponent:@"kwlogin.plist"];
+        }
+    } @catch (NSException *e) {}
+    return nil;
 }
-static void CfgSave(NSDictionary *d) { [d writeToFile:CfgPath() atomically:YES]; }
-static NSString *CfgGet(NSString *k, NSString *def) {
+static NSMutableDictionary *CfgLoad(void) {
+    // ?? guest ??
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
+    if (d && d.count) return [d mutableCopy];
+    // ??????
+    NSString *sp = CfgSharedPath();
+    if (sp) {
+        d = [NSDictionary dictionaryWithContentsOfFile:sp];
+        if (d && d.count) return [d mutableCopy];
+    }
+    return [NSMutableDictionary dictionary];
+}
+static void CfgSave(NSDictionary *d) {
+    [d writeToFile:CfgPath() atomically:YES];
+    NSString *sp = CfgSharedPath();
+    if (sp) {
+        @try { [d writeToFile:sp atomically:YES]; } @catch (NSException *e) {}
+    }
+}static NSString *CfgGet(NSString *k, NSString *def) {
     id v = CfgLoad()[k];
     if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
     return def;
@@ -43,6 +100,30 @@ static void CfgSet(NSString *k, NSString *v) {
     CfgSave(d);
 }
 
+// ---------- ???? ----------
+// ????@"" ? @"1" = ????@"2" = ???
+static BOOL KWIsV2(void) {
+    return [CfgGet(@"platform", @"2") isEqualToString:@"2"];
+}
+
+// ? Bearer ??? GET
+static NSDictionary *HTTPGetAuth(NSString *url, NSString *bearer) {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    req.timeoutInterval = 20;
+    if (bearer.length) [req setValue:[NSString stringWithFormat:@"Bearer %@", bearer]
+                   forHTTPHeaderField:@"Authorization"];
+    NSURLResponse *resp = nil;
+    NSError *err = nil;
+    NSData *d = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+    if (err) { KWLog(@"[v2] req err: %@ url=%@", err.localizedDescription, url); return nil; }
+    if (!d) { KWLog(@"[v2] req no data url=%@", url); return nil; }
+    NSString *raw = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    KWLog(@"[v2] raw(%lu)=%@", (unsigned long)d.length, raw.length>400?[raw substringToIndex:400]:raw);
+    NSError *je = nil;
+    id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:&je];
+    if (je) { KWLog(@"[v2] json err: %@", je.localizedDescription); return nil; }
+    return [o isKindOfClass:[NSDictionary class]] ? o : nil;
+}
 // ---------- HTTP ----------
 static NSDictionary *HTTPGet(NSString *url) {
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
@@ -81,31 +162,49 @@ static BOOL my_canOpenURL(id self, SEL _cmd, NSURL *url) {
 
 static NSString *g_state = @"";
 static NSString *g_scope = @"snsapi_userinfo";
+static id g_kwaiDelegate = nil;
+static void KwaiInstallSpoof(void);
+static void KwaiInstallFiveParams(void);
 void KWDeliver(NSString *code);
+void KwaiInstallQQProbe(void);
+void KwaiInstallQQHook(void);
+void KQDeliver(NSString *qqUrl);
+extern id g_qqServiceInst;
+extern id g_qqDict;
+extern id g_qqSuccessBlock;
+extern id g_qqFailureBlock;
+void KQExchange(NSString *data, void (^done)(NSString *url, NSString *err));
 static void KWShowOrderList(void);
 
-// ---------- 閰嶇疆寮圭獥 ----------
+// ----------  ----------
 static void KWShowConfig(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *u = CfgGet(@"username", @"");
-        NSString *p = CfgGet(@"password", @"");
+        NSString *u  = CfgGet(@"username", @"");
+        NSString *p  = CfgGet(@"password", @"");
+        NSString *pf = CfgGet(@"platform", @"1");
         UIAlertController *ac = [UIAlertController
-            alertControllerWithTitle:@"蹇墜寰俊鐧诲綍 路 閰嶇疆"
-                             message:@"杈撳叆鎺堟潈骞冲彴璐﹀彿锛堟湰鍦颁繚瀛橈紝浠呴渶濉竴娆★級"
+            alertControllerWithTitle:@"Kwai WeChat Login"
+                             message:@"Platform 1=old  2=new(cnc)"
                       preferredStyle:UIAlertControllerStyleAlert];
         [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-            tf.placeholder = @"璐﹀彿"; tf.text = u;
-            tf.keyboardType = UIKeyboardTypeNumberPad;
+            tf.placeholder = @"Account"; tf.text = u;
         }];
         [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-            tf.placeholder = @"瀵嗙爜"; tf.text = p; tf.secureTextEntry = YES;
+            tf.placeholder = @"Password"; tf.text = p; tf.secureTextEntry = YES;
         }];
-        [ac addAction:[UIAlertAction actionWithTitle:@"鍙栨秷" style:UIAlertActionStyleCancel handler:nil]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"淇濆瓨" style:UIAlertActionStyleDefault
+        [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"Platform (1/2)"; tf.text = pf;
+            tf.keyboardType = UIKeyboardTypeNumberPad;
+        }];
+        [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
                     handler:^(UIAlertAction *a) {
             CfgSet(@"username", ac.textFields[0].text ?: @"");
             CfgSet(@"password", ac.textFields[1].text ?: @"");
-            KWLog(@"閰嶇疆宸蹭繚瀛?user=%@", ac.textFields[0].text);
+            NSString *pv = ac.textFields[2].text;
+            if (![pv isEqualToString:@"2"]) pv = @"1";
+            CfgSet(@"platform", pv);
+            KWLog(@"ConfigSave user=%@ platform=%@", ac.textFields[0].text, pv);
         }]];
         UIWindow *w = nil;
         for (UIWindow *win in [UIApplication sharedApplication].windows)
@@ -114,11 +213,11 @@ static void KWShowConfig(void) {
         UIViewController *root = w.rootViewController;
         while (root.presentedViewController) root = root.presentedViewController;
         if (root) [root presentViewController:ac animated:YES completion:nil];
-        KWLog(@"閰嶇疆绐楀凡寮瑰嚭");
+        KWLog(@"Config");
     });
 }
 
-// ---------- 璁㈠崟鍒楄〃 ----------
+// ----------  ----------
 @interface KwaiOrderVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) UILabel *headerLabel;
@@ -139,7 +238,7 @@ static void KWShowConfig(void) {
     CGFloat H = self.view.bounds.size.height;
 
     self.headerLabel = [[UILabel alloc] init];
-    self.headerLabel.text = @"閫夋嫨鎺堟潈鏂瑰紡";
+    self.headerLabel.text = @"Select Auth";
     self.headerLabel.textColor = [UIColor whiteColor];
     self.headerLabel.font = [UIFont boldSystemFontOfSize:20];
     self.headerLabel.textAlignment = NSTextAlignmentCenter;
@@ -148,7 +247,7 @@ static void KWShowConfig(void) {
     [self.view addSubview:self.headerLabel];
 
     self.statusLabel = [[UILabel alloc] init];
-    self.statusLabel.text = [NSString stringWithFormat:@"鍏?%lu 鏉¤鍗?路 鐐归€夊嵆澶嶆壂", (unsigned long)self.orders.count];
+    self.statusLabel.text = [NSString stringWithFormat:@"%lu orders - tap to re-auth", (unsigned long)self.orders.count];
     self.statusLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
     self.statusLabel.font = [UIFont systemFontOfSize:13];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
@@ -159,16 +258,34 @@ static void KWShowConfig(void) {
     UIButton *cfg = [UIButton buttonWithType:UIButtonTypeSystem];
     cfg.frame = CGRectMake(W-76, 54, 60, 30);
     cfg.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [cfg setTitle:@"閰嶇疆" forState:UIControlStateNormal];
+    [cfg setTitle:@"Config" forState:UIControlStateNormal];
     [cfg setTitleColor:[UIColor colorWithRed:0.4 green:0.7 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
     cfg.titleLabel.font = [UIFont systemFontOfSize:14];
     [cfg addTarget:self action:@selector(onConfig) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:cfg];
 
+    UIButton *five = [UIButton buttonWithType:UIButtonTypeSystem];
+    five.frame = CGRectMake(W-140, 54, 60, 30);
+    five.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [five setTitle:@"5P" forState:UIControlStateNormal];
+    [five setTitleColor:[UIColor colorWithRed:1.0 green:0.8 blue:0.3 alpha:1.0] forState:UIControlStateNormal];
+    five.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [five addTarget:self action:@selector(onFive) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:five];
+
+    UIButton *qq = [UIButton buttonWithType:UIButtonTypeSystem];
+    qq.frame = CGRectMake(W-200, 54, 60, 30);
+    qq.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [qq setTitle:@"QQ" forState:UIControlStateNormal];
+    [qq setTitleColor:[UIColor colorWithRed:0.4 green:0.85 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+    qq.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [qq addTarget:self action:@selector(onQQ) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:qq];
+
     UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
     cancel.frame = CGRectMake((W-140)/2, H-80, 140, 44);
     cancel.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
-    [cancel setTitle:@"鍙栨秷" forState:UIControlStateNormal];
+    [cancel setTitle:@"Cancel" forState:UIControlStateNormal];
     [cancel setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     cancel.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
     cancel.layer.cornerRadius = 8;
@@ -189,7 +306,58 @@ static void KWShowConfig(void) {
     KWLog(@"UI built rows=%lu", (unsigned long)[self.table numberOfRowsInSection:0]);
 }
 
+- (void)onQQ {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"QQ 授权"
+                         message:@"粘贴 QQ 授权数据（5 段 | 分隔）"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"数据号";
+        tf.text = CfgGet(@"qqdata", @"");
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"授权" style:UIAlertActionStyleDefault
+                handler:^(UIAlertAction *a) {
+        NSString *data = ac.textFields[0].text ?: @"";
+        if (!data.length) return;
+        CfgSet(@"qqdata", data);
+        self.statusLabel.text = @"QQ exchanging...";
+        KWLog(@"[qq] data len=%lu", (unsigned long)data.length);
+        KQExchange(data, ^(NSString *url, NSString *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (url.length) {
+                    self.statusLabel.text = @"QQ auth sent";
+                    KQDeliver(url);
+                } else {
+                    self.statusLabel.text = [NSString stringWithFormat:@"QQ failed: %@", err ?: @"?"];
+                }
+            });
+        });
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 - (void)onConfig { KWShowConfig(); }
+
+- (void)onFive {
+    // ??? static ?????? extern?
+    // ?????plist ??????
+    KwaiReadFromCache();
+    KwaiDumpPlist();
+    NSString *five = KwaiGetFiveString();
+    KWLog(@"[5p] UI five=%@", five);
+
+    NSString *show = five.length ? five : @"(empty - open Kwai first)";
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Five Params"
+                         message:show
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault
+                handler:^(UIAlertAction *a) {
+        [UIPasteboard generalPasteboard].string = five ?: @"";
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     return self.orders.count + 1;
@@ -203,13 +371,13 @@ static void KWShowConfig(void) {
     c.detailTextLabel.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
     c.detailTextLabel.font = [UIFont systemFontOfSize:11];
     if (ip.row == 0) {
-        c.textLabel.text = @"锛?鏂板缓鎺堟潈  (楼0.60)";
+        c.textLabel.text = @"+ New Auth (0.60)";
         c.textLabel.textColor = [UIColor colorWithRed:0.35 green:0.85 blue:0.5 alpha:1.0];
-        c.detailTextLabel.text = @"鐢熸垚鍏ㄦ柊鎺堟潈鐮?;
+        c.detailTextLabel.text = @"Fresh auth code";
         return c;
     }
     NSDictionary *o = self.orders[ip.row - 1];
-    c.textLabel.text = [NSString stringWithFormat:@"%@   澶嶆壂%@娆?,
+    c.textLabel.text = [NSString stringWithFormat:@"%@   v%@",
                         o[@"createTime"] ?: @"", o[@"version"] ?: @"1"];
     NSString *codeUrl = o[@"code"] ?: @"";
     NSString *shortCode = @"";
@@ -219,7 +387,7 @@ static void KWShowConfig(void) {
         NSRange a = [tail rangeOfString:@"&"];
         shortCode = (a.location==NSNotFound)?tail:[tail substringToIndex:a.location];
     }
-    c.detailTextLabel.text = [NSString stringWithFormat:@"%@   璁㈠崟 %@", shortCode, o[@"id"] ?: @""];
+    c.detailTextLabel.text = [NSString stringWithFormat:@"%@   order %@", shortCode, o[@"id"] ?: @""];
     return c;
 }
 
@@ -229,42 +397,67 @@ static void KWShowConfig(void) {
     self.busy = YES;
 
     NSString *user = CfgGet(@"username", @"");
-    NSString *pass = CfgGet(@"password", @"");
+        NSString *pass = CfgGet(@"password", @"");
     NSString *api  = CfgGet(@"api", kDefApi);
     NSString *appId= CfgGet(@"appid", kDefAppId);
     NSString *grade= CfgGet(@"grade", kDefGrade);
 
-    if (!user.length || !pass.length) {
-        self.busy = NO;
-        self.statusLabel.text = @"璇峰厛鐐瑰彸涓婅銆岄厤缃€?;
-        KWShowConfig();
+    // ?????? Token??????
+    BOOL needCfg = KWIsV2() ? (user.length == 0) : (!user.length || !pass.length);
+    if (needCfg) {
+        KWLog(@"ConfigConfig v2=%d user=%lu pass=%lu", KWIsV2(),
+              (unsigned long)user.length, (unsigned long)pass.length);
+        dispatch_async(dispatch_get_main_queue(), ^{ KWShowConfig(); });
         return;
     }
 
     if (ip.row == 0) {
-        self.statusLabel.text = @"姝ｅ湪鏂板缓鎺堟潈...";
-        KWLog(@"鏂板缓鎺堟潈");
+        self.statusLabel.text = @"Creating...";
+        KWLog(@"new auth");
         dispatch_async(dispatch_get_global_queue(0,0), ^{
-            NSDictionary *j = HTTPGet([NSString stringWithFormat:
-                @"%@/api/auth?username=%@&password=%@&appId=%@&grade=%@",
-                api, user, pass, appId, grade]);
+            NSDictionary *j = nil;
+            if (KWIsV2()) {
+                NSString *u = [NSString stringWithFormat:
+                    @"%@/trial/authorize?gameAppId=%@&channelMode=1&scanMode=1",
+                    kApiV2Base, appId];
+                j = HTTPGetAuth(u, kApiV2Token);
+                if (j && [j[@"flag"] boolValue]) {
+                    NSString *ac = j[@"data"][@"authorizationCode"];
+                    NSString *on = j[@"data"][@"trialOrderNo"];
+                    KWLog(@"[v2] auth ok ac=%@ on=%@", ac, on);
+                    j = @{ @"code": @20000,
+                           @"data": @{ @"code": ac ?: @"",
+                                       @"orderId": on ?: @"" },
+                           @"message": j[@"message"] ?: @"" };
+                } else {
+                    KWLog(@"[v2] auth not-ok j=%@", j);
+                }
+            } else {
+                j = HTTPGet([NSString stringWithFormat:
+                    @"%@/api/auth?username=%@&password=%@&appId=%@&grade=%@",
+                    api, user, pass, appId, grade]);
+            }
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.busy = NO;
-                KWLog(@"鏂板缓杩斿洖: %@", j[@"message"]);
+                KWLog(@": %@", j[@"message"]);
                 if ([j[@"code"] isEqual:@20000]) {
                     NSString *oid = j[@"data"][@"orderId"];
                     if (oid.length) CfgSet(@"last_order", oid);
                     [self finishWithCodeUrl:j[@"data"][@"code"]];
                 } else {
-                    self.statusLabel.text = [NSString stringWithFormat:@"澶辫触: %@", j[@"message"]];
+                    NSString *msg = j[@"message"];
+                    if (![msg isKindOfClass:[NSString class]] || msg.length == 0) {
+                        msg = j ? @"Request rejected" : @"Network error, retry";
+                    }
+                    self.statusLabel.text = [NSString stringWithFormat:@"Failed: %@", msg];
                 }
             });
         });
     } else {
         NSDictionary *o = self.orders[ip.row - 1];
         NSString *oid = o[@"id"];
-        self.statusLabel.text = [NSString stringWithFormat:@"姝ｅ湪澶嶆壂 %@ ...", oid];
-        KWLog(@"澶嶆壂 %@", oid);
+        self.statusLabel.text = [NSString stringWithFormat:@"Rescan %@", oid];
+        KWLog(@"rescan %@", oid);
         dispatch_async(dispatch_get_global_queue(0,0), ^{
             NSDictionary *body = @{
                 @"appId": appId, @"grade": @([grade intValue]), @"model": @1, @"type": @1,
@@ -272,15 +465,33 @@ static void KWShowConfig(void) {
                 @"orderId": oid,
                 @"qrCode": @"https://open.weixin.qq.com/connect/confirm?uuid="
             };
-            NSDictionary *j = HTTPPostJSON([NSString stringWithFormat:@"%@/autoAuth", api], body, self.token);
+            NSDictionary *j = nil;
+            if (KWIsV2()) {
+                NSString *u = [NSString stringWithFormat:
+                    @"%@/trial/authorize?gameAppId=%@&channelMode=1&scanMode=1&trialOrderNo=%@",
+                    kApiV2Base, appId, oid];
+                j = HTTPGetAuth(u, kApiV2Token);
+                if (j && [j[@"flag"] boolValue]) {
+                    NSString *authCode = j[@"data"][@"authorizationCode"];
+                    j = @{ @"code": @20000,
+                           @"data": @{ @"code": authCode ?: @"" },
+                           @"message": j[@"message"] ?: @"" };
+                }
+            } else {
+                j = HTTPPostJSON([NSString stringWithFormat:@"%@/autoAuth", api], body, self.token);
+            }
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.busy = NO;
-                KWLog(@"澶嶆壂杩斿洖: %@", j[@"message"]);
+                KWLog(@": %@", j[@"message"]);
                 if ([j[@"code"] isEqual:@20000]) {
                     CfgSet(@"last_order", oid);
                     [self finishWithCodeUrl:j[@"data"][@"code"]];
                 } else {
-                    self.statusLabel.text = [NSString stringWithFormat:@"澶嶆壂澶辫触: %@", j[@"message"]];
+                    NSString *msg2 = j[@"message"];
+                    if (![msg2 isKindOfClass:[NSString class]] || msg2.length == 0) {
+                        msg2 = j ? @"Request rejected" : @"Network error, retry";
+                    }
+                    self.statusLabel.text = [NSString stringWithFormat:@"Failed: %@", msg2];
                 }
             });
         });
@@ -296,8 +507,8 @@ static void KWShowConfig(void) {
         code = (a.location==NSNotFound)?tail:[tail substringToIndex:a.location];
     }
     KWLog(@"GOT code=%@", code);
-    if (!code) { self.statusLabel.text = @"瑙ｆ瀽澶辫触"; self.busy = NO; return; }
-    self.statusLabel.text = @"鎺堟潈鎴愬姛";
+    if (!code) { self.statusLabel.text = @"Parse failed"; self.busy = NO; return; }
+    self.statusLabel.text = @"Success";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.5*NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [self dismissViewControllerAnimated:YES completion:nil];
@@ -305,30 +516,131 @@ static void KWShowConfig(void) {
     });
 }
 
-- (void)onCancel { KWLog(@"鍙栨秷"); [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)onCancel { KWLog(@"Cancel"); [self dismissViewControllerAnimated:YES completion:nil]; }
 @end
 
-// ---------- 浜や粯 ----------
-void KWDeliver(NSString *code) {
-    NSString *appId = CfgGet(@"appid", kDefAppId);
-    NSString *urlStr = [NSString stringWithFormat:
-        @"%@://oauth?code=%@&scope=%@&state=%@&packageName=com.smile.gifmaker",
-        appId, code, g_scope, g_state];
-    KWLog(@"deliver: %@", urlStr);
-    NSURL *u = [NSURL URLWithString:urlStr];
-    Class wx = NSClassFromString(@"WXApi");
-    if (wx) {
-        SEL s1 = NSSelectorFromString(@"handleOpenURL:delegate:");
-        if ([wx respondsToSelector:s1]) { [wx performSelector:s1 withObject:u withObject:nil]; }
-        SEL s2 = NSSelectorFromString(@"handleAuthOpenUrl:delegate:");
-        if ([wx respondsToSelector:s2]) { [wx performSelector:s2 withObject:u withObject:nil]; }
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
+// ----------  ----------
+// ---------- QQ 授权交付 ----------
+// 传入 eryueop API 返回的完整 URL（tencent100228415://...）
+void KQDeliver(NSString *qqUrl) {
+    if (!qqUrl.length) { KWLog(@"[qq] empty"); return; }
+    KWLog(@"[qq] input: %@", [qqUrl substringToIndex:MIN(100, qqUrl.length)]);
+
+    @try {
+        NSURL *u = [NSURL URLWithString:qqUrl];
+        if (!u) { KWLog(@"[qq] bad url"); return; }
+        KWLog(@"[qq] scheme=%@ host=%@ path=%@", u.scheme, u.host, u.path);
+
+        NSMutableString *diag = [NSMutableString string];
+        [diag appendFormat:@"scheme=%@\nhost=%@\n", u.scheme, u.host];
+
+        // ① 原样调 openURL（让 LC 转发给快手自己）
+        [diag appendString:@"[1] openURL...\n"];
+        if ([NSThread isMainThread]) {
+            [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok){
+                KWLog(@"[qq] openURL ok=%d", ok);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"QQ 诊断6"
+                        message:[NSString stringWithFormat:@"%@[1] openURL ok=%d", diag, ok]
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    UIViewController *r = UIApplication.sharedApplication.keyWindow.rootViewController;
+                    while (r.presentedViewController) r = r.presentedViewController;
+                    if (r) [r presentViewController:a animated:YES completion:nil];
+                });
+            }];
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok){
+                    KWLog(@"[qq] openURL ok=%d", ok);
+                }];
+            });
+        }
+    } @catch (NSException *e) { KWLog(@"[qq] FATAL: %@", e); }
+}
+// 调 eryueop API 换 URL
+void KQExchange(NSString *data, void (^done)(NSString *url, NSString *err)) {
+    dispatch_async(dispatch_get_global_queue(0,0), ^{
+        @try {
+            NSDictionary *body = @{ @"url": data ?: @"", @"game": kQQGameId };
+            NSData *jd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+                                        [NSURL URLWithString:kEryueApi]];
+            req.HTTPMethod = @"POST";
+            req.timeoutInterval = 20;
+            [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+            req.HTTPBody = jd;
+
+            NSURLResponse *resp = nil; NSError *err = nil;
+            NSData *rd = [NSURLConnection sendSynchronousRequest:req
+                                              returningResponse:&resp error:&err];
+            if (err) { KWLog(@"[qq] api err: %@ -> use cache", err.localizedDescription);
+                       if (done) done(kQQUrlCache, nil); return; }
+            NSDictionary *j = [NSJSONSerialization JSONObjectWithData:rd options:0 error:nil];
+            KWLog(@"[qq] api resp: %@", j);
+            NSString *u = j[@"url"];
+            NSString *st = j[@"status"];
+            if ([st isEqualToString:@"success"] && u.length) {
+                if (done) done(u, nil);
+            } else {
+                if (done) done(nil, j[@"message"] ?: @"API rejected");
+            }
+        } @catch (NSException *e) {
+            KWLog(@"[qq] api ex: %@", e);
+            if (done) done(nil, e.reason);
+        }
     });
 }
+void KWDeliver(NSString *code) {
+    @try {
+        NSString *appId = CfgGet(@"appid", kDefAppId);
+        NSString *urlStr = [NSString stringWithFormat:
+            @"%@://oauth?code=%@&scope=%@&state=%@&packageName=com.smile.gifmaker",
+            appId, code, g_scope, g_state];
+        KWLog(@"deliver: %@", urlStr);
+        NSURL *u = [NSURL URLWithString:urlStr];
 
-// ---------- 鎷夊垪琛?----------
+        Class wx = NSClassFromString(@"WXApi");
+        if (wx) {
+            @try {
+                SEL s1 = NSSelectorFromString(@"handleOpenURL:delegate:");
+                if ([wx respondsToSelector:s1]) {
+                    [wx performSelector:s1 withObject:u withObject:nil];
+                    KWLog(@"ok handleOpenURL");
+                }
+            } @catch (NSException *e) { KWLog(@"ex1 %@", e); }
+            @try {
+                SEL s2 = NSSelectorFromString(@"handleAuthOpenUrl:delegate:");
+                if ([wx respondsToSelector:s2]) {
+                    [wx performSelector:s2 withObject:u withObject:nil];
+                    KWLog(@"ok handleAuthOpenUrl");
+                }
+            } @catch (NSException *e) { KWLog(@"ex2 %@", e); }
+        }
+
+        // openURL ?????????
+        KWLog(@"calling openURL sync");
+        @try {
+            if ([NSThread isMainThread]) {
+                [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok) {
+                    KWLog(@"openURL done ok=%d", ok);
+                }];
+            } else {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok) {
+                        KWLog(@"openURL done ok=%d", ok);
+                    }];
+                });
+            }
+        } @catch (NSException *e) { KWLog(@"openURL ex %@", e); }
+
+        KWLog(@"deliver complete");
+    } @catch (NSException *e) {
+        KWLog(@"deliver FATAL: %@", e);
+    }
+}
+
+// ----------  ----------
 static void KWShowOrderList(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *user = CfgGet(@"username", @"");
@@ -336,23 +648,44 @@ static void KWShowOrderList(void) {
         NSString *api  = CfgGet(@"api", kDefApi);
         NSString *appId= CfgGet(@"appid", kDefAppId);
 
-        if (!user.length || !pass.length) {
-            KWLog(@"鏈厤缃紝寮归厤缃獥");
+        // ?????? Token??????
+        BOOL needCfg2 = KWIsV2() ? (user.length == 0) : (!user.length || !pass.length);
+        if (needCfg2) {
+            KWLog(@"ConfigConfig v2=%d user=%lu pass=%lu", KWIsV2(),
+                  (unsigned long)user.length, (unsigned long)pass.length);
             dispatch_async(dispatch_get_main_queue(), ^{ KWShowConfig(); });
             return;
         }
 
-        NSDictionary *ui = HTTPGet([NSString stringWithFormat:
-            @"%@/api/userInfo?username=%@&password=%@", api, user, pass]);
-        NSString *token = ui[@"data"][@"token"];
-        KWLog(@"token %@", token ? @"OK" : @"FAIL");
-
-        NSDictionary *j = HTTPGet([NSString stringWithFormat:
-            @"%@/api/authRecords?username=%@&password=%@&appId=%@&page=1&size=20",
-            api, user, pass, appId]);
+        NSDictionary *j = nil;
+        NSString *apiToken = @"";
+        if (KWIsV2()) {
+            apiToken = kApiV2Token;
+            j = HTTPGetAuth([NSString stringWithFormat:
+                @"%@/trial/records?pageIndex=1&pageSize=20", kApiV2Base], kApiV2Token);
+            KWLog(@"[v2] records j=%@", j);
+            if (j && [j[@"flag"] boolValue]) {
+                NSArray *recs = j[@"data"][@"records"] ?: @[];
+                NSMutableArray *conv = [NSMutableArray array];
+                for (NSDictionary *r in recs) {
+                    [conv addObject:@{ @"id": r[@"trialOrderNo"] ?: @"",
+                                       @"createTime": r[@"createdAt"] ?: @"",
+                                       @"status": r[@"latestActionLabel"] ?: @"" }];
+                }
+                j = @{ @"code": @20000, @"data": @{ @"list": @{ @"records": conv } } };
+            }
+        } else {
+            NSDictionary *ui = HTTPGet([NSString stringWithFormat:
+                @"%@/api/userInfo?username=%@&password=%@", api, user, pass]);
+            apiToken = ui[@"data"][@"token"] ?: @"";
+            KWLog(@"token %@", apiToken.length ? @"OK" : @"FAIL");
+            j = HTTPGet([NSString stringWithFormat:
+                @"%@/api/authRecords?username=%@&password=%@&appId=%@&page=1&size=20",
+                api, user, pass, appId]);
+        }
         NSArray *orders = @[];
         if (j && [j[@"code"] isEqual:@20000]) orders = j[@"data"][@"list"][@"records"] ?: @[];
-        KWLog(@"璁㈠崟鏁?%lu", (unsigned long)orders.count);
+        KWLog(@"=%lu", (unsigned long)orders.count);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *w = nil;
@@ -362,7 +695,7 @@ static void KWShowOrderList(void) {
             if (!w || !w.rootViewController) { KWLog(@"no window"); return; }
             KwaiOrderVC *vc = [[KwaiOrderVC alloc] init];
             vc.orders = orders;
-            vc.token = token;
+            vc.token = apiToken;
             vc.modalPresentationStyle = UIModalPresentationFullScreen;
             [w.rootViewController presentViewController:vc animated:YES completion:^{
                 KWLog(@"shown");
@@ -371,7 +704,7 @@ static void KWShowOrderList(void) {
     });
 }
 
-// ---------- 鎷︽埅 ----------
+// ----------  ----------
 static void (*orig_openURL_opt)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL));
 static void my_openURL_opt(id self, SEL _cmd, NSURL *url, NSDictionary *opt, void (^comp)(BOOL)) {
     NSString *sch = url.scheme.lowercaseString;
@@ -397,25 +730,1658 @@ static void my_openURL_opt(id self, SEL _cmd, NSURL *url, NSDictionary *opt, voi
     KWShowOrderList();
 }
 
-// ---------- 鍒濆鍖?----------
+// ----------  ----------
+// ===== WXApi hooks to capture delegate =====
+static IMP g_orig_sendReq = NULL;
+static IMP g_orig_sendReq2 = NULL;
+static IMP g_orig_sendAuthReq = NULL;
+
+typedef id (*SendReqFn)(id, SEL, id, id);
+typedef id (*SendReqAutoFn)(id, SEL, id, BOOL, BOOL, id);
+typedef id (*SendAuthReqFn)(id, SEL, id, id, id, id);
+
+static id kw_sendReq_completion(id self, SEL _cmd, id req, id comp) {
+    KWLog(@"sendReq intercepted req=%@", req);
+    KWLog(@"  comp=%@", comp);
+    if (comp) { g_kwaiDelegate = comp; KWLog(@"  saved comp as delegate"); }
+    SendReqFn f = (SendReqFn)g_orig_sendReq;
+    return f ? f(self, _cmd, req, comp) : nil;
+}
+
+static id kw_sendReq_auto(id self, SEL _cmd, id req, BOOL a, BOOL b, id comp) {
+    KWLog(@"sendReq_auto intercepted req=%@", req);
+    SendReqAutoFn f = (SendReqAutoFn)g_orig_sendReq2;
+    return f ? f(self, _cmd, req, a, b, comp) : nil;
+}
+
+static id kw_sendAuthReq(id self, SEL _cmd, id req, id vc, id delegate, id comp) {
+    KWLog(@"sendAuthReq intercepted req=%@", req);
+    KWLog(@"  delegate=%@", delegate);
+    KWLog(@"  comp=%@", comp);
+    if (delegate) { g_kwaiDelegate = delegate; KWLog(@"  saved delegate"); }
+    SendAuthReqFn f = (SendAuthReqFn)g_orig_sendAuthReq;
+    return f ? f(self, _cmd, req, vc, delegate, comp) : nil;
+}
 void KwaiBuiltinInit(void) {
     @autoreleasepool {
         NSString *bid = [NSBundle mainBundle].bundleIdentifier;
         KWLog(@"");
         KWLog(@"##### KwaiWeChatLogin v1.0 #####");
         KWLog(@"bundleId=%@", bid);
-        if (![bid isEqualToString:@"com.jiangjia.gif"]) { KWLog(@"闈炲揩鎵嬭繘绋?); return; }
+        if (![bid isEqualToString:@"com.jiangjia.gif"]) { KWLog(@"not kwai"); return; }
+
+        // ===== 反检测 v4（开机时长 / 环境隐藏 / 镜像过滤 / 进程伪装）=====
+        extern void KwaiHideInstall(void);
+
+        // ???? hook
+#ifndef KWAI_NO_SPOOF
+        KwaiInstallSpoof();
+#endif
+
+        // ?????? hook
+        KwaiInstallFiveParams();
+
+        // ===== 反检测（放在 spoof 之后，避免干扰容器初始化）=====
+        extern void KwaiHideInstall(void);
+        KwaiHideInstall();
 
         Method m0 = class_getInstanceMethod([UIApplication class], @selector(canOpenURL:));
         if (m0) { orig_canOpenURL=(void*)method_getImplementation(m0);
                   method_setImplementation(m0,(IMP)my_canOpenURL); KWLog(@"OK canOpenURL"); }
 
+        // ===== capture Kwai WXApi delegate =====
+        Class wxc = NSClassFromString(@"WXApi");
+        if (wxc) {
+            // hook sendReq:completion:
+            SEL sr1 = NSSelectorFromString(@"sendReq:completion:");
+            Method msr1 = class_getClassMethod(wxc, sr1);
+            if (msr1) {
+                IMP oldImp = method_setImplementation(msr1, (IMP)kw_sendReq_completion);
+                g_orig_sendReq = oldImp;
+                KWLog(@"hooked sendReq:completion:");
+            }
+            // hook sendReq:isAutoResend:forceScheme:completion:
+            SEL sr2 = NSSelectorFromString(@"sendReq:isAutoResend:forceScheme:completion:");
+            Method msr2 = class_getClassMethod(wxc, sr2);
+            if (msr2) {
+                IMP oldImp2 = method_setImplementation(msr2, (IMP)kw_sendReq_auto);
+                g_orig_sendReq2 = oldImp2;
+                KWLog(@"hooked sendReq:isAutoResend:");
+            }
+            // hook sendAuthReq:viewController:delegate:completion:
+            SEL sr3 = NSSelectorFromString(@"sendAuthReq:viewController:delegate:completion:");
+            Method msr3 = class_getClassMethod(wxc, sr3);
+            if (msr3) {
+                IMP oldImp3 = method_setImplementation(msr3, (IMP)kw_sendAuthReq);
+                g_orig_sendAuthReq = oldImp3;
+                KWLog(@"hooked sendAuthReq:");
+            }
+        }
         Method m2 = class_getInstanceMethod([UIApplication class],
                     @selector(openURL:options:completionHandler:));
         if (m2) { orig_openURL_opt=(void*)method_getImplementation(m2);
                   method_setImplementation(m2,(IMP)my_openURL_opt); KWLog(@"OK openURL"); }
 
-        KWLog(@"閰嶇疆: %@", CfgPath());
-        KWLog(@"##### 鍒濆鍖栧畬鎴?#####");
+        KWLog(@"Config: %@", CfgPath());
+
+        // ????????????????
+        // QQ 拦截 hook
+        KwaiInstallQQHook();
+
+        // QQ 探针
+        KwaiInstallQQProbe();
+
+        KwaiStartBallWatcher();
+
+        KWLog(@"##### init done #####");
     }
+}
+// ============================================================
+//  ????????
+//  ??????? HOME ??????????????
+// ============================================================
+
+#import <sys/utsname.h>
+#import <sys/sysctl.h>
+
+// 机型表 { machine, ncpu, memGB, minIOS, product, board }
+typedef struct {
+    const char *machine;
+    int ncpu;
+    int memGB;
+    int minIOS;
+    const char *product;     // hw.product
+    const char *board;       // hw.target / 主板代号
+} KwaiDeviceModel;
+
+static const KwaiDeviceModel kDeviceModels[] = {
+    // machine,      ncpu, mem, minIOS, product,          board(target)
+    { "iPhone11,2", 6, 4, 13, "iPhone XS",         "D321AP" },
+    { "iPhone11,8", 6, 3, 13, "iPhone XR",         "N841AP" },
+    { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP" },
+    { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP" },
+    { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP" },
+    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP" },
+    { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP" },
+    { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP" },
+    { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP" },
+    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP"  },
+    { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP"  },
+    { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP"  },
+    { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP"  },
+    { "iPhone14,6", 6, 4, 16, "iPhone SE (3rd)",   "D79AP"  },
+    { "iPhone14,7", 6, 4, 16, "iPhone 14",         "D27AP"  },
+    { "iPhone14,8", 6, 6, 16, "iPhone 14 Plus",    "D28AP"  },
+    { "iPhone15,2", 6, 6, 16, "iPhone 14 Pro",     "D73AP"  },
+    { "iPhone15,3", 6, 6, 16, "iPhone 14 Pro Max", "D74AP"  },
+    { "iPhone15,4", 6, 6, 17, "iPhone 15",         "D37AP"  },
+    { "iPhone15,5", 6, 6, 17, "iPhone 15 Plus",    "D38AP"  },
+    { "iPhone16,1", 6, 8, 17, "iPhone 15 Pro",     "D83AP"  },
+    { "iPhone16,2", 6, 8, 17, "iPhone 15 Pro Max", "D84AP"  },
+    { "iPhone17,3", 6, 8, 18, "iPhone 16",         "D47AP"  },
+    { "iPhone17,4", 6, 8, 18, "iPhone 16 Plus",    "D48AP"  },
+    { "iPhone17,1", 6, 8, 18, "iPhone 16 Pro",     "D93AP"  },
+    { "iPhone17,2", 6, 8, 18, "iPhone 16 Pro Max", "D94AP"  },
+};
+static const int kDeviceModelCount = sizeof(kDeviceModels) / sizeof(kDeviceModels[0]);
+
+// ??????
+static NSString *g_fakeMachine = nil;
+static char g_fakeMachineC[64] = {0};   // C ???????????? ObjC ???
+static char g_fakeModelC[64] = {0};
+static NSUUID   *g_fakeIDFV = nil;
+static char      g_fakeProductC[64] = {0};    // hw.product
+static char      g_fakeBoardC[64] = {0};      // hw.target
+static NSString *g_fakeSerial = nil;          // IOPlatformSerialNumber
+static NSString *g_fakeUUID = nil;            // IOPlatformUUID
+static int       g_fakeNCPU = 0;
+static long long g_fakeMemSize = 0;
+static NSString *g_fakeIDFA = nil;
+static NSString *g_fakeDevName = nil;
+static int       g_fakeSoCId = 0;
+static int       g_fakeFreqMHz = 0;
+static int       g_fakeScrW = 0;
+static int       g_fakeScrH = 0;
+static float     g_fakeScale = 3.0f;
+static int       g_fakeBattery = 0;
+static int       g_fakeArmE = 1;
+static int       g_fakeMinIOS = 15;
+static NSString *g_fakeBundlePath = nil;
+static NSString *g_fakeExecPath = nil;
+static long long g_fakeBootOffset = 0;
+
+// ??? HOME ?????????????
+static unsigned long KwaiContainerSeed(void) {
+    static unsigned long seed = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *home = NSHomeDirectory();
+        // HOME ???? UUID??????
+        // ?: .../Documents/Data/Application/33DDF79A-A61D-.../
+        NSString *uid = home.lastPathComponent;
+        unsigned long h = 5381;
+        for (NSUInteger i = 0; i < uid.length; i++) {
+            h = ((h << 5) + h) + [uid characterAtIndex:i];
+        }
+        // ??? GuestAppId???????? App ?
+        NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
+        for (NSUInteger i = 0; i < bid.length; i++) {
+            h = ((h << 5) + h) + [bid characterAtIndex:i];
+        }
+        seed = h;
+        KWLog(@"[spoof] container seed: %lu (home=%s)", h, home.UTF8String);
+    });
+    return seed;
+}
+
+// ???????
+static void KwaiSetupSpoof(void) {
+    // ===== 优先读 LC 传入的伪装参数（LC 层生成，每个容器独立）=====
+    const char *envModel   = getenv("LC_SPOOF_MODEL");
+    const char *envProduct = getenv("LC_SPOOF_PRODUCT");
+    const char *envBoard   = getenv("LC_SPOOF_BOARD");
+    const char *envSerial  = getenv("LC_SPOOF_SERIAL");
+    const char *envUUID    = getenv("LC_SPOOF_UUID");
+    const char *envIDFV    = getenv("LC_SPOOF_IDFV");
+    const char *envNCPU    = getenv("LC_SPOOF_NCPU");
+    const char *envMem     = getenv("LC_SPOOF_MEM");
+    const char *envIDFA    = getenv("LC_SPOOF_IDFA");
+    const char *envName    = getenv("LC_SPOOF_NAME");
+    const char *envSoC     = getenv("LC_SPOOF_SOC");
+    const char *envFreq    = getenv("LC_SPOOF_FREQ");
+    const char *envScrW    = getenv("LC_SPOOF_SCR_W");
+    const char *envScrH    = getenv("LC_SPOOF_SCR_H");
+    const char *envBatt    = getenv("LC_SPOOF_BATT");
+    const char *envArmE    = getenv("LC_SPOOF_ARME");
+    const char *envMinIOS  = getenv("LC_SPOOF_MINIOS");
+    const char *envBundle  = getenv("LC_SPOOF_BUNDLE");
+    const char *envExec    = getenv("LC_SPOOF_EXEC");
+
+    if (envModel && envModel[0]) {
+        g_fakeMachine = [NSString stringWithUTF8String:envModel];
+        strncpy(g_fakeMachineC, envModel, sizeof(g_fakeMachineC)-1);
+        strncpy(g_fakeModelC, envModel, sizeof(g_fakeModelC)-1);
+        if (envProduct) strncpy(g_fakeProductC, envProduct, sizeof(g_fakeProductC)-1);
+        if (envBoard)   strncpy(g_fakeBoardC,   envBoard,   sizeof(g_fakeBoardC)-1);
+        if (envSerial)  g_fakeSerial = [NSString stringWithUTF8String:envSerial];
+        if (envUUID)    g_fakeUUID   = [NSString stringWithUTF8String:envUUID];
+        if (envIDFV)    g_fakeIDFV   = [[NSUUID alloc] initWithUUIDString:[NSString stringWithUTF8String:envIDFV]];
+        if (envNCPU)    g_fakeNCPU   = atoi(envNCPU);
+        if (envMem)     g_fakeMemSize = atoll(envMem);
+        if (envIDFA)    g_fakeIDFA     = [NSString stringWithUTF8String:envIDFA];
+        if (envName)    g_fakeDevName  = [NSString stringWithUTF8String:envName];
+        if (envSoC)     g_fakeSoCId    = (int)strtol(envSoC, NULL, 0);
+        if (envFreq)    g_fakeFreqMHz  = atoi(envFreq);
+        if (envScrW)    g_fakeScrW     = atoi(envScrW);
+        if (envScrH)    g_fakeScrH     = atoi(envScrH);
+        if (envBatt)    g_fakeBattery  = atoi(envBatt);
+        if (envArmE)    g_fakeArmE     = atoi(envArmE);
+        if (envMinIOS)  g_fakeMinIOS   = atoi(envMinIOS);
+        if (envBundle)  g_fakeBundlePath = [NSString stringWithUTF8String:envBundle];
+        if (envExec)    g_fakeExecPath   = [NSString stringWithUTF8String:envExec];
+        KWLog(@"[spoof] FROM LC ENV: model=%s product=%s board=%s sn=%s",
+              envModel, envProduct ?: "", envBoard ?: "", envSerial ?: "");
+        return;   // ★ 用 LC 的参数，不再自己算
+    }
+
+    unsigned long seed = KwaiContainerSeed();
+
+    // ??? iOS ????????? <= ?????
+    NSString *ver = [[UIDevice currentDevice] systemVersion];
+    int hostMajor = [[ver componentsSeparatedByString:@"."].firstObject intValue];
+    if (hostMajor <= 0) hostMajor = 15;
+    KWLog(@"[spoof] host iOS major = %d", hostMajor);
+
+    // ??????
+    int cand[64];
+    int candCount = 0;
+    for (int i = 0; i < kDeviceModelCount && candCount < 64; i++) {
+        if (kDeviceModels[i].minIOS <= hostMajor) {
+            cand[candCount++] = i;
+        }
+    }
+    if (candCount == 0) {
+        // ?????
+        for (int i = 0; i < kDeviceModelCount && candCount < 64; i++) cand[candCount++] = i;
+    }
+    KWLog(@"[spoof] candidates=%d", candCount);
+
+    int pick = cand[seed % (unsigned long)candCount];
+    const KwaiDeviceModel *m = &kDeviceModels[pick];
+
+    g_fakeMachine = [NSString stringWithUTF8String:m->machine];
+    strncpy(g_fakeMachineC, m->machine, sizeof(g_fakeMachineC)-1);
+    strncpy(g_fakeModelC, m->machine, sizeof(g_fakeModelC)-1);
+    g_fakeNCPU = m->ncpu;
+    g_fakeMemSize = (long long)m->memGB * 1024LL * 1024LL * 1024LL;
+
+    // IDFV???????????? IDFV?
+    unsigned char bytes[16];
+    unsigned long s = seed;
+    for (int i = 0; i < 16; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        bytes[i] = (unsigned char)(s >> 33);
+    }
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    g_fakeIDFV = [[NSUUID alloc] initWithUUIDBytes:bytes];
+
+    // ---- product / board ----
+    if (m->product) strncpy(g_fakeProductC, m->product, sizeof(g_fakeProductC)-1);
+    if (m->board)   strncpy(g_fakeBoardC, m->board, sizeof(g_fakeBoardC)-1);
+
+    // ---- 序列号（12位，苹果格式）----
+    {
+        static const char cs[] = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
+        char sbuf[13];
+        unsigned long ss = seed ^ 0xA5A5A5A5UL;
+        for (int i = 0; i < 12; i++) {
+            ss = ss * 6364136223846793005ULL + 1442695040888963407ULL;
+            sbuf[i] = cs[(ss >> 33) % 34];
+        }
+        sbuf[12] = 0;
+        g_fakeSerial = [NSString stringWithUTF8String:sbuf];
+    }
+
+    // ---- 硬件 UUID ----
+    {
+        unsigned char ub[16];
+        unsigned long us = seed ^ 0x5A5A5A5AUL;
+        for (int i = 0; i < 16; i++) {
+            us = us * 6364136223846793005ULL + 1442695040888963407ULL;
+            ub[i] = (unsigned char)(us >> 33);
+        }
+        ub[6] = (ub[6] & 0x0F) | 0x40;
+        ub[8] = (ub[8] & 0x3F) | 0x80;
+        g_fakeUUID = [[NSUUID alloc] initWithUUIDBytes:ub].UUIDString;
+    }
+
+    KWLog(@"[spoof] model=%s ncpu=%d mem=%dGB idfv=%@ serial=%@ uuid=%@ product=%s board=%s",
+          m->machine, m->ncpu, m->memGB, g_fakeIDFV.UUIDString,
+          g_fakeSerial, g_fakeUUID, g_fakeProductC, g_fakeBoardC);
+}
+
+// ---- hook uname ----
+static int (*orig_uname)(struct utsname *);
+static int kw_uname(struct utsname *buf) {
+    int ret = orig_uname(buf);
+    if (ret == 0 && buf && g_fakeMachine) {
+        strncpy(buf->machine, g_fakeMachine.UTF8String, sizeof(buf->machine) - 1);
+        buf->machine[sizeof(buf->machine) - 1] = '\0';
+    }
+    return ret;
+}
+// ============================================================
+//  改机扩展 hook（v2）
+// ============================================================
+#include <sys/utsname.h>
+
+// ---- ③ sysctl MIB（kern.hostname / hw.machine）----
+static int (*orig_sysctl_mib)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+
+static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+                         void *newp, size_t newlen) {
+    if (name && namelen >= 2 && oldp && oldlenp) {
+        // hw.machine = {CTL_HW, HW_MACHINE}; hw.model = {CTL_HW, HW_MODEL}
+        if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_MODEL)) {
+            if (g_fakeMachineC[0]) {
+                size_t need = strlen(g_fakeMachineC) + 1;
+                if (*oldlenp >= need) { memcpy(oldp, g_fakeMachineC, need); *oldlenp = need; return 0; }
+            }
+        }
+        if (name[0] == CTL_HW && name[1] == HW_MEMSIZE) {
+            if (*oldlenp >= sizeof(long long) && g_fakeMemSize > 0) {
+                *(long long *)oldp = g_fakeMemSize; *oldlenp = sizeof(long long); return 0;
+            }
+        }
+    }
+    if (orig_sysctl_mib) return orig_sysctl_mib(name, namelen, oldp, oldlenp, newp, newlen);
+    return -1;
+}
+
+// ---- ⑤ UIDevice.model ----
+static NSString *(*orig_dev_model)(id, SEL) = NULL;
+static NSString *kw_dev_model(id self, SEL _cmd) {
+    return @"iPhone";   // 通用值，避免暴露具体型号
+}
+
+// ---- ⑥ NSProcessInfo.physicalMemory ----
+static unsigned long long (*orig_phys_mem)(id, SEL) = NULL;
+static unsigned long long kw_phys_mem(id self, SEL _cmd) {
+    if (g_fakeMemSize > 0) return (unsigned long long)g_fakeMemSize;
+    return orig_phys_mem ? orig_phys_mem(self, _cmd) : 0;
+}
+
+// ---- ⑦ NSProcessInfo.processorCount ----
+static NSUInteger (*orig_proc_count)(id, SEL) = NULL;
+static NSUInteger kw_proc_count(id self, SEL _cmd) {
+    if (g_fakeNCPU > 0) return (NSUInteger)g_fakeNCPU;
+    return orig_proc_count ? orig_proc_count(self, _cmd) : 0;
+}
+
+
+
+// ---- hook sysctlbyname ----
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
+static int kw_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    // ? ?????????dyld/objc ??????? C ????? ObjC ??
+    if (!orig_sysctlbyname) {
+        // ????????? key ???????????????? buffer
+        if (name && oldp && oldlenp && g_fakeMachineC[0]) {
+            if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
+                size_t need = strlen(g_fakeMachineC) + 1;
+                if (*oldlenp >= need) { memcpy(oldp, g_fakeMachineC, need); *oldlenp = need; return 0; }
+            }
+        }
+        return -1;
+    }
+    if (!name || !oldp || !oldlenp) {
+        return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    }
+
+    // ????????????
+    if (g_fakeMachineC[0] == '\0') {
+        return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    }
+
+    if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
+        size_t need = strlen(g_fakeMachineC) + 1;
+        if (*oldlenp >= need) {
+            memcpy(oldp, g_fakeMachineC, need);
+            *oldlenp = need;
+            return 0;
+        }
+    }
+    if (strcmp(name, "hw.product") == 0) {
+        if (g_fakeProductC[0]) {
+            size_t need = strlen(g_fakeProductC) + 1;
+            if (*oldlenp >= need) { memcpy(oldp, g_fakeProductC, need); *oldlenp = need; return 0; }
+        }
+    }
+    if (strcmp(name, "hw.target") == 0) {
+        if (g_fakeBoardC[0]) {
+            size_t need = strlen(g_fakeBoardC) + 1;
+            if (*oldlenp >= need) { memcpy(oldp, g_fakeBoardC, need); *oldlenp = need; return 0; }
+        }
+    }
+    if (strcmp(name, "hw.ncpu") == 0 || strcmp(name, "hw.logicalcpu") == 0) {
+        if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) {
+            *(int *)oldp = g_fakeNCPU;
+            *oldlenp = sizeof(int);
+            return 0;
+        }
+    }
+    if (strcmp(name, "hw.physicalcpu") == 0) {
+        if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) {
+            *(int *)oldp = g_fakeNCPU / 2;
+            *oldlenp = sizeof(int);
+            return 0;
+        }
+    }
+    if (strcmp(name, "hw.memsize") == 0) {
+        if (*oldlenp >= sizeof(long long) && g_fakeMemSize > 0) {
+            *(long long *)oldp = g_fakeMemSize;
+            *oldlenp = sizeof(long long);
+            return 0;
+        }
+    }
+    return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+}
+// ---- hook UIDevice.identifierForVendor ----
+static NSUUID * (*orig_idfv)(id, SEL);
+static NSUUID * kw_idfv(id self, SEL _cmd) {
+    if (g_fakeIDFV) return g_fakeIDFV;
+    return orig_idfv(self, _cmd);
+}
+
+// ---- ???? hook ----
+static BOOL g_spoofInstalled = NO;
+
+
+// ============================================================
+//  IOKit hook（IOPlatformSerialNumber / IOPlatformUUID）
+//  —— 风控核心：唯一设备标识
+// ============================================================
+#import <IOKit/IOKitLib.h>
+#import <CoreFoundation/CoreFoundation.h>
+
+static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
+
+static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
+                                                     CFAllocatorRef alloc, IOOptionBits opts) {
+    if (key) {
+        NSString *k = (__bridge NSString *)key;
+        if ([k isEqualToString:@"IOPlatformSerialNumber"] && g_fakeSerial) {
+            return CFBridgingRetain([g_fakeSerial copy]);
+        }
+        if ([k isEqualToString:@"IOPlatformUUID"] && g_fakeUUID) {
+            return CFBridgingRetain([g_fakeUUID copy]);
+        }
+    }
+    if (orig_IORegistryEntryCreateCFProperty)
+        return orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
+    return NULL;
+}
+
+// ---- Search 版本 ----
+static CFTypeRef (*orig_IORegEntrySearchCFProp)(io_registry_entry_t, const io_name_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
+static CFTypeRef kw_IORegEntrySearchCFProp(io_registry_entry_t entry, const io_name_t plane,
+                                            CFStringRef key, CFAllocatorRef alloc, IOOptionBits opts) {
+    if (key) {
+        NSString *k = (__bridge NSString *)key;
+        if ([k isEqualToString:@"IOPlatformSerialNumber"] && g_fakeSerial)
+            return CFBridgingRetain([g_fakeSerial copy]);
+        if ([k isEqualToString:@"IOPlatformUUID"] && g_fakeUUID)
+            return CFBridgingRetain([g_fakeUUID copy]);
+    }
+    if (orig_IORegEntrySearchCFProp)
+        return orig_IORegEntrySearchCFProp(entry, plane, key, alloc, opts);
+    return NULL;
+}
+
+// ---- CreateCFProperties（批量）----
+static kern_return_t (*orig_IORegEntryCFProps)(io_registry_entry_t, CFMutableDictionaryRef *, CFAllocatorRef, IOOptionBits) = NULL;
+static kern_return_t kw_IORegEntryCFProps(io_registry_entry_t entry, CFMutableDictionaryRef *props,
+                                           CFAllocatorRef alloc, IOOptionBits opts) {
+    kern_return_t r = orig_IORegEntryCFProps
+        ? orig_IORegEntryCFProps(entry, props, alloc, opts) : KERN_FAILURE;
+    if (r == KERN_SUCCESS && props && *props) {
+        if (g_fakeSerial)
+            CFDictionarySetValue(*props, CFSTR("IOPlatformSerialNumber"), (__bridge const void *)g_fakeSerial);
+        if (g_fakeUUID)
+            CFDictionarySetValue(*props, CFSTR("IOPlatformUUID"), (__bridge const void *)g_fakeUUID);
+    }
+    return r;
+}
+
+// ---- IODeviceTree:/ 路径 ----
+// ---- IORegistryEntryGetProperty（C 字符串版）----
+static kern_return_t (*orig_IORegEntryGetProperty)(io_registry_entry_t, const char *, char *, unsigned int *) = NULL;
+static kern_return_t kw_IORegEntryGetProperty(io_registry_entry_t entry, const char *name,
+                                              char *buf, unsigned int *size) {
+    if (name && buf && size) {
+        if (strcmp(name, "model") == 0 && g_fakeBoardC[0]) {
+            size_t n = strlen(g_fakeBoardC);
+            if (*size > n) { strcpy(buf, g_fakeBoardC); *size = (unsigned int)(n + 1); return 0; }
+        }
+        if (strcmp(name, "IOPlatformSerialNumber") == 0 && g_fakeSerial) {
+            const char *sv = g_fakeSerial.UTF8String; size_t n = strlen(sv);
+            if (*size > n) { strcpy(buf, sv); *size = (unsigned int)(n + 1); return 0; }
+        }
+        if (strcmp(name, "IOPlatformUUID") == 0 && g_fakeUUID) {
+            const char *uv = g_fakeUUID.UTF8String; size_t n = strlen(uv);
+            if (*size > n) { strcpy(buf, uv); *size = (unsigned int)(n + 1); return 0; }
+        }
+    }
+    if (orig_IORegEntryGetProperty) return orig_IORegEntryGetProperty(entry, name, buf, size);
+    return KERN_FAILURE;
+}
+
+
+static io_registry_entry_t (*orig_IORegEntryFromPath)(const io_string_t) = NULL;
+static io_registry_entry_t kw_IORegEntryFromPath(const io_string_t path) {
+    return orig_IORegEntryFromPath ? orig_IORegEntryFromPath(path) : 0;
+}
+
+// ---- MobileGestalt ----
+static CFTypeRef (*orig_MGCopyAnswer)(CFStringRef) = NULL;
+static CFTypeRef (*orig_MGGetStringAnswer)(CFStringRef) = NULL;
+static bool (*orig_MGGetBoolAnswer)(CFStringRef) = NULL;
+
+// MG 的 key 映射
+static CFTypeRef kw_MGCopyAnswer(CFStringRef key) {
+    if (key) {
+        NSString *k = (__bridge NSString *)key;
+        if (([k isEqualToString:@"SerialNumber"] || [k isEqualToString:@"InternationalMobileEquipmentIdentity"]) && g_fakeSerial)
+            return CFBridgingRetain([g_fakeSerial copy]);
+        if (([k isEqualToString:@"UniqueDeviceID"] || [k isEqualToString:@"UserAssignedDeviceName"]) && g_fakeUUID)
+            return CFBridgingRetain([g_fakeUUID copy]);
+        if ([k isEqualToString:@"ProductType"] && g_fakeMachine)
+            return CFBridgingRetain([g_fakeMachine copy]);
+        if ([k isEqualToString:@"HardwareModel"] && g_fakeBoardC[0])
+            return CFBridgingRetain([[NSString stringWithUTF8String:g_fakeBoardC] copy]);
+        if ([k isEqualToString:@"DeviceClass"] && g_fakeMachine)
+            return CFBridgingRetain([@"iPhone" copy]);
+    }
+    if (orig_MGCopyAnswer) return orig_MGCopyAnswer(key);
+    return NULL;
+}
+
+static CFStringRef kw_MGGetStringAnswer(CFStringRef key) {
+    if (key) {
+        NSString *k = (__bridge NSString *)key;
+        if ([k isEqualToString:@"SerialNumber"] && g_fakeSerial)
+            return CFBridgingRetain([g_fakeSerial copy]);
+        if ([k isEqualToString:@"ProductType"] && g_fakeMachine)
+            return CFBridgingRetain([g_fakeMachine copy]);
+        if ([k isEqualToString:@"HardwareModel"] && g_fakeBoardC[0])
+            return CFBridgingRetain([[NSString stringWithUTF8String:g_fakeBoardC] copy]);
+    }
+    if (orig_MGGetStringAnswer) return orig_MGGetStringAnswer(key);
+    return NULL;
+}
+
+static bool kw_MGGetBoolAnswer(CFStringRef key) {
+    if (orig_MGGetBoolAnswer) return orig_MGGetBoolAnswer(key);
+    return false;
+}
+
+
+// ============================================================
+//  快手设备信息 hook（platformString / UIDeviceHardware）
+//  —— 快手自己缓存的机型，必须从源头改
+// ============================================================
+static NSString *(*orig_platformString)(id, SEL) = NULL;
+
+static NSString *kw_platformString(id self, SEL _cmd) {
+    if (g_fakeMachine) {
+        KWLog(@"[spoof] platformString -> %@", g_fakeMachine);
+        return g_fakeMachine;
+    }
+    return orig_platformString ? orig_platformString(self, _cmd) : @"iPhone";
+}
+
+void KwaiInstallKwaiDeviceHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // ① UIDeviceHardware.platformString
+    SEL ps = NSSelectorFromString(@"platformString");
+    NSArray *cands = @[@"UIDeviceHardware", @"KSDeviceModel", @"KSAppleDeviceTypesDefine",
+                       @"KSAppSystemResourceInfomation", @"KSCPDeviceModelUtil"];
+    int hooked = 0;
+    for (NSString *cn in cands) {
+        Class c = NSClassFromString(cn);
+        if (!c) { KWLog(@"[spoof] class %@ not found", cn); continue; }
+        // 实例方法
+        Method m = class_getInstanceMethod(c, ps);
+        if (m) {
+            orig_platformString = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)kw_platformString);
+            KWLog(@"[spoof] %@ -platformString hooked", cn);
+            hooked++;
+        }
+        // 类方法
+        Method cm = class_getClassMethod(c, ps);
+        if (cm) {
+            method_setImplementation(cm, (IMP)kw_platformString);
+            KWLog(@"[spoof] %@ +platformString hooked", cn);
+            hooked++;
+        }
+        // 其他相关 selector
+        for (NSString *selName in @[@"hardwareString", @"machineName", @"platform"]) {
+            SEL s2 = NSSelectorFromString(selName);
+            Method m2 = class_getInstanceMethod(c, s2);
+            if (m2) {
+                method_setImplementation(m2, (IMP)kw_platformString);
+                KWLog(@"[spoof] %@ -%@ hooked", cn, selName);
+                hooked++;
+            }
+        }
+    }
+    KWLog(@"[spoof] kwai device hook done (%d)", hooked);
+}
+
+
+static void KwaiInstallIOKitHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (!h) { KWLog(@"[spoof] IOKit dlopen fail"); return; }
+
+    // ① CreateCFProperty
+    void *s1 = dlsym(h, "IORegistryEntryCreateCFProperty");
+    if (s1) {
+        orig_IORegistryEntryCreateCFProperty = s1;
+        @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s1,
+              (void *)kw_IORegistryEntryCreateCFProperty, NULL);
+              KWLog(@"[spoof] IOKit CreateCFProperty OK"); }
+        @catch (NSException *e) { KWLog(@"[spoof] CreateCFProperty ex: %@", e); }
+    }
+
+    // ② SearchCFProperty
+    void *s2 = dlsym(h, "IORegistryEntrySearchCFProperty");
+    if (s2) {
+        orig_IORegEntrySearchCFProp = s2;
+        @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s2,
+              (void *)kw_IORegEntrySearchCFProp, NULL);
+              KWLog(@"[spoof] IOKit SearchCFProperty OK"); }
+        @catch (NSException *e) { KWLog(@"[spoof] SearchCFProperty ex: %@", e); }
+    }
+
+    // ③ CreateCFProperties
+    void *s3 = dlsym(h, "IORegistryEntryCreateCFProperties");
+    if (s3) {
+        orig_IORegEntryCFProps = s3;
+        @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s3,
+              (void *)kw_IORegEntryCFProps, NULL);
+              KWLog(@"[spoof] IOKit CreateCFProperties OK"); }
+        @catch (NSException *e) { KWLog(@"[spoof] CreateCFProperties ex: %@", e); }
+    }
+
+    // ④ IORegistryEntryGetProperty（C 字符串版 —— 别人也有这个）
+    void *s4b = dlsym(h, "IORegistryEntryGetProperty");
+    if (s4b) {
+        orig_IORegEntryGetProperty = s4b;
+        @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s4b,
+              (void *)kw_IORegEntryGetProperty, NULL);
+              KWLog(@"[spoof] IOKit GetProperty OK"); }
+        @catch (NSException *e) { KWLog(@"[spoof] GetProperty ex: %@", e); }
+    }
+
+    // ⑤ IODeviceTree:/ 的 model 节点
+
+
+
+    // ④ IODeviceTree:/ 的 model 节点（快手崩溃报告里的 D22AP）
+    void *s4 = dlsym(h, "IORegistryEntryFromPath");
+    if (s4) {
+        orig_IORegEntryFromPath = s4;
+        @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s4,
+              (void *)kw_IORegEntryFromPath, NULL);
+              KWLog(@"[spoof] IOKit FromPath OK"); }
+        @catch (NSException *e) { KWLog(@"[spoof] FromPath ex: %@", e); }
+    }
+
+    // ⑤ libMobileGestalt（MGCopyAnswer / MGGetStringAnswer）
+    void *mg = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_LAZY);
+    if (mg) {
+        void *mc = dlsym(mg, "MGCopyAnswer");
+        if (mc) {
+            orig_MGCopyAnswer = mc;
+            @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, mc,
+                  (void *)kw_MGCopyAnswer, NULL);
+                  KWLog(@"[spoof] MobileGestalt MGCopyAnswer OK"); }
+            @catch (NSException *e) { KWLog(@"[spoof] MGCopyAnswer ex: %@", e); }
+        }
+        void *mgs = dlsym(mg, "MGGetStringAnswer");
+        if (mgs) {
+            orig_MGGetStringAnswer = mgs;
+            @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, mgs,
+                  (void *)kw_MGGetStringAnswer, NULL);
+                  KWLog(@"[spoof] MobileGestalt MGGetStringAnswer OK"); }
+            @catch (NSException *e) { KWLog(@"[spoof] MGGetStringAnswer ex: %@", e); }
+        }
+        void *mgb = dlsym(mg, "MGGetBoolAnswer");
+        if (mgb) {
+            orig_MGGetBoolAnswer = mgb;
+            @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, mgb,
+                  (void *)kw_MGGetBoolAnswer, NULL);
+                  KWLog(@"[spoof] MobileGestalt MGGetBoolAnswer OK"); }
+            @catch (NSException *e) { KWLog(@"[spoof] MGGetBoolAnswer ex: %@", e); }
+        }
+    } else {
+        KWLog(@"[spoof] libMobileGestalt not found");
+    }
+
+    KWLog(@"[spoof] IOKit all done");
+}
+static void KwaiInstallSpoof(void) {
+    if (g_spoofInstalled) return;
+    g_spoofInstalled = YES;
+
+    KwaiSetupSpoof();
+    if (!g_fakeMachine) { KWLog(@"[spoof] setup failed"); return; }
+
+    #define LITEHOOK_REBIND_GLOBAL NULL
+
+    // ========== ① sysctlbyname（hw.machine / ncpu / memsize）==========
+    orig_sysctlbyname = sysctlbyname;
+    KWLog(@"[spoof] orig_sysctlbyname=%p", orig_sysctlbyname);
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL,
+                               (void *)sysctlbyname, (void *)kw_sysctlbyname, NULL);
+        KWLog(@"[spoof] sysctlbyname OK");
+    } @catch (NSException *e) { KWLog(@"[spoof] sysctl ex: %@", e); }
+
+    // ========== ② uname（utsname.machine）==========
+    orig_uname = uname;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL,
+                               (void *)uname, (void *)kw_uname, NULL);
+        KWLog(@"[spoof] uname OK");
+    } @catch (NSException *e) { KWLog(@"[spoof] uname ex: %@", e); }
+
+    // ========== ③ sysctl（kern.hostname / hw.machine via MIB）==========
+    orig_sysctl_mib = sysctl;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL,
+                               (void *)sysctl, (void *)kw_sysctl_mib, NULL);
+        KWLog(@"[spoof] sysctl MIB OK");
+    } @catch (NSException *e) { KWLog(@"[spoof] sysctl mib ex: %@", e); }
+
+    // ========== ④ UIDevice.identifierForVendor ==========
+    Method m = class_getInstanceMethod([UIDevice class], @selector(identifierForVendor));
+    if (m) {
+        orig_idfv = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)kw_idfv);
+        KWLog(@"[spoof] IDFV hooked");
+    }
+
+    // ========== ⑤ UIDevice.model / name（OC 层）==========
+    Method mm = class_getInstanceMethod([UIDevice class], @selector(model));
+    if (mm) {
+        orig_dev_model = (void *)method_getImplementation(mm);
+        method_setImplementation(mm, (IMP)kw_dev_model);
+        KWLog(@"[spoof] UIDevice.model hooked");
+    }
+
+    // ========== ⑥ NSProcessInfo.physicalMemory ==========
+    Method mp = class_getInstanceMethod([NSProcessInfo class], @selector(physicalMemory));
+    if (mp) {
+        orig_phys_mem = (void *)method_getImplementation(mp);
+        method_setImplementation(mp, (IMP)kw_phys_mem);
+        KWLog(@"[spoof] physicalMemory hooked");
+    }
+
+    // ========== ⑦ NSProcessInfo.processorCount ==========
+    Method mpc = class_getInstanceMethod([NSProcessInfo class], @selector(processorCount));
+    if (mpc) {
+        orig_proc_count = (void *)method_getImplementation(mpc);
+        method_setImplementation(mpc, (IMP)kw_proc_count);
+        KWLog(@"[spoof] processorCount hooked");
+    }
+
+    // ========== ⑧ IOKit 序列号 / UUID（风控核心）==========
+    KwaiInstallIOKitHook();
+
+    // ========== ⑩ 快手设备信息类（platformString / UIDeviceHardware）==========
+    KwaiInstallKwaiDeviceHook();
+
+    // ========== ⑭ 时间/屏幕/设备伪装 ==========
+    KwaiInstallTimeSpoof();
+
+    // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
+    {
+        extern void KwaiWeaponInstall(void);
+        extern void KwaiWeaponSetValues(NSString *, NSString *, NSString *, NSString *, NSString *, NSString *, NSNumber *, NSNumber *);
+        KwaiWeaponSetValues(g_fakeMachine,
+                            [UIDevice currentDevice].name,
+                            g_fakeSerial,
+                            g_fakeUUID,
+                            g_fakeIDFV.UUIDString,
+                            g_fakeUUID,   // IDFA 用同一个（或另生成）
+                            @(g_fakeMemSize),
+                            @(g_fakeNCPU));
+        KwaiWeaponInstall();
+    }
+
+    // ========== ⑫ 越狱检测绕过（文件路径拦截）==========
+    {
+        extern void KwaiJailbreakInstall(void);
+        KwaiJailbreakInstall();
+    }
+
+    // ========== ⑬ 综合反检测（fishhook/模拟器/代理/文件）==========
+    {
+        extern void KwaiAntiDetectInstall(void);
+        KwaiAntiDetectInstall();
+    }
+
+
+
+    // ========== ⑨ 进程伪装（假可执行路径）==========
+    {
+        extern void KwaiHideSetFakeProcPath(const char *);
+        // 伪装成真机原生安装路径
+        NSString *home = NSHomeDirectory();
+        // 找到 guest 容器的 Bundle 路径
+        NSString *fakePath = [NSString stringWithFormat:@"/var/containers/Bundle/Application/%@/com.jiangjia.gif.app/com_kwai_gif",
+                              [[NSUUID UUID] UUIDString]];
+        KwaiHideSetFakeProcPath(fakePath.UTF8String);
+        KWLog(@"[spoof] fake proc path set");
+    }
+
+
+    KWLog(@"[spoof] done: machine=%s ncpu=%d mem=%lld",
+          g_fakeMachine.UTF8String, g_fakeNCPU, g_fakeMemSize);
+}
+
+// ============================================================
+//  ??????
+//  hook ?????????? did / egid / token / salt / api_st
+// ============================================================
+
+static NSMutableDictionary *g_fiveParams = nil;   // ??????
+
+static void KwaiInitFiveParams(void) {
+    if (!g_fiveParams) g_fiveParams = [NSMutableDictionary dictionary];
+}
+
+// ? URL ?????? "key=value"
+static void KwaiScanParam(NSString *text, NSString *key) {
+    if (!text || !key) return;
+    NSString *needle = [key stringByAppendingString:@"="];
+    NSRange r = [text rangeOfString:needle];
+    if (r.location == NSNotFound) return;
+
+    NSString *tail = [text substringFromIndex:r.location + needle.length];
+    // ????& " ' space ??
+    NSCharacterSet *stops = [NSCharacterSet characterSetWithCharactersInString:@"&;\"' \n\r\t?/|,}>)<"];
+    NSRange e = [tail rangeOfCharacterFromSet:stops];
+    NSString *val = (e.location == NSNotFound) ? tail : [tail substringToIndex:e.location];
+    if (val.length < 4) return;
+
+    // ?????????
+    @synchronized(g_fiveParams) {
+        NSString *old = g_fiveParams[key];
+        if (!old || ![old isEqualToString:val]) {
+            g_fiveParams[key] = val;
+        }
+    }
+}
+
+// ????????URL / header / body?
+static void KwaiScanText(NSString *text) {
+    if (!text || text.length < 8) return;
+    KwaiScanParam(text, @"did");
+    KwaiScanParam(text, @"egid");
+    KwaiScanParam(text, @"global_id");
+    KwaiScanParam(text, @"token");
+    KwaiScanParam(text, @"api_st");
+    KwaiScanParam(text, @"salt");
+    KwaiScanParam(text, @"client_salt");
+    KwaiScanParam(text, @"token_client_salt");
+    KwaiScanParam(text, @"user_id");
+    KwaiScanParam(text, @"uid");
+}
+
+// ---- hook NSURLSession dataTaskWithRequest ----
+static NSURLSessionDataTask *(*orig_dataTask)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionDataTask *kw_dataTask(id self, SEL _cmd, NSURLRequest *req, void (^h)(NSData *, NSURLResponse *, NSError *)) {
+    @try {
+        if (req) {
+            KwaiInitFiveParams();
+            KwaiScanText(req.URL.absoluteString);
+            [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+                KwaiScanText(v);
+                KwaiScanText(k);
+            }];
+            if (req.HTTPBody) {
+                NSString *b = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
+                KwaiScanText(b);
+            }
+        }
+    } @catch (NSException *e) {}
+    return orig_dataTask(self, _cmd, req, h);
+}
+
+// ---- hook NSURLSession dataTaskWithURL ----
+static NSURLSessionDataTask *(*orig_dataTaskURL)(id, SEL, NSURL *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionDataTask *kw_dataTaskURL(id self, SEL _cmd, NSURL *url, void (^h)(NSData *, NSURLResponse *, NSError *)) {
+    @try {
+        if (url) { KwaiInitFiveParams(); KwaiScanText(url.absoluteString); }
+    } @catch (NSException *e) {}
+    return orig_dataTaskURL(self, _cmd, url, h);
+}
+
+// ---- hook NSURLConnection sendSynchronousRequest???????----
+static NSData *(*orig_sendSync)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **);
+static NSData *kw_sendSync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
+    @try {
+        if (req) { KwaiInitFiveParams(); KwaiScanText(req.URL.absoluteString); }
+    } @catch (NSException *e) {}
+    return orig_sendSync(self, _cmd, req, resp, err);
+}
+
+// ---- ?? hook ----
+static BOOL g_fiveInstalled = NO;
+
+
+static void KwaiInstallFiveParams(void) {
+    if (g_fiveInstalled) return;
+    g_fiveInstalled = YES;
+    KwaiInitFiveParams();
+    KWLog(@"[5p] init (file-only mode, no network hooks)");
+
+    // ? ? hook ??????? EXC_BAD_ACCESS?
+    // ????????
+    KwaiReadFromCache();
+    KWLog(@"[5p] cache scan done, params=%lu", (unsigned long)g_fiveParams.count);
+
+    // ?? Keychain
+    KwaiDumpKeychain();
+    KwaiDumpPlist();
+}
+
+// ---- ? KSURLCache ??? did/egid????----
+static void KwaiReadFromCache(void) {
+    @try {
+        NSString *home = NSHomeDirectory();
+        NSString *cacheDir = [home stringByAppendingPathComponent:
+                              @"Library/Caches/com.jiangjia.gif/KSURLCache"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *items = [fm contentsOfDirectoryAtPath:cacheDir error:nil];
+        if (!items) return;
+
+        // ? ??????? -wal > Cache.db* ?????? fsCachedData?
+        NSMutableArray *ordered = [NSMutableArray array];
+        for (NSString *n in items) {
+            if ([n hasSuffix:@"-wal"]) [ordered insertObject:n atIndex:0];
+            else if ([n hasPrefix:@"Cache.db"]) [ordered addObject:n];
+        }
+
+        for (NSString *n in ordered) {
+            NSString *p = [cacheDir stringByAppendingPathComponent:n];
+            NSData *d = [NSData dataWithContentsOfFile:p];
+            if (!d || d.length < 16) continue;
+            NSString *txt = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
+            if (!txt) continue;
+            KwaiScanText(txt);
+            KWLog(@"[5p] scanned %@ (%lu bytes)", n, (unsigned long)d.length);
+        }
+    } @catch (NSException *e) { KWLog(@"[5p] cache read ex: %@", e); }
+}
+
+// ---- ??????? ----
+NSDictionary *KwaiGetFiveParams(void) {
+    @synchronized(g_fiveParams) {
+        if (!g_fiveParams) return @{};
+        return [g_fiveParams copy];
+    }
+}
+// ---- ?? Keychain?? token/salt/api_st?----
+static NSString *KwaiUnarchive(NSData *d) {
+    if (!d) return nil;
+    @try {
+        id obj = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSObject class]
+                                                   fromData:d error:nil];
+        if ([obj isKindOfClass:[NSString class]]) return obj;
+        if (obj) return [obj description];
+    } @catch (NSException *e) {}
+    @try {
+        id obj = [NSKeyedUnarchiver unarchiveObjectWithData:d];
+        if ([obj isKindOfClass:[NSString class]]) return obj;
+        if (obj) return [obj description];
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static NSString *KwaiKeychainGet(NSString *acct) {
+    NSDictionary *q = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrAccount: acct,
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne,
+    };
+    CFTypeRef d = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &d) != errSecSuccess || !d) return nil;
+    NSData *data = (__bridge_transfer NSData *)d;
+    NSString *s = KwaiUnarchive(data);
+    if (!s) s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return s;
+}
+
+static void KwaiDumpKeychain(void) {
+    @try {
+        KWLog(@"[kv] === enumerate MMKV ===");
+        Class mmkvCls = NSClassFromString(@"MMKV");
+        if (!mmkvCls) { KWLog(@"[kv] MMKV not found"); return; }
+        SEL wsel = NSSelectorFromString(@"mmkvWithID:");
+        if (![mmkvCls respondsToSelector:wsel]) { KWLog(@"[kv] no mmkvWithID"); return; }
+
+        NSArray *ids = @[@"com.kuaishou.KSwitchSDK.DEFAULT", @"com.kuaishou.account",
+                         @"com.jiangjia.gif", @"com.kuaishou.KSwitchSDK"];
+        for (NSString *mid in ids) {
+            @try {
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id kv = [mmkvCls performSelector:wsel withObject:mid];
+                #pragma clang diagnostic pop
+                if (!kv) continue;
+                SEL ak = NSSelectorFromString(@"allKeys");
+                if (![kv respondsToSelector:ak]) continue;
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                NSArray *keys = [kv performSelector:ak];
+                #pragma clang diagnostic pop
+                KWLog(@"[kv] %@ has %lu keys", mid, (unsigned long)keys.count);
+                for (NSString *k in keys) {
+                    NSString *v = nil;
+                    @try {
+                        SEL gs = NSSelectorFromString(@"getStringForKey:");
+                        if ([kv respondsToSelector:gs]) {
+                            #pragma clang diagnostic push
+                            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                            v = [kv performSelector:gs withObject:k];
+                            #pragma clang diagnostic pop
+                        }
+                    } @catch (NSException *e) {}
+                    if (v.length) {
+                        KWLog(@"[kv]   %@ = %@", k, (v.length > 120 ? [v substringToIndex:120] : v));
+                    }
+                }
+            } @catch (NSException *e) { KWLog(@"[kv] ex %@: %@", mid, e); }
+        }
+        KWLog(@"[kv] === done ===");
+    } @catch (NSException *e) { KWLog(@"[kv] outer ex: %@", e); }
+}
+// ============================================================
+//  ?? plist ????
+// ============================================================
+// ?? plist ?????token/salt/did/api_st???? g_fiveParams
+static void KwaiDumpPlist(void) {
+    @try {
+        NSString *home = NSHomeDirectory();
+        NSString *p = [home stringByAppendingPathComponent:
+                       @"Library/Preferences/com.jiangjia.gif.plist"];
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (!d) { KWLog(@"[pl] load failed: %@", p); return; }
+        KWLog(@"[pl] keys=%lu", (unsigned long)d.count);
+
+        KwaiInitFiveParams();
+        @synchronized(g_fiveParams) {
+            id v;
+            v = d[@"Gif_Token"];
+            if ([v isKindOfClass:[NSString class]] && [v length]) g_fiveParams[@"token"] = v;
+
+            v = d[@"Gif_Token_Salt"] ?: d[@"Gif_KwaiClientSalt"];
+            if ([v isKindOfClass:[NSString class]] && [v length]) g_fiveParams[@"salt"] = v;
+
+            v = d[@"KLink_Persistent_klink.device_id"];
+            if ([v isKindOfClass:[NSString class]] && [v length]) g_fiveParams[@"did"] = v;
+
+            v = d[@"Gif_ServiceToken"];
+            if ([v isKindOfClass:[NSString class]] && [v length]) g_fiveParams[@"api_st"] = v;
+        }
+        KWLog(@"[pl] token=%@ salt=%@ did=%@ api_st=%lu",
+              g_fiveParams[@"token"], g_fiveParams[@"salt"],
+              g_fiveParams[@"did"], (unsigned long)[g_fiveParams[@"api_st"] length]);
+    } @catch (NSException *e) { KWLog(@"[pl] ex: %@", e); }
+}
+
+// ?????token----salt----did----egid----api_st
+NSString *KwaiGetFiveString(void) {
+    @synchronized(g_fiveParams) {
+        if (!g_fiveParams) return @"";
+        NSString *t = g_fiveParams[@"token"]  ?: @"";
+        NSString *s = g_fiveParams[@"salt"]   ?: @"";
+        NSString *d = g_fiveParams[@"did"]    ?: @"";
+        NSString *e = g_fiveParams[@"egid"]   ?: @"";
+        NSString *a = g_fiveParams[@"api_st"] ?: @"";
+        if (!t.length && !s.length && !d.length && !e.length && !a.length) return @"";
+        return [NSString stringWithFormat:@"%@----%@----%@----%@----%@", t, s, d, e, a];
+    }
+}
+// ============================================================
+//  ????????????? + ??? + ?????
+// ============================================================
+// ============================================================
+//  ????? + ????
+// ============================================================
+
+// ---------- ???? ----------
+@interface KwaiFivePanel : UIWindow
+@end
+
+@implementation KwaiFivePanel {
+    NSString *_five;
+    UITextView *_tv;
+}
+
+- (instancetype)initWithFive:(NSString *)five {
+    UIScreen *sc = [UIScreen mainScreen];
+    CGFloat W = sc.bounds.size.width;
+    CGFloat H = sc.bounds.size.height;
+    CGFloat pw = W - 32;                 // ???
+    CGFloat ph = MIN(460, H - 120);      // ???????
+    CGRect f = CGRectMake(16, (H - ph) / 2.0, pw, ph);
+    self = [super initWithFrame:f];
+    if (self) {
+        _five = [five copy] ?: @"";
+        self.windowLevel = UIWindowLevelAlert + 200;
+        self.backgroundColor = [UIColor clearColor];
+        self.rootViewController = [[UIViewController alloc] init];
+
+        UIView *bg = [[UIView alloc] initWithFrame:self.bounds];
+        bg.backgroundColor = [UIColor colorWithWhite:0.11 alpha:0.98];
+        bg.layer.cornerRadius = 14;
+        bg.layer.masksToBounds = YES;
+        bg.layer.borderWidth = 1;
+        bg.layer.borderColor = [UIColor colorWithWhite:0.35 alpha:1].CGColor;
+        [self.rootViewController.view addSubview:bg];
+
+        CGFloat pad = 14;
+        CGFloat y = pad;
+
+        // ??
+        UILabel *title = [[UILabel alloc] initWithFrame:
+                          CGRectMake(pad, y, pw - pad*2, 24)];
+        title.text = @"快手五参";
+        title.textColor = [UIColor whiteColor];
+        title.font = [UIFont boldSystemFontOfSize:17];
+        title.textAlignment = NSTextAlignmentCenter;
+        [bg addSubview:title];
+        y += 30;
+
+        // ???
+        UIView *line = [[UIView alloc] initWithFrame:CGRectMake(pad, y, pw - pad*2, 1)];
+        line.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1];
+        [bg addSubview:line];
+        y += 10;
+
+        // ? ???????????????????????
+        CGFloat btnH = 44;
+        CGFloat btnY = ph - pad - btnH;
+        CGFloat tvH = btnY - y - 10;
+
+        _tv = [[UITextView alloc] initWithFrame:CGRectMake(pad, y, pw - pad*2, tvH)];
+        _tv.text = _five.length ? _five : @"(empty)";
+        _tv.editable = NO;
+        _tv.selectable = YES;
+        _tv.backgroundColor = [UIColor colorWithWhite:0.05 alpha:1];
+        _tv.textColor = [UIColor colorWithRed:0.55 green:0.9 blue:0.6 alpha:1];
+        _tv.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
+        _tv.layer.cornerRadius = 8;
+        _tv.layer.masksToBounds = YES;
+        _tv.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+        [bg addSubview:_tv];
+
+        // ?????????
+        NSInteger n = 3;
+        CGFloat gap = 8;
+        CGFloat bw = (pw - pad*2 - gap*(n-1)) / (CGFloat)n;
+        NSArray *titles = @[@"复制", @"保存", @"关闭"];
+        NSArray *sels = @[@"doCopy", @"doSave", @"doClose"];
+        for (NSInteger i = 0; i < n; i++) {
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+            b.frame = CGRectMake(pad + i*(bw+gap), btnY, bw, btnH);
+            [b setTitle:titles[i] forState:UIControlStateNormal];
+            [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            b.backgroundColor = (i == 2)
+                ? [UIColor colorWithWhite:0.32 alpha:1]
+                : [UIColor colorWithRed:0.20 green:0.52 blue:0.86 alpha:1];
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+            b.layer.cornerRadius = 8;
+            [b addTarget:self action:NSSelectorFromString(sels[i])
+                forControlEvents:UIControlEventTouchUpInside];
+            [bg addSubview:b];
+        }
+    }
+    return self;
+}
+
+- (void)doCopy {
+    if (_five.length) [UIPasteboard generalPasteboard].string = _five;
+    KWLog(@"[ball] copied %lu", (unsigned long)_five.length);
+    [self doClose];
+}
+- (void)doSave {
+    NSString *home = NSHomeDirectory();
+    NSString *p = [[home stringByAppendingPathComponent:@"Documents"]
+                   stringByAppendingPathComponent:@"five_params.txt"];
+    [_five writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    KWLog(@"[ball] saved: %@", p);
+    [self doClose];
+}
+- (void)doClose {
+    self.hidden = YES;
+    self.rootViewController = nil;
+}
+@end
+
+// ---------- ??? ----------
+@interface KwaiFiveBall : UIWindow
+@end
+
+@implementation KwaiFiveBall {
+    UIView *_circle;
+}
+
+- (instancetype)init {
+    CGFloat d = 52;                                  // ???
+    UIScreen *sc = [UIScreen mainScreen];
+    CGRect f = CGRectMake(sc.bounds.size.width - d - 10, 140, d, d);
+    self = [super initWithFrame:f];
+    if (self) {
+        self.windowLevel = UIWindowLevelAlert + 100;
+        self.backgroundColor = [UIColor clearColor];
+        self.rootViewController = [[UIViewController alloc] init];
+        self.rootViewController.view.backgroundColor = [UIColor clearColor];
+
+        _circle = [[UIView alloc] initWithFrame:CGRectMake(0, 0, d, d)];
+        _circle.backgroundColor = [UIColor colorWithRed:0.13 green:0.13 blue:0.15 alpha:0.92];
+        _circle.layer.cornerRadius = d / 2.0;
+        _circle.layer.masksToBounds = YES;
+        _circle.layer.borderWidth = 1.5;
+        _circle.layer.borderColor = [UIColor colorWithRed:1.0 green:0.78 blue:0.25 alpha:0.95].CGColor;
+        _circle.userInteractionEnabled = YES;
+        [self.rootViewController.view addSubview:_circle];
+
+        UILabel *t = [[UILabel alloc] initWithFrame:_circle.bounds];
+        t.text = @"5P";
+        t.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.35 alpha:1];
+        t.font = [UIFont boldSystemFontOfSize:15];
+        t.textAlignment = NSTextAlignmentCenter;
+        t.userInteractionEnabled = NO;
+        [_circle addSubview:t];
+
+        // ??
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:self action:@selector(onPan:)];
+        [_circle addGestureRecognizer:pan];
+        // ?? ? ???
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+            initWithTarget:self action:@selector(onTap:)];
+        [_circle addGestureRecognizer:tap];
+
+        self.hidden = NO;
+    }
+    return self;
+}
+
+- (void)onPan:(UIPanGestureRecognizer *)g {
+    UIView *sv = self.superview ?: self.rootViewController.view;
+    CGPoint tr = [g translationInView:sv];
+    CGPoint c = self.center;
+    c.x += tr.x; c.y += tr.y;
+    // ??????
+    UIScreen *sc = [UIScreen mainScreen];
+    CGFloat half = self.bounds.size.width / 2.0;
+    c.x = MAX(half, MIN(sc.bounds.size.width - half, c.x));
+    c.y = MAX(half + 20, MIN(sc.bounds.size.height - half - 20, c.y));
+    self.center = c;
+    [g setTranslation:CGPointZero inView:sv];
+}
+
+- (void)onTap:(id)s {
+    KwaiReadFromCache();
+    KwaiDumpPlist();
+    NSString *five = KwaiGetFiveString();
+    KWLog(@"[ball] tap five len=%lu", (unsigned long)five.length);
+
+    static KwaiFivePanel *panel = nil;
+    if (panel) { panel.hidden = YES; panel = nil; }
+    panel = [[KwaiFivePanel alloc] initWithFive:five];
+    panel.hidden = NO;
+}
+
+@end
+
+// ---------- ?? ----------
+static KwaiFiveBall *g_ball = nil;
+static BOOL g_ballShown = NO;
+
+void KwaiShowBall(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_ballShown) return;
+        g_ballShown = YES;
+        g_ball = [[KwaiFiveBall alloc] init];
+        KWLog(@"[ball] shown");
+    });
+}
+
+BOOL KwaiIsLoggedIn(void) {
+    NSString *home = NSHomeDirectory();
+    NSString *p = [home stringByAppendingPathComponent:
+                   @"Library/Preferences/com.jiangjia.gif.plist"];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+    id t = d[@"Gif_Token"];
+    return [t isKindOfClass:[NSString class]] && [t length] > 10;
+}
+
+void KwaiStartBallWatcher(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (int i = 0; i < 120; i++) {
+            @autoreleasepool {
+                if (KwaiIsLoggedIn()) {
+                    KwaiReadFromCache();
+                    KwaiDumpPlist();
+                    NSString *five = KwaiGetFiveString();
+                    KWLog(@"[ball] logged in, five=%lu chars", (unsigned long)five.length);
+                    KwaiShowBall();
+                    break;
+                }
+            }
+            usleep(500 * 1000);
+        }
+    });
+}
+
+// ============================================================
+//  悬浮球手势处理（挂在 host UIWindow 上）
+// ============================================================
+
+// ============================================================
+//  QQ 授权探针（先只打日志，看快手点 QQ 授权走哪条路）
+// ============================================================
+void KwaiInstallQQProbe(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KWLog(@"[probe] installing QQ probes");
+
+    NSArray *clsMethods = @[
+        @[@"KSSocialQQOAuthService", @"sf_loginWithScopes:success:failure:"],
+        @[@"KSSocialQQOAuthService", @"oQQAuthWithReq:"],
+        @[@"KSSocialQQURLHandler", @"handleOpenURLStr:"],
+        @[@"KSSocialQQURLHandler", @"handleOpenURLString:"],
+        @[@"KSSocialQQURLHandler", @"handleOpenURL:"],
+        @[@"KSSocialQQURLHandler", @"handleOpenURL:delegate:"],
+        @[@"TencentOAuth", @"authorizeWithPermissions"],
+        @[@"TencentOAuth", @"handleOpenURL:"],
+        @[@"TencentOAuth", @"handleOpenURL:delegate:"],
+    ];
+
+    for (NSArray *pair in clsMethods) {
+        NSString *cn = pair[0], *sn = pair[1];
+        Class cls = NSClassFromString(cn);
+        if (!cls) { KWLog(@"[probe] no class %@", cn); continue; }
+        SEL sel = NSSelectorFromString(sn);
+
+        // 先试实例方法
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            IMP old = method_getImplementation(m);
+            KWLog(@"[probe] found -[%@ %@] imp=%p", cn, sn, old);
+            // 用 block 包装打日志（限于篇幅，先只记录存在性）
+        }
+        // 再试类方法
+        Method cm = class_getClassMethod(cls, sel);
+        if (cm) {
+            KWLog(@"[probe] found +[%@ %@]", cn, sn);
+        }
+        if (!m && !cm) {
+            KWLog(@"[probe] NOT found %@ %@", cn, sn);
+        }
+    }
+    KWLog(@"[probe] done");
+}
+
+// ============================================================
+//  QQ 授权拦截（hook KSSocialQQOAuthService 登录入口）
+// ============================================================
+static IMP g_orig_qqLogin = NULL;
+id   g_qqSuccessBlock = nil;
+id   g_qqServiceInst = nil;
+id   g_qqDict = nil;
+id   g_qqFailureBlock = nil;
+
+// 拦截后的处理：弹输入框 → 调 API → 交付
+static void KwaiQQInterceptFlow(void) {
+    // 直接调用原有的 sf_loginWithScopes:success:failure: → 跳真 QQ
+    KWLog(@"[qq] direct open real QQ");
+    if (g_orig_qqLogin && g_qqServiceInst) {
+        ((void(*)(id,SEL,id,id,id))g_orig_qqLogin)(
+            g_qqServiceInst,
+            NSSelectorFromString(@"sf_loginWithScopes:success:failure:"),
+            nil, g_qqSuccessBlock, g_qqFailureBlock);
+        KWLog(@"[qq] called original sf_login -> real QQ");
+    } else {
+        KWLog(@"[qq] no orig impl, fallback");
+    }
+}
+
+// 被 hook 的方法：-(void)sf_loginWithScopes:(id)scopes success:(id)s failure:(id)f
+static void kw_qqLogin(id self, SEL _cmd, id scopes, id success, id failure) {
+    @try {
+        KWLog(@"[qq] INTERCEPTED");
+        g_qqSuccessBlock = success;
+        g_qqFailureBlock = failure;
+        g_qqServiceInst = self;
+        KwaiQQInterceptFlow();   // 直接跳真 QQ
+    } @catch (NSException *e) {
+        KWLog(@"[qq] ex: %@", e);
+        if (g_orig_qqLogin) ((void(*)(id,SEL,id,id,id))g_orig_qqLogin)(self,_cmd,scopes,success,failure);
+    }
+}
+
+void KwaiInstallQQHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    Class cls = NSClassFromString(@"KSSocialQQOAuthService");
+    if (!cls) {
+        // 可能只作为 category 存在，用 runtime 找
+        cls = NSClassFromString(@"_TtC12KSSocialSDK22KSSocialQQOAuthService");
+    }
+    if (!cls) { KWLog(@"[qq] hook: class not found"); return; }
+
+    SEL sel = NSSelectorFromString(@"sf_loginWithScopes:success:failure:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { KWLog(@"[qq] hook: method not found"); return; }
+
+    g_orig_qqLogin = method_getImplementation(m);
+    method_setImplementation(m, (IMP)kw_qqLogin);
+    KWLog(@"[qq] hook installed on %@", NSStringFromClass(cls));
+}
+
+// ============================================================
+//  时间伪装 + 扩展 hook（对齐 libsystem_x 的全部功能）
+// ============================================================
+
+// ---- ① 开机时长 / 运行时间 ----
+static long long g_timeOffset = 0;   // 秒：把"现在"往前推
+
+static void KwaiSetupTimeSpoof(void) {
+    if (g_timeOffset != 0) return;
+    // 按容器种子生成 1~90 天随机
+    unsigned long seed = KwaiContainerSeed();
+    long long days = (seed % 90) + 1;
+    g_timeOffset = days * 24LL * 3600LL + (long long)(seed % 86400);
+    KWLog(@"[time] uptime spoof: %llds (%.1f days)", g_timeOffset, g_timeOffset / 86400.0);
+}
+
+// sysctl kern.boottime（开机时刻）
+static int (*orig_sysctl_time)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static int kw_sysctl_time(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+                           void *newp, size_t newlen) {
+    if (g_timeOffset > 0 && name && namelen >= 2 && oldp && oldlenp) {
+        // CTL_KERN = 1, KERN_BOOTTIME = 21
+        if (name[0] == 1 && name[1] == 21) {
+            if (*oldlenp >= sizeof(struct timeval)) {
+                struct timeval tv; gettimeofday(&tv, NULL);
+                tv.tv_sec -= g_timeOffset;
+                memcpy(oldp, &tv, sizeof(tv)); *oldlenp = sizeof(tv);
+                return 0;
+            }
+        }
+    }
+    return orig_sysctl_time ? orig_sysctl_time(name, namelen, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// sysctlbyname kern.boottime
+static int (*orig_sysctlbyname_time)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int kw_sysctlbyname_time(const char *name, void *oldp, size_t *oldlenp,
+                                 void *newp, size_t newlen) {
+    if (g_timeOffset > 0 && name && strcmp(name, "kern.boottime") == 0 && oldp && oldlenp) {
+        if (*oldlenp >= sizeof(struct timeval)) {
+            struct timeval tv; gettimeofday(&tv, NULL);
+            tv.tv_sec -= g_timeOffset;
+            memcpy(oldp, &tv, sizeof(tv)); *oldlenp = sizeof(tv);
+            return 0;
+        }
+    }
+    return orig_sysctlbyname_time ? orig_sysctlbyname_time(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// mach_absolute_time
+static uint64_t (*orig_mach_abs_time)(void) = NULL;
+static uint64_t kw_mach_abs_time(void) {
+    uint64_t r = orig_mach_abs_time ? orig_mach_abs_time() : 0;
+    if (g_timeOffset <= 0) return r;
+    static mach_timebase_info_data_t tb = {0,0};
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    uint64_t d = (uint64_t)((long double)g_timeOffset * 1e9L * tb.denom / tb.numer);
+    return (r > d) ? (r - d) : r;
+}
+
+// NSProcessInfo.systemUptime
+static NSTimeInterval (*orig_sys_uptime)(id, SEL) = NULL;
+static NSTimeInterval kw_sys_uptime(id self, SEL _cmd) {
+    NSTimeInterval up = orig_sys_uptime ? orig_sys_uptime(self, _cmd) : 0;
+    return (up > g_timeOffset) ? (up - g_timeOffset) : up;
+}
+
+// --- ② 屏幕 / 电池 / 设备名 hook ---
+
+// UIScreen bounds / scale
+static CGRect (*orig_screen_bounds)(id, SEL) = NULL;
+static CGRect kw_screen_bounds(id self, SEL _cmd) {
+    if (g_fakeScrW > 0 && g_fakeScrH > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]]) return CGRectMake(0, 0, g_fakeScrW, g_fakeScrH);
+    }
+    return orig_screen_bounds ? orig_screen_bounds(self, _cmd) : CGRectZero;
+}
+
+static CGFloat (*orig_screen_scale)(id, SEL) = NULL;
+static CGFloat kw_screen_scale(id self, SEL _cmd) {
+    if (g_fakeScale > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]]) return g_fakeScale;
+    }
+    return orig_screen_scale ? orig_screen_scale(self, _cmd) : 3.0;
+}
+
+// UIDevice.name
+static NSString *(*orig_dev_name)(id, SEL) = NULL;
+static NSString *kw_dev_name(id self, SEL _cmd) {
+    if (g_fakeDevName) return g_fakeDevName;
+    return orig_dev_name ? orig_dev_name(self, _cmd) : @"iPhone";
+}
+
+// UIDevice.systemVersion
+static NSString *(*orig_dev_ver)(id, SEL) = NULL;
+static NSString *kw_dev_ver(id self, SEL _cmd) {
+    // 与机型的 minIOS 匹配
+    if (g_fakeMinIOS > 0) return [NSString stringWithFormat:@"%d.4", g_fakeMinIOS];
+    return orig_dev_ver ? orig_dev_ver(self, _cmd) : @"15.4";
+}
+
+// NSProcessInfo.operatingSystemVersion
+static NSOperatingSystemVersion (*orig_os_ver)(id, SEL) = NULL;
+static NSOperatingSystemVersion kw_os_ver(id self, SEL _cmd) {
+    if (g_fakeMinIOS > 0) {
+        NSOperatingSystemVersion v; v.majorVersion = g_fakeMinIOS; v.minorVersion = 4; v.patchVersion = 0;
+        return v;
+    }
+    return orig_os_ver ? orig_os_ver(self, _cmd) : (NSOperatingSystemVersion){15,4,0};
+}
+
+// --- ③ 安装 ---
+void KwaiInstallTimeSpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupTimeSpoof();
+
+    // sysctl / sysctlbyname
+    orig_sysctl_time = sysctl;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctl, (void *)kw_sysctl_time, NULL);
+        KWLog(@"[time] sysctl OK");
+    } @catch (NSException *e) { KWLog(@"[time] sysctl ex: %@", e); }
+
+    orig_sysctlbyname_time = sysctlbyname;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)kw_sysctlbyname_time, NULL);
+        KWLog(@"[time] sysctlbyname OK");
+    } @catch (NSException *e) { KWLog(@"[time] sysctlbn ex: %@", e); }
+
+    // mach_absolute_time
+    orig_mach_abs_time = mach_absolute_time;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)mach_absolute_time, (void *)kw_mach_abs_time, NULL);
+        KWLog(@"[time] mach_absolute_time OK");
+    } @catch (NSException *e) { KWLog(@"[time] mat ex: %@", e); }
+
+    // NSProcessInfo
+    Method m1 = class_getInstanceMethod([NSProcessInfo class], @selector(systemUptime));
+    if (m1) { orig_sys_uptime = (void *)method_getImplementation(m1);
+              method_setImplementation(m1, (IMP)kw_sys_uptime);
+              KWLog(@"[time] systemUptime OK"); }
+
+    Method m2 = class_getInstanceMethod([NSProcessInfo class], @selector(operatingSystemVersion));
+    if (m2) { orig_os_ver = (void *)method_getImplementation(m2);
+              method_setImplementation(m2, (IMP)kw_os_ver);
+              KWLog(@"[time] OSVersion OK"); }
+
+    // UIScreen
+    Method m3 = class_getInstanceMethod([UIScreen class], @selector(bounds));
+    if (m3) { orig_screen_bounds = (void *)method_getImplementation(m3);
+              method_setImplementation(m3, (IMP)kw_screen_bounds);
+              KWLog(@"[screen] bounds OK"); }
+
+    Method m4 = class_getInstanceMethod([UIScreen class], @selector(scale));
+    if (m4) { orig_screen_scale = (void *)method_getImplementation(m4);
+              method_setImplementation(m4, (IMP)kw_screen_scale);
+              KWLog(@"[screen] scale OK"); }
+
+    // UIDevice
+    Method m5 = class_getInstanceMethod([UIDevice class], @selector(name));
+    if (m5) { orig_dev_name = (void *)method_getImplementation(m5);
+              method_setImplementation(m5, (IMP)kw_dev_name);
+              KWLog(@"[device] name OK"); }
+
+    Method m6 = class_getInstanceMethod([UIDevice class], @selector(systemVersion));
+    if (m6) { orig_dev_ver = (void *)method_getImplementation(m6);
+              method_setImplementation(m6, (IMP)kw_dev_ver);
+              KWLog(@"[device] systemVersion OK"); }
+
+    KWLog(@"[time] all done");
 }
