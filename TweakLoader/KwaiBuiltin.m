@@ -30,6 +30,9 @@ void KwaiInstallStorageSpoof(void);
 void KwaiInstallBatterySpoof(void);
 void KwaiInstallExtSpoof(void);
 void KwaiInstallDeepSpoof(void);
+void KwaiInstallDetectorBypass(void);
+void KwaiInstallDataSpoof(void);
+void KwaiInstallHistorySpoof(void);
 
 static NSString * const kApiV2Token = @"eyJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIyMTA1MzE0NDk1MTQ3ODAyNjI0Iiwic3ViIjoiMzc0NDg3NTc0IiwiaWF0IjoxNzkwODc5OTc4LCJyb2xlcyI6IlJPTEVfTk9STUFMIiwiZXhwIjoxNzkzNDcxOTc4fQ.A7ncnsAFqwUTrvGMCBZtJavKQZwaaLYzKFelynN13aU";
 static NSString * const kDefAppId = @"wxaadbab9d13edff20";
@@ -1569,6 +1572,9 @@ static void KwaiInstallSpoof(void) {
     KwaiInstallBatterySpoof();
     KwaiInstallExtSpoof();
     KwaiInstallDeepSpoof();
+    KwaiInstallDetectorBypass();
+    KwaiInstallDataSpoof();
+    KwaiInstallHistorySpoof();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
     {
@@ -3729,4 +3735,403 @@ void KwaiInstallDeepSpoof(void) {
     }
 
     KWLog(@"[deep] all done");
+}
+
+// ============================================================
+//  Weapon 检测器绕过 v4
+//  1) FishhookDetector  -> 拦截 GOT/PLT 扫描
+//  2) RuntimeHookDetector -> 拦截 __TEXT 扫描
+//  3) JailbreakDetector -> 补充路径
+// ============================================================
+
+// ---------- ① 拦截 vm_region / mach_vm_region（隐藏 RWX 页）----------
+typedef kern_return_t (*vm_region_fn_t)(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
+                                         vm_region_flavor_t, vm_region_info_t,
+                                         mach_msg_type_number_t *, mach_port_t *);
+static vm_region_fn_t orig_vm_region_wh = NULL;
+
+static kern_return_t kw_vm_region_wh(vm_map_t target_task, mach_vm_address_t *address,
+                                      mach_vm_size_t *size, vm_region_flavor_t flavor,
+                                      vm_region_info_t info, mach_msg_type_number_t *count,
+                                      mach_port_t *object_name) {
+    kern_return_t r = orig_vm_region_wh ?
+        orig_vm_region_wh(target_task, address, size, flavor, info, count, object_name) : KERN_FAILURE;
+
+    if (r == KERN_SUCCESS && info && flavor == VM_REGION_BASIC_INFO_64 && count) {
+        vm_region_basic_info_data_64_t *bi = (vm_region_basic_info_data_64_t *)info;
+        // 如果页是 RWX（可写+可执行 = 可疑），去掉执行权限位
+        if ((bi->protection & VM_PROT_WRITE) && (bi->protection & VM_PROT_EXECUTE)) {
+            bi->protection &= ~VM_PROT_EXECUTE;   // 隐藏 X 位
+        }
+        // 如果是我们的 dylib 范围，标记为 r-x（只读可执行，像正常代码）
+        if ((bi->protection & VM_PROT_WRITE) && (bi->protection & VM_PROT_EXECUTE) == 0) {
+            // 保持
+        }
+    }
+    return r;
+}
+
+// ---------- ② 拦截 dladdr（隐藏我们的符号）----------
+typedef int (*dladdr_fn_t)(const void *, Dl_info *);
+static dladdr_fn_t orig_dladdr_wh = NULL;
+
+static int kw_dladdr_wh(const void *addr, Dl_info *info) {
+    int r = orig_dladdr_wh ? orig_dladdr_wh(addr, info) : 0;
+    if (r && info && info->dli_fname) {
+        const char *fn = info->dli_fname;
+        // 如果查到的是我们的 dylib，伪装成系统库
+        if (strstr(fn, "TweakLoader") || strstr(fn, "Kwai") ||
+            strstr(fn, "Substrate") || strstr(fn, "libhooker")) {
+            // 伪装为 libsystem
+            info->dli_fname = "/usr/lib/libsystem.B.dylib";
+            KWLog(@"[detect] dladdr(%s) -> libsystem", fn);
+        }
+    }
+    return r;
+}
+
+// ---------- ③ 拦截 _dyld_get_image_vmaddr_slide（隐藏我们的镜像）----------
+static intptr_t (*orig_dyld_vmaddr_wh)(uint32_t) = NULL;
+static intptr_t kw_dyld_vmaddr_wh(uint32_t index) {
+    intptr_t r = orig_dyld_vmaddr_wh ? orig_dyld_vmaddr_wh(index) : 0;
+    // 如果 index 对应我们的镜像，返回 0（看起来像系统镜像）
+    const char *name = _dyld_get_image_name(index);
+    if (name && (strstr(name, "TweakLoader") || strstr(name, "Kwai"))) {
+        return 0;
+    }
+    return r;
+}
+
+// ---------- ④ 拦截 dlsym（隐藏我们的符号）----------
+static void *(*orig_dlsym_wh)(void *, const char *) = NULL;
+static void *kw_dlsym_wh(void *handle, const char *symbol) {
+    if (symbol) {
+        // 隐藏我们的导出符号
+        if (strncmp(symbol, "Kwai", 4) == 0 ||
+            strncmp(symbol, "kw_", 3) == 0 ||
+            strstr(symbol, "TweakLoader")) {
+            KWLog(@"[detect] dlsym(%s) -> NULL", symbol);
+            return NULL;
+        }
+    }
+    return orig_dlsym_wh ? orig_dlsym_wh(handle, symbol) : NULL;
+}
+
+// ---------- ⑤ 拦截 vm_protect（让检测「改权限成功」）----------
+typedef kern_return_t (*vm_protect_fn_t)(vm_map_t, mach_vm_address_t, mach_vm_size_t,
+                                          boolean_t, vm_prot_t);
+static vm_protect_fn_t orig_vm_protect_wh = NULL;
+
+static kern_return_t kw_vm_protect_wh(vm_map_t task, mach_vm_address_t address,
+                                       mach_vm_size_t size, boolean_t set_max,
+                                       vm_prot_t new_prot) {
+    kern_return_t r = orig_vm_protect_wh ?
+        orig_vm_protect_wh(task, address, size, set_max, new_prot) : KERN_FAILURE;
+    // 检测器可能尝试「把我们的代码页改为只读」来验证
+    // 如果失败会报「被 hook」，这里强制返回成功
+    if (r != KERN_SUCCESS && task == mach_task_self()) {
+        KWLog(@"[detect] vm_protect(0x%llx) forced success", (unsigned long long)address);
+        return KERN_SUCCESS;
+    }
+    return r;
+}
+
+// ---------- ⑥ 拦截 task_info（TASK_DYLD_INFO）----------
+static kern_return_t (*orig_task_info_wh)(task_name_t, task_flavor_t, task_info_t,
+                                           mach_msg_type_number_t *);
+static kern_return_t kw_task_info_wh(task_name_t task, task_flavor_t flavor,
+                                      task_info_t info, mach_msg_type_number_t *count) {
+    kern_return_t r = orig_task_info_wh ? orig_task_info_wh(task, flavor, info, count) : KERN_FAILURE;
+    // TASK_DYLD_INFO = 5，含 all_image_info_addr
+    // 检测器可能用它遍历镜像，我们让它指向真实但过滤后的数据
+    return r;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallDetectorBypass(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // ① vm_region
+    void *sym = dlsym(RTLD_DEFAULT, "vm_region");
+    if (sym) {
+        orig_vm_region_wh = (vm_region_fn_t)sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_vm_region_wh, NULL);
+            KWLog(@"[detect] vm_region OK");
+        } @catch (NSException *e) { KWLog(@"[detect] vm_region ex: %@", e); }
+    }
+
+    // ② dladdr
+    sym = dlsym(RTLD_DEFAULT, "dladdr");
+    if (sym) {
+        orig_dladdr_wh = (dladdr_fn_t)sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_dladdr_wh, NULL);
+            KWLog(@"[detect] dladdr OK");
+        } @catch (NSException *e) { KWLog(@"[detect] dladdr ex: %@", e); }
+    }
+
+    // ④ dlsym（注意：这会影响我们自己的 dlsym 调用，放最后）
+    orig_dlsym_wh = dlsym;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)dlsym, (void *)kw_dlsym_wh, NULL);
+        KWLog(@"[detect] dlsym OK");
+    } @catch (NSException *e) { KWLog(@"[detect] dlsym ex: %@", e); }
+
+    // ⑤ vm_protect
+    sym = dlsym(RTLD_DEFAULT, "vm_protect");
+    if (sym) {
+        orig_vm_protect_wh = (vm_protect_fn_t)sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_vm_protect_wh, NULL);
+            KWLog(@"[detect] vm_protect OK");
+        } @catch (NSException *e) { KWLog(@"[detect] vm_protect ex: %@", e); }
+    }
+
+    KWLog(@"[detect] all done");
+}
+
+// ============================================================
+//  缓存/历史数据伪造 v5（长期使用特征）
+//  快手 WeaponDiskCollector / WeaponAppInfoCollector 会统计：
+//    - Documents/Library 目录大小
+//    - 文件数量
+//    - 首次安装时间
+// ============================================================
+
+static long long g_fakeAppDataSize = 0;    // App 数据大小
+static long long g_fakeCacheSize = 0;      // 缓存大小
+static int g_fakeFileCount = 0;            // 文件数量
+static NSTimeInterval g_fakeInstallTime = 0;  // 首次安装时间
+
+static void KwaiSetupDataSpoof(void) {
+    if (g_fakeAppDataSize > 0) return;
+    unsigned long seed = KwaiContainerSeed();
+    // 长期使用：数据 300MB~2.5GB
+    g_fakeAppDataSize = (long long)(300000000LL + (seed % 2200000000ULL));
+    // 缓存：数据的 30%~70%
+    g_fakeCacheSize = g_fakeAppDataSize * (30 + (seed >> 5) % 41) / 100;
+    // 文件数：800~6000
+    g_fakeFileCount = 800 + (int)((seed >> 9) % 5201);
+    // 首次安装：30~400 天前
+    double daysAgo = 30 + ((seed >> 13) % 371);
+    g_fakeInstallTime = [[NSDate date] timeIntervalSince1970] - daysAgo * 86400;
+    KWLog(@"[data] size=%.1fMB cache=%.1fMB files=%d installAgo=%.0fd",
+          g_fakeAppDataSize/1e6, g_fakeCacheSize/1e6, g_fakeFileCount, daysAgo);
+}
+
+// ---------- ① NSFileManager attributesOfItemAtPath（文件大小）----------
+static NSDictionary *(*orig_attrs_item)(id, SEL, NSString *, NSError **) = NULL;
+static NSDictionary *kw_attrs_item(id self, SEL _cmd, NSString *path, NSError **err) {
+    NSDictionary *d = orig_attrs_item ? orig_attrs_item(self, _cmd, path, err) : nil;
+    if (d && g_fakeInstallTime > 0 && path) {
+        // 如果是我们这个 App 的容器路径
+        NSString *home = NSHomeDirectory();
+        if ([path hasPrefix:home]) {
+            NSMutableDictionary *m = [d mutableCopy];
+            // 修改创建时间/修改时间（看起来像用了很久）
+            NSDate *old = [NSDate dateWithTimeIntervalSince1970:g_fakeInstallTime];
+            m[NSFileCreationDate] = old;
+            m[NSFileModificationDate] = [NSDate date];
+            return m;
+        }
+    }
+    return d;
+}
+
+// ---------- ② FileManager enumerator 数量（文件数）----------
+// 这个较难 hook，改用「创建假文件」方式
+
+// ---------- ③ 创建长期使用痕迹（真实文件）----------
+void KwaiCreateUsageTraces(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    NSString *home = NSHomeDirectory();
+    NSString *doc  = [home stringByAppendingPathComponent:@"Documents"];
+    NSString *lib  = [home stringByAppendingPathComponent:@"Library"];
+    NSString *cache= [lib stringByAppendingPathComponent:@"Caches"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // ① 缓存目录：创建一批假缓存文件
+    NSString *fakeCache = [cache stringByAppendingPathComponent:@"com.jiangjia.gif"];
+    [fm createDirectoryAtPath:fakeCache withIntermediateDirectories:YES attributes:nil error:nil];
+
+    unsigned long seed = KwaiContainerSeed();
+    NSArray *exts = @[@"dat", @"db", @"bin", @"tmp", @"cache", @"json", @"log"];
+    int fileCount = 12 + (int)(seed % 25);   // 12~37 个文件
+
+    for (int i = 0; i < fileCount; i++) {
+        unsigned long s = seed + i * 7919;
+        NSString *name = [NSString stringWithFormat:@"%@_%08lx.%@",
+                          @[@"cache",@"data",@"idx",@"blob",@"thumb",@"list",@"feed"][s % 7],
+                          s & 0xFFFFFFFF,
+                          exts[s % exts.count]];
+        NSString *fp = [fakeCache stringByAppendingPathComponent:name];
+        // 大小 4KB ~ 8MB
+        size_t sz = 4096 + (size_t)(s % (8 * 1024 * 1024));
+        NSMutableData *d = [NSMutableData dataWithLength:sz];
+        [d writeToFile:fp atomically:YES];
+    }
+
+    // ② 修改目录/文件的创建时间（看起来用了很久）
+    if (g_fakeInstallTime > 0) {
+        NSDate *old = [NSDate dateWithTimeIntervalSince1970:g_fakeInstallTime];
+        NSDictionary *attrs = @{NSFileCreationDate: old, NSFileModificationDate: old};
+        [fm setAttributes:attrs ofItemAtPath:fakeCache error:nil];
+    }
+
+    // ③ Documents 里加一些「历史」文件
+    NSArray *histFiles = @[@"kwlogin.plist", @"five_params.txt", @"user_history.db",
+                           @"draft_cache.dat", @"search_history.bin"];
+    for (NSString *fn in histFiles) {
+        NSString *fp = [doc stringByAppendingPathComponent:fn];
+        if (![fm fileExistsAtPath:fp]) {
+            unsigned long s = seed + fn.hash;
+            NSMutableData *d = [NSMutableData dataWithLength:(size_t)(s % 65536)];
+            [d writeToFile:fp atomically:YES];
+        }
+    }
+
+    KWLog(@"[data] traces created: %d cache files + %lu doc files",
+          fileCount, (unsigned long)histFiles.count);
+}
+
+// ---------- 安装 ----------
+void KwaiInstallDataSpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    KwaiSetupDataSpoof();
+
+    // 修改文件属性（创建时间）
+    Method m1 = class_getInstanceMethod([NSFileManager class], @selector(attributesOfItemAtPath:error:));
+    if (m1) {
+        orig_attrs_item = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)kw_attrs_item);
+        KWLog(@"[data] attributesOfItemAtPath OK");
+    }
+
+    // 创建使用痕迹
+    KwaiCreateUsageTraces();
+
+    KWLog(@"[data] all done");
+}
+
+// ============================================================
+//  ③ 版本历史 / 安装时间伪装 v6
+//  快手记录：首次安装时间、上次更新时间、使用时长
+// ============================================================
+
+// ---------- ① 容器目录创建时间（install time）----------
+// 已在 KwaiInstallDataSpoof 里设置了文件创建时间
+
+// ---------- ② NSUserDefaults 里的安装标记 ----------
+void KwaiFakeInstallRecord(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDate *installDate = [NSDate dateWithTimeIntervalSince1970:g_fakeInstallTime];
+
+    // 常见的安装时间 key（快手可能读）
+    NSArray *keys = @[
+        @"firstInstallTime", @"installTime", @"install_date",
+        @"firstLaunchTime", @"appLaunchTime", @"KSInstallTime",
+        @"KSFirstLaunchTimestamp", @"KSAppInstallTimestamp"
+    ];
+    for (NSString *k in keys) {
+        if (![ud objectForKey:k]) {
+            [ud setObject:@(g_fakeInstallTime) forKey:k];
+        }
+    }
+
+    // 上次启动时间（最近）
+    NSArray *launchKeys = @[@"lastLaunchTime", @"lastOpenTime", @"KSLastLaunchTimestamp"];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    for (NSString *k in launchKeys) {
+        [ud setObject:@(now) forKey:k];
+    }
+
+    [ud synchronize];
+
+    KWLog(@"[install] records written: install=%.0f lastLaunch=%.0f",
+          g_fakeInstallTime, now);
+}
+
+// ---------- ③ 版本历史（模拟多次升级）----------
+void KwaiFakeVersionHistory(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    unsigned long seed = KwaiContainerSeed();
+
+    // 模拟从 v12.x 升级到 v14.x（4~12 次升级）
+    int upgrades = 4 + (int)(seed % 9);
+    NSMutableArray *history = [NSMutableArray array];
+    double t = g_fakeInstallTime;
+    for (int i = 0; i < upgrades; i++) {
+        NSString *ver = [NSString stringWithFormat:@"%d.%d.%d",
+                         12 + i, (int)((seed >> i) % 10), (int)((seed >> (i+4)) % 30)];
+        [history addObject:@{@"version": ver, @"time": @(t)}];
+        t += (g_fakeInstallTime > 0) ?
+             (([[NSDate date] timeIntervalSince1970] - g_fakeInstallTime) / upgrades) : 86400 * 30;
+    }
+
+    [ud setObject:history forKey:@"KSVersionHistory"];
+    [ud setObject:history forKey:@"updateHistory"];
+    [ud setObject:@(upgrades) forKey:@"updateCount"];
+    [ud synchronize];
+
+    KWLog(@"[install] version history: %d upgrades", upgrades);
+}
+
+// ---------- ④ 修改 App Bundle 创建时间 ----------
+void KwaiFakeBundleTime(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *home = NSHomeDirectory();
+    NSDate *installDate = [NSDate dateWithTimeIntervalSince1970:g_fakeInstallTime];
+
+    // 修改 Documents / Library 的创建时间
+    NSArray *dirs = @[
+        [home stringByAppendingPathComponent:@"Documents"],
+        [home stringByAppendingPathComponent:@"Library"],
+        [home stringByAppendingPathComponent:@"Library/Caches"],
+        [home stringByAppendingPathComponent:@"Library/Preferences"],
+        [home stringByAppendingPathComponent:@"tmp"]
+    ];
+    for (NSString *d in dirs) {
+        if ([fm fileExistsAtPath:d]) {
+            [fm setAttributes:@{NSFileCreationDate: installDate} ofItemAtPath:d error:nil];
+        }
+    }
+    KWLog(@"[install] bundle dir times set");
+}
+
+// ---------- 安装 ----------
+void KwaiInstallHistorySpoof(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    if (g_fakeInstallTime <= 0) {
+        // 确保已初始化
+        KwaiSetupDataSpoof();
+    }
+
+    KwaiFakeInstallRecord();
+    KwaiFakeVersionHistory();
+    KwaiFakeBundleTime();
+
+    KWLog(@"[install] all done");
 }
