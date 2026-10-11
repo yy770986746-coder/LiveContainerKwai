@@ -40,11 +40,13 @@ void NSFMGuestHooksInit(void) {
     }
     NSURL *result;
     if(isolateAppGroup) {
-        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/LCAppGroup/%@", getenv("HOME"), groupIdentifier]];
+        const char *h = getenv("HOME"); if(!h) h = "";
+        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/LCAppGroup/%@", h, groupIdentifier]];
     } else if (NSUserDefaults.lcAppGroupPath){
         result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/LiveContainer/Data/AppGroup/%@", NSUserDefaults.lcAppGroupPath, groupIdentifier]];
     } else {
-        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/Documents/Data/AppGroup/%@", getenv("LC_HOME_PATH"), groupIdentifier]];
+        const char *lh = getenv("LC_HOME_PATH"); if(!lh) lh = "";
+        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/Documents/Data/AppGroup/%@", lh, groupIdentifier]];
     }
     [NSFileManager.defaultManager createDirectoryAtURL:[result URLByAppendingPathComponent:@"Library/Caches"] withIntermediateDirectories:YES attributes:nil error:nil];
     return result;
@@ -61,10 +63,12 @@ void NSFMGuestHooksInit(void) {
             // see NSFileManager+GuestHooks.m for more info
             NSFileManager *fm = NSFileManager.defaultManager;
             const char *lcHomePath = getenv(NSUserDefaults.isLiveProcess ? "LP_HOME_PATH" : "LC_HOME_PATH");
+            if(!lcHomePath) lcHomePath = "";
             NSString *libraryPath = [@(lcHomePath) stringByAppendingPathComponent:@"Library"];
             NSString *cookies2Path = [libraryPath stringByAppendingPathComponent:@"Cookies2"];
             NSString *cookiesPath = [libraryPath stringByAppendingPathComponent:@"Cookies"];
-            NSString* appCookiesPath = [@(getenv("HOME")) stringByAppendingPathComponent:@"Library/Cookies"];
+            const char *hp = getenv("HOME"); if(!hp) hp = "";
+            NSString* appCookiesPath = [@(hp) stringByAppendingPathComponent:@"Library/Cookies"];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:cookies2Path isDirectory:&isDir]) {
                 if([fm fileExistsAtPath:cookiesPath isDirectory:&isDir]) {
