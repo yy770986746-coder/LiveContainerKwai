@@ -818,18 +818,13 @@ public struct MultitaskDockSwiftView: View {
     @State private var isMoving: Bool = false
     @AppStorage("LCHideCollapsedDock", store: LCUtils.appGroupUserDefault) var hideCollapsedDock: Bool = false
     
-    @ViewBuilder
     private var dockBackground: some View {
-        if #available(iOS 26.0, *), SharedModel.isLiquidGlassEnabled {
-            Rectangle().glassEffect(.regular, in: .rect(cornerRadius: 15))
-        } else {
-            RoundedRectangle(cornerRadius: 15)
-                .fill(Color.black.opacity(dockManager.isDockHidden ? 0.3 : 0.7))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 15)
-                        .stroke(Color.white.opacity(dockManager.isDockHidden ? 0.1 : 0.3), lineWidth: 1)
-                )
-        }
+        RoundedRectangle(cornerRadius: 15)
+            .fill(Color.black.opacity(dockManager.isDockHidden ? 0.3 : 0.7))
+            .overlay(
+                RoundedRectangle(cornerRadius: 15)
+                    .stroke(Color.white.opacity(dockManager.isDockHidden ? 0.1 : 0.3), lineWidth: 1)
+            )
     }
     // Calculate dynamic padding based on user settings
     private var dynamicPadding: CGFloat {
