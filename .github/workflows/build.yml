@@ -13,28 +13,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode
+      - name: Select Xcode 16.0
         run: |
-          for X in Xcode_16.2.app Xcode_16.1.app Xcode_16.0.app Xcode.app; do
-            if [ -d "/Applications/$X" ]; then sudo xcode-select -s "/Applications/$X"; break; fi
-          done
+          # 列出可用 Xcode
+          ls /Applications | grep -i xcode
+          # 优先用 16.0（自带 iOS 18.0 SDK，无需额外下载）
+          sudo xcode-select -s /Applications/Xcode_16.0.app
           xcodebuild -version
+          echo "--- SDKs ---"
+          xcodebuild -showsdks | grep -i iphoneos || true
 
       - name: Install tools
         run: brew install ldid || true
 
       - name: Re-sign OpenSSL xcframework
         run: |
-          set -x
           XCF="OpenSSL/Frameworks/OpenSSL.xcframework"
-          ls -la "$XCF"
-          # 移除旧签名
           for f in $(find "$XCF" -name "OpenSSL" -type f); do
-            echo "processing: $f"
             codesign --remove-signature "$f" 2>/dev/null || true
-          done
-          # 重新 ad-hoc 签名
-          for f in $(find "$XCF" -name "OpenSSL" -type f); do
             codesign -f -s - "$f" 2>/dev/null || true
           done
           echo "resign done"
@@ -61,7 +57,6 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             ONLY_ACTIVE_ARCH=NO \
-            DISABLE_MANUAL_TARGET_ORDER_BUILD_WARNING=1 \
             archive \
             2>&1 | tail -100
 
