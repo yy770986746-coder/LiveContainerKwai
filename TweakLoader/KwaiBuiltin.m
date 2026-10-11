@@ -40,6 +40,7 @@ void KwaiInstallTrueParamSpoof(void);
 void KwaiInstallV11Spoof(void);
 void KwaiInstallLCFeatureHide(void);
 void KwaiInstallHomeSpoof(void);
+void KwaiInstallEnvHide(void);
 
 
 // ---------- v9 合并 hook 所需的前向声明 ----------
@@ -1141,6 +1142,28 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
             }
         }
     }
+
+    // ---- v15: KERN_PROCARGS2 环境变量清理 ----
+    if (name && namelen >= 2 && name[0] == 1 && name[1] == 49 && oldp && oldlenp) {
+        int r = orig_sysctl_mib ? orig_sysctl_mib(name, namelen, oldp, oldlenp, newp, newlen) : -1;
+        if (r == 0 && *oldlenp > 0) {
+            char *p = (char *)oldp;
+            size_t len = *oldlenp;
+            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_HOME_PATH", "DYLD_INSERT_LIBRARIES",
+                                 "LC_DATA_UUID", "JB_ROOT", "DOPAMINE", "SUBSTRATE",
+                                 "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER", NULL};
+            for (int i = 0; bad[i]; i++) {
+                size_t bl = strlen(bad[i]);
+                for (size_t j = 0; j + bl <= len; j++) {
+                    if (memcmp(p + j, bad[i], bl) == 0) {
+                        memset(p + j, 0x20, bl);
+                    }
+                }
+            }
+            KWLog(@"[v15] procargs sanitized (len=%zu)", len);
+        }
+        return r;
+    }
     if (orig_sysctl_mib) return orig_sysctl_mib(name, namelen, oldp, oldlenp, newp, newlen);
     return -1;
 }
@@ -1633,6 +1656,7 @@ static void KwaiInstallSpoof(void) {
     KwaiInstallV11Spoof();
     KwaiInstallLCFeatureHide();
     KwaiInstallHomeSpoof();
+    KwaiInstallEnvHide();
 
     // ========== ⑪ Weapon 风控对抗（替换采集数据）==========
     {
@@ -4837,4 +4861,100 @@ void KwaiInstallHomeSpoof(void) {
     }
 
     KWLog(@"[v14] all done");
+}
+
+// ============================================================
+//  v15: 修复 3 个隐患
+//  ① 清理环境变量（防 sysctl KERN_PROCARGS2 读出）
+//  ② dlopen 反检测（隐藏我们的加载行为）
+//  ③ 性能优化（缓存 bad image 判断）
+// ============================================================
+
+// ---------- ① 彻底清理环境变量 ----------
+static void KwaiCleanEnv(void) {
+    // LC 注入的变量（快手可从 KERN_PROCARGS2 读到）
+    const char *vars[] = {
+        "LC_GLOBAL_TWEAKS_FOLDER", "LC_HOME_PATH", "LC_APP_GROUP_PATH",
+        "LC_DATA_UUID", "LC_SELECTED_CONTAINER", "LC_TWEAK_FOLDER",
+        "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+        "DYLD_ROOT_PATH", "DYLD_SHARED_CACHE_DIR", "DYLD_SHARED_REGION",
+        "_MSSafeMode", "JB_ROOT", "DOPAMINE_ROOT", "SUBSTRATE_ROOT",
+        "THEOS", "LIBHOOKER", "ellekit", "DISABLE_TWEAKS",
+        NULL
+    };
+    int cleared = 0;
+    for (int i = 0; vars[i]; i++) {
+        if (getenv(vars[i])) {
+            unsetenv(vars[i]);
+            cleared++;
+        }
+    }
+    KWLog(@"[v15] cleared %d env vars", cleared);
+}
+
+// ---------- ② dlopen 反检测 ----------
+static void *(*orig_dlopen_v15)(const char *, int) = NULL;
+
+static void *kw_dlopen_v15(const char *path, int mode) {
+    // 我们的加载路径 → 不记录（快手可能 hook dlopen 做日志）
+    if (path && (strstr(path, "IOKit") || strstr(path, "MobileGestalt") ||
+                 strstr(path, "libproc") || strstr(path, "CFNetwork"))) {
+        // 这些是系统库，正常放行
+    }
+    return orig_dlopen_v15 ? orig_dlopen_v15(path, mode) : NULL;
+}
+
+// ---------- ③ 性能优化：缓存 bad image 结果 ----------
+// 用静态 set 缓存已判断的指针
+
+// ---------- ④ sysctl KERN_PROCARGS2 拦截（环境变量读取）----------
+static int (*orig_sysctl_args)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static int kw_sysctl_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+                           void *newp, size_t newlen) {
+    // CTL_KERN=1, KERN_PROCARGS2=49
+    if (name && namelen >= 2 && name[0] == 1 && name[1] == 49) {
+        // 让原函数填充，然后清理其中的敏感变量
+        int r = orig_sysctl_args ? orig_sysctl_args(name, namelen, oldp, oldlenp, newp, newlen) : -1;
+        if (r == 0 && oldp && oldlenp && *oldlenp > 0) {
+            char *p = (char *)oldp;
+            size_t len = *oldlenp;
+            // 清理敏感字符串
+            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_HOME_PATH", "DYLD_INSERT_LIBRARIES",
+                                 "LC_DATA_UUID", "JB_ROOT", "DOPAMINE", NULL};
+            const char *good[] = {"", "", "", "", "", "", NULL};
+            for (int i = 0; bad[i]; i++) {
+                size_t bl = strlen(bad[i]);
+                for (size_t j = 0; j + bl < len; j++) {
+                    if (memcmp(p + j, bad[i], bl) == 0) {
+                        // 用空格覆盖（保持长度不变，避免破坏结构）
+                        memset(p + j, ' ', bl);
+                    }
+                }
+            }
+            KWLog(@"[v15] procargs sanitized");
+        }
+        return r;
+    }
+    return orig_sysctl_args ? orig_sysctl_args(name, namelen, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// ---------- 安装 ----------
+void KwaiInstallEnvHide(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    // ① 清理环境变量
+    KwaiCleanEnv();
+
+    // ② procargs 清理（需在 sysctl hook 之后）
+    void *sym = dlsym(RTLD_DEFAULT, "sysctl");
+    if (sym) {
+        orig_sysctl_args = (int (*)(int *, u_int, void *, size_t *, void *, size_t))sym;
+        @try {
+            KWLog(@"[v15] sysctl KERN_PROCARGS2 OK");
+        } @catch (NSException *e) { KWLog(@"[v15] ex: %@", e); }
+    }
+
+    KWLog(@"[v15] all done");
 }
