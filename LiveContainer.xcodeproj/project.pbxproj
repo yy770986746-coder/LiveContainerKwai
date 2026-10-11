@@ -214,16 +214,11 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				DocumentPicker.m,
-				KwaiAntiDetect.m,
 				KwaiBuiltin.m,
-				KwaiHide.m,
-				KwaiJailbreak.m,
-				KwaiWeapon.m,
 				Notification.m,
 				TweakLoader.m,
 				"UIKit+GuestHooks.m",
 				litehook.c,
-				litehook.h,
 				dyld_cache_format.h,
 				"fixup-chains.h",
 			);
