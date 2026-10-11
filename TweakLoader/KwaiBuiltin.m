@@ -4538,6 +4538,19 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
         const char *v = "iPhone"; size_t n = strlen(v)+1;
         if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
     }
+    // ---- ⑧ 虚拟机检测（防 WeaponSimulatorDetector）----
+    if (strcmp(name, "kern.hv_vmm_present") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 0; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.arm64e") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = g_fakeArmE; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.armv8_1_atomics") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.armv8_2") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
     return -1;   // 未处理
 }
 
