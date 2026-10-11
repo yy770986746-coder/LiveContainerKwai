@@ -155,7 +155,7 @@ final class LCStorageManagementModel: ObservableObject {
     }
 
     nonisolated private static func calculateAppItem(
-        from input: LCAppModel,
+        from input: LCAppModel
     ) async throws -> LCAppStorageItem {
         var containerDetails: [LCAppStorageContainerItem] = []
         containerDetails.reserveCapacity(input.uiContainers.count)

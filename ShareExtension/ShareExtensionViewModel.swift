@@ -307,7 +307,7 @@ final class ShareExtensionViewModel: ObservableObject {
             id: "builtinSideStore",
             folderName: "builtinSideStore",
             name: "SideStore",
-            isShared: false,
+            isShared: false
         )
 
         return ShareApp(
@@ -377,7 +377,7 @@ final class ShareExtensionViewModel: ObservableObject {
                 id: "\(isShared ? "shared" : "private")|\(folderName)",
                 folderName: folderName,
                 name: name,
-                isShared: isShared,
+                isShared: isShared
             )
         }
     }
@@ -391,7 +391,7 @@ final class ShareExtensionViewModel: ObservableObject {
                 id: "\(isShared ? "shared" : "private")|\(folderName)",
                 folderName: folderName,
                 name: folderName,
-                isShared: isShared,
+                isShared: isShared
             )
         ]
     }
