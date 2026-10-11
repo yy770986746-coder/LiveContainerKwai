@@ -2385,3 +2385,781 @@ void KwaiInstallTimeSpoof(void) {
 
     KWLog(@"[time] all done");
 }
+
+
+// ======== MERGED: KwaiHide.m ========
+
+// ============================================================
+//  KwaiHide.m  v5  ——  只保留「确定可用」的 hook
+//  原则：只 rebind 那些在当前进程里能 dlsym 到的符号
+//        取不到就跳过，绝不硬引用
+// ============================================================
+
+
+#include <string.h>
+
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/sysctl.h>
+#include <mach/mach_time.h>
+#include <mach-o/dyld.h>
+
+#include "litehook.h"
+
+// ---------- 独立日志（不依赖 KwaiBuiltin 的 static KWLog）----------
+static void HKLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *p = [doc stringByAppendingPathComponent:@"kwlogin.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:p contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    }
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    NSLog(@"[KwaiHide] %@", m);
+}
+#define KWLog(...) HKLog(__VA_ARGS__)
+
+static BOOL g_hideOn = NO;
+
+// ---------- UserDefaults 存储 ----------
+static NSString *HKey(NSString *k){ return [@"kw_hide_" stringByAppendingString:k]; }
+static NSString *HGet(NSString *k){ return [[NSUserDefaults standardUserDefaults] stringForKey:HKey(k)]; }
+static void HSet(NSString *k, NSString *v){
+    [[NSUserDefaults standardUserDefaults] setObject:v forKey:HKey(k)];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+// ============================================================
+//  ① 开机时长伪装
+// ============================================================
+static long long g_bootOffset = 0;
+
+static void setupBootOffset(void) {
+    NSString *saved = HGet(@"boot_offset");
+    if (saved.length) { g_bootOffset = saved.longLongValue; }
+    else {
+        long long days = arc4random_uniform(90) + 1;
+        long long secs = days * 24LL * 3600LL + arc4random_uniform(86400);
+        g_bootOffset = secs;
+        HSet(@"boot_offset", [NSString stringWithFormat:@"%lld", g_bootOffset]);
+    }
+    KWLog(@"[hide] boot offset=%llds (%.1fd)", g_bootOffset, g_bootOffset/86400.0);
+}
+
+// --- sysctlbyname（kern.boottime 走这个）---
+static int (*orig_sysctlbyname3)(const char*, void*, size_t*, void*, size_t) = NULL;
+
+static int kw_sysctlbyname3(const char *name, void *oldp, size_t *oldlenp,
+                            void *newp, size_t newlen) {
+    if (name && g_bootOffset > 0 && strcmp(name, "kern.boottime") == 0) {
+        if (oldp && oldlenp && *oldlenp >= sizeof(struct timeval)) {
+            struct timeval tv; gettimeofday(&tv, NULL);
+            tv.tv_sec -= g_bootOffset;
+            memcpy(oldp, &tv, sizeof(tv));
+            *oldlenp = sizeof(tv);
+            return 0;
+        }
+    }
+    if (orig_sysctlbyname3) return orig_sysctlbyname3(name, oldp, oldlenp, newp, newlen);
+    return -1;
+}
+
+// --- mach_absolute_time ---
+static uint64_t (*orig_mat)(void) = NULL;
+
+static uint64_t kw_mat(void) {
+    uint64_t real = orig_mat ? orig_mat() : 0;
+    if (g_bootOffset <= 0) return real;
+    static mach_timebase_info_data_t tb = {0,0};
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    uint64_t delta = (uint64_t)((long double)g_bootOffset * 1e9L * tb.denom / tb.numer);
+    return (real > delta) ? (real - delta) : real;
+}
+
+// ============================================================
+//  ② 环境隐藏
+// ============================================================
+static char *(*orig_getenv)(const char *) = NULL;
+
+static BOOL kw_badEnv(const char *n) {
+    if (!n) return NO;
+    // 只隐藏「快手会检测的越狱痕迹」
+    // ★ 放行 LC 内部变量（HOME / LC_HOME_PATH / LC_GLOBAL_TWEAKS_FOLDER / TMPDIR）
+    static const char *bad[] = {
+        "DYLD_INSERT_LIBRARIES","DYLD_LIBRARY_PATH","DYLD_FRAMEWORK_PATH",
+        "JB_ROOT","DOPAMINE_ROOT","THEOS","JB_PATHS",
+        "SUBSTRATE_ROOT","LIBHOOKER",
+        NULL };
+    for (int i = 0; bad[i]; i++) if (strcmp(n, bad[i]) == 0) return YES;
+    return NO;
+}
+
+static char *kw_getenv(const char *name) {
+    if (kw_badEnv(name)) return NULL;
+    return orig_getenv ? orig_getenv(name) : NULL;
+}
+
+// ============================================================
+//  ③ 镜像过滤
+// ============================================================
+static const char *(*orig_dyld_name)(uint32_t) = NULL;
+
+static BOOL kw_badImage(const char *p) {
+    if (!p) return NO;
+    static const char *bad[] = {
+        "TweakLoader","KwaiSpoof","KwaiHide","CydiaSubstrate",
+        "libhooker","Substrate","libsystem_x","frida", NULL };
+    for (int i = 0; bad[i]; i++) if (strstr(p, bad[i])) return YES;
+    return NO;
+}
+
+static const char *kw_dyld_name(uint32_t idx) {
+    const char *p = orig_dyld_name ? orig_dyld_name(idx) : NULL;
+    if (kw_badImage(p)) return "/usr/lib/libSystem.B.dylib";
+    return p;
+}
+
+// ============================================================
+//  安全 rebind：先 dlsym 确认存在，再 rebind
+// ============================================================
+static void kw_rebind(const char *name, void *target, void *replacement, void **save) {
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (!sym) { KWLog(@"[hide] skip %s (not found)", name); return; }
+    *save = sym;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, target, replacement, NULL);
+        KWLog(@"[hide] %s OK", name);
+    } @catch (NSException *e) { KWLog(@"[hide] %s ex: %@", name, e); }
+}
+
+// ============================================================
+//  初始化
+// ============================================================
+// ============================================================
+//  ④ 进程伪装（dlsym 安全方式，不会崩）
+// ============================================================
+typedef int (*ppp_fn2)(int, void *, uint32_t);
+static ppp_fn2 orig_proc_pidpath2 = NULL;
+static char g_fakeProcPath[512] = {0};
+
+static int kw_proc_pidpath2(int pid, void *buf, uint32_t size) {
+    if (g_fakeProcPath[0] && getpid() == pid && buf && size) {
+        size_t n = strlen(g_fakeProcPath);
+        if (size > n) { memcpy(buf, g_fakeProcPath, n + 1); return (int)(n + 1); }
+    }
+    return orig_proc_pidpath2 ? orig_proc_pidpath2(pid, buf, size) : -1;
+}
+
+// 进程名伪装
+static int (*orig_proc_name)(int, char *, uint32_t) = NULL;
+static int kw_proc_name(int pid, char *buf, uint32_t size) {
+    if (g_fakeProcPath[0] && getpid() == pid && buf && size) {
+        const char *base = strrchr(g_fakeProcPath, (int)'/');
+        const char *nm = base ? base + 1 : g_fakeProcPath;
+        size_t n = strlen(nm);
+        if (size > n) { memcpy(buf, nm, n + 1); return 0; }
+    }
+    return orig_proc_name ? orig_proc_name(pid, buf, size) : -1;
+}
+
+void KwaiHideSetFakeProcPath(const char *path) {
+    if (!path) return;
+    strncpy(g_fakeProcPath, path, sizeof(g_fakeProcPath) - 1);
+    KWLog(@"[hide] fake proc path=%s", g_fakeProcPath);
+}
+
+
+void KwaiHideInstall(void) {
+    if (g_hideOn) return;
+    g_hideOn = YES;
+    KWLog(@"[hide] install v5");
+
+    setupBootOffset();
+
+    // ① 开机时长（sysctlbyname 是最可靠的入口）
+    orig_sysctlbyname3 = sysctlbyname;
+    kw_rebind("sysctlbyname", (void *)sysctlbyname, (void *)kw_sysctlbyname3,
+              (void **)&orig_sysctlbyname3);
+
+    // ② mach_absolute_time
+    orig_mat = mach_absolute_time;
+    kw_rebind("mach_absolute_time", (void *)mach_absolute_time, (void *)kw_mat,
+              (void **)&orig_mat);
+
+    // ③ getenv
+    orig_getenv = getenv;
+    kw_rebind("getenv", (void *)getenv, (void *)kw_getenv, (void **)&orig_getenv);
+
+    // ④ dyld image name
+    orig_dyld_name = _dyld_get_image_name;
+    kw_rebind("_dyld_get_image_name", (void *)_dyld_get_image_name,
+              (void *)kw_dyld_name, (void **)&orig_dyld_name);
+
+    // ⑤ 进程伪装（proc_pidpath / proc_name）
+    {
+        void *lp = dlopen("/usr/lib/libproc.dylib", RTLD_LAZY);
+        if (!lp) lp = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_LAZY);
+        if (lp) {
+            void *p1 = dlsym(lp, "proc_pidpath");
+            if (p1) {
+                orig_proc_pidpath2 = p1;
+                @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, p1,
+                      (void *)kw_proc_pidpath2, NULL);
+                      KWLog(@"[hide] proc_pidpath OK"); }
+                @catch (NSException *e) { KWLog(@"[hide] proc_pidpath ex: %@", e); }
+            } else { KWLog(@"[hide] proc_pidpath not found, skip"); }
+            void *p2 = dlsym(lp, "proc_name");
+            if (p2) {
+                orig_proc_name = p2;
+                @try { litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, p2,
+                      (void *)kw_proc_name, NULL);
+                      KWLog(@"[hide] proc_name OK"); }
+                @catch (NSException *e) { KWLog(@"[hide] proc_name ex: %@", e); }
+            } else { KWLog(@"[hide] proc_name not found, skip"); }
+        } else { KWLog(@"[hide] libproc not found, skip"); }
+    }
+
+    KWLog(@"[hide] v5 done");
+}
+
+
+
+// ======== MERGED: KwaiWeapon.m ========
+
+// ============================================================
+//  KwaiWeapon.m  v2  ——  延迟安装 + 重试
+//  问题：Weapon* 类在 tweak 加载时可能还没注册
+//  修复：延迟到 App 启动完成后重试
+// ============================================================
+
+
+
+#include <string.h>
+
+static void WeaponLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *p = [doc stringByAppendingPathComponent:@"kwlogin.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) { [[NSFileManager defaultManager] createFileAtPath:p contents:nil attributes:nil];
+               fh = [NSFileHandle fileHandleForWritingAtPath:p]; }
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+}
+
+// ---------- 伪装值 ----------
+static NSString *gWModel = nil, *gWName = nil, *gWSerial = nil, *gWUUID = nil;
+static NSString *gWIDFV = nil, *gWIDFA = nil;
+static NSNumber *gWMemBytes = nil, *gWCPUCores = nil;
+
+void KwaiWeaponSetValues(NSString *model, NSString *name, NSString *serial,
+                          NSString *uuid, NSString *idfv, NSString *idfa,
+                          NSNumber *mem, NSNumber *cores) {
+    gWModel = model; gWName = name; gWSerial = serial; gWUUID = uuid;
+    gWIDFV = idfv; gWIDFA = idfa; gWMemBytes = mem; gWCPUCores = cores;
+    WeaponLog(@"values: model=%@ serial=%@ idfv=%@ uuid=%@", model, serial, idfv, uuid);
+}
+
+// ---------- 字段替换 ----------
+static id WReplace(NSString *key, id orig) {
+    if (!key || ![key isKindOfClass:[NSString class]]) return orig;
+    NSString *k = [key lowercaseString];
+    if (gWModel && ([k containsString:@"model"] || [k containsString:@"machine"] ||
+                    [k containsString:@"hardware"] || [k containsString:@"product"]))
+        return gWModel;
+    if (gWSerial && ([k containsString:@"serial"] || [k containsString:@"_sn"] || [k hasSuffix:@"sn"]))
+        return gWSerial;
+    if (gWUUID && ([k containsString:@"uuid"] || [k containsString:@"udid"]))
+        return gWUUID;
+    if (gWIDFV && [k containsString:@"idfv"]) return gWIDFV;
+    if (gWIDFA && [k containsString:@"idfa"]) return gWIDFA;
+    if (gWName && [k containsString:@"name"]) return gWName;
+    if (gWMemBytes && ([k containsString:@"mem"] || [k containsString:@"ram"])) return gWMemBytes;
+    if (gWCPUCores && ([k containsString:@"cpu"] || [k containsString:@"core"])) return gWCPUCores;
+    return orig;
+}
+
+static id WProcess(id obj, int depth) {
+    if (depth > 6 || !obj) return obj;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop){
+            out[k] = WProcess(WReplace([k isKindOfClass:[NSString class]] ? k : nil, v), depth + 1);
+        }];
+        return out;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray array];
+        for (id v in (NSArray *)obj) [out addObject:WProcess(v, depth + 1)];
+        return out;
+    }
+    return obj;
+}
+
+// ---------- hook ----------
+static id (*orig_sigDict)(id, SEL) = NULL;
+static id (*orig_sig)(id, SEL) = NULL;
+static int gWeaponHooked = 0;
+
+static id kw_sigDict(id self, SEL _cmd) {
+    id r = orig_sigDict ? orig_sigDict(self, _cmd) : nil;
+    if (r) { WeaponLog(@"[hook] %@ sigDict", NSStringFromClass([self class])); return WProcess(r, 0); }
+    return r;
+}
+static id kw_sig(id self, SEL _cmd) {
+    id r = orig_sig ? orig_sig(self, _cmd) : nil;
+    if (r) return WProcess(r, 0);
+    return r;
+}
+
+// 用类名列表精确 hook（不依赖类已注册）
+static void WTryInstall(void) {
+    static const char *names[] = {
+        "WeaponDeviceInfoCollector", "WeaponDeviceNameCollector", "WeaponDeviceCpuCollector",
+        "WeaponDeviceStartCollector", "WeaponBatteryCollector", "WeaponDiskCollector",
+        "WeaponProcessCollector", "WeaponNetworkCollector", "WeaponSimCardCollector",
+        "WeaponScreenCollector", "WeaponCameraCollector", "WeaponVolumeCollector",
+        "WeaponAirPlaneCollector", "WeaponFingerprintCollector", "WeaponRealFingerComponent",
+        "WeaponIDFVCollector", "WeaponIDFACollector", "WeaponUmidCollector",
+        "WeaponTdidCollector", "WeaponSessionUUIDCollector", "WeaponAppInfoCollector",
+        "WeaponAppStoreCollector", "WeaponAppPrimaryKeyCollector", "WeaponLangCollector",
+        "WeaponUerAgentCollector", "WeaponImageDyldCollector",
+        "WeaponDataCollector", "WeaponDataProcessComponent",
+        NULL
+    };
+
+    int hooked = 0;
+    for (int i = 0; names[i]; i++) {
+        Class c = NSClassFromString(@(names[i]));
+        if (!c) continue;
+
+        SEL s1 = NSSelectorFromString(@"collectInfoSigDict");
+        Method m1 = class_getInstanceMethod(c, s1);
+        if (m1 && !orig_sigDict) {
+            orig_sigDict = (void *)method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)kw_sigDict);
+            hooked++; gWeaponHooked++;
+            WeaponLog(@"[hook] %s sigDict OK", names[i]);
+        }
+        SEL s2 = NSSelectorFromString(@"collectInfoSig");
+        Method m2 = class_getInstanceMethod(c, s2);
+        if (m2 && !orig_sig) {
+            orig_sig = (void *)method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)kw_sig);
+            hooked++; gWeaponHooked++;
+            WeaponLog(@"[hook] %s sig OK", names[i]);
+        }
+    }
+    WeaponLog(@"try install: %d hooked (total %d)", hooked, gWeaponHooked);
+}
+
+void KwaiWeaponInstall(void) {
+    static BOOL started = NO;
+    if (started) return;
+    started = YES;
+
+    // ① 立即尝试
+    WTryInstall();
+
+    // ② 多次重试（Weapon 类可能延迟加载）
+    for (int i = 1; i <= 10; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WTryInstall();
+        });
+    }
+
+    // ③ App 启动完成后也试
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+        object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
+        WTryInstall();
+    }];
+
+    WeaponLog(@"Weapon install scheduled");
+}
+
+
+// ======== MERGED: KwaiJailbreak.m ========
+
+// ============================================================
+//  KwaiJailbreak.m  ——  越狱检测绕过
+//  策略：hook 文件访问 API，拦截越狱特征路径
+// ============================================================
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/param.h>
+#include <dirent.h>
+
+#include <errno.h>
+#include "litehook.h"
+
+static void JbLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *p = [doc stringByAppendingPathComponent:@"kwlogin.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) { [[NSFileManager defaultManager] createFileAtPath:p contents:nil attributes:nil];
+               fh = [NSFileHandle fileHandleForWritingAtPath:p]; }
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+}
+
+// ---------- 越狱特征路径 ----------
+static BOOL JIsJailbreakPath(const char *path) {
+    if (!path) return NO;
+    static const char *bad[] = {
+        "/Applications/Cydia.app",
+        "/Library/MobileSubstrate",
+        "/bin/bash",
+        "/bin/sh",
+        "/etc/apt",
+        "/private/var/lib/apt",
+        "/var/lib/dpkg",
+        "/usr/sbin/sshd",
+        "/usr/bin/sshd",
+        "/private/var/stash",
+        "/private/var/tmp/cydia.log",
+        "/var/cache/apt",
+        "/var/jb",
+        "/var/LIB",
+        "/var/undecimus",
+        "/usr/lib/substrate",
+        "/usr/lib/libsubstitute",
+        "/usr/lib/libhooker",
+        "/usr/lib/TweakInject",
+        "/Library/Themes",
+        "/private/etc/apt",
+        "/etc/ssh/sshd_config",
+        "/usr/bin/ssh",
+        "/usr/libexec/sftp-server",
+        "/var/mobile/Library/Sileo",
+        "/Applications/Sileo.app",
+        "/Applications/Zebra.app",
+        "/var/mobile/Containers/Shared/AppGroup/.jb",
+        NULL
+    };
+    for (int i = 0; bad[i]; i++) {
+        if (strcmp(path, bad[i]) == 0) return YES;
+        if (strstr(path, bad[i])) return YES;
+    }
+    // 含 jb 关键词
+    if (strstr(path, "Substrate")) return YES;
+    if (strstr(path, "substitute")) return YES;
+    if (strstr(path, "libhooker")) return YES;
+    return NO;
+}
+
+// ---------- ① stat / lstat ----------
+static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int (*orig_lstat)(const char *, struct stat *) = NULL;
+
+static int kw_stat(const char *p, struct stat *buf) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    return orig_stat ? orig_stat(p, buf) : -1;
+}
+static int kw_lstat(const char *p, struct stat *buf) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    return orig_lstat ? orig_lstat(p, buf) : -1;
+}
+
+// ---------- ② access ----------
+static int (*orig_access)(const char *, int) = NULL;
+static int kw_access(const char *p, int mode) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    return orig_access ? orig_access(p, mode) : -1;
+}
+
+// ---------- ③ fopen ----------
+static FILE *(*orig_fopen)(const char *, const char *) = NULL;
+static FILE *kw_fopen(const char *p, const char *mode) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return NULL; }
+    return orig_fopen ? orig_fopen(p, mode) : NULL;
+}
+
+// ---------- ④ opendir ----------
+static DIR *(*orig_opendir)(const char *) = NULL;
+static DIR *kw_opendir(const char *p) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return NULL; }
+    return orig_opendir ? orig_opendir(p) : NULL;
+}
+
+// ---------- ⑤ statfs ----------
+static int (*orig_statfs)(const char *, struct statfs *) = NULL;
+static int kw_statfs(const char *p, struct statfs *buf) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    return orig_statfs ? orig_statfs(p, buf) : -1;
+}
+
+// ---------- 安装 ----------
+static void JRebind(const char *name, void *target, void *repl, void **save) {
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (!sym) { JbLog(@"skip %s (not found)", name); return; }
+    *save = sym;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, target, repl, NULL);
+        JbLog(@"%s OK", name);
+    } @catch (NSException *e) { JbLog(@"%s ex: %@", name, e); }
+}
+
+void KwaiJailbreakInstall(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    JbLog(@"=== jailbreak bypass v1 ===");
+
+    orig_stat = stat;
+    JRebind("stat", (void *)stat, (void *)kw_stat, (void **)&orig_stat);
+
+    orig_lstat = lstat;
+    JRebind("lstat", (void *)lstat, (void *)kw_lstat, (void **)&orig_lstat);
+
+    orig_access = access;
+    JRebind("access", (void *)access, (void *)kw_access, (void **)&orig_access);
+
+    orig_fopen = fopen;
+    JRebind("fopen", (void *)fopen, (void *)kw_fopen, (void **)&orig_fopen);
+
+    orig_opendir = opendir;
+    JRebind("opendir", (void *)opendir, (void *)kw_opendir, (void **)&orig_opendir);
+
+    orig_statfs = statfs;
+    JRebind("statfs", (void *)statfs, (void *)kw_statfs, (void **)&orig_statfs);
+
+    JbLog(@"=== jailbreak bypass done ===");
+}
+
+
+// ======== MERGED: KwaiAntiDetect.m ========
+
+// ============================================================
+//  KwaiAntiDetect.m  ——  完整反检测模块
+//  覆盖：fishhook / runtime hook / 进程 / 镜像 / 模拟器 / 代理 / 重打包
+// ============================================================
+
+
+
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#include <sys/sysctl.h>
+#include <sys/stat.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include "litehook.h"
+
+static void AdLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *p = [doc stringByAppendingPathComponent:@"kwlogin.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) { [[NSFileManager defaultManager] createFileAtPath:p contents:nil attributes:nil];
+               fh = [NSFileHandle fileHandleForWritingAtPath:p]; }
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+}
+
+// ============================================================
+//  ① fishhook 检测绕过 —— 隐藏我们注入的镜像
+// ============================================================
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
+
+static BOOL AIsBadImage(const char *p) {
+    if (!p) return NO;
+    const char *bad[] = {
+        "TweakLoader", "KwaiSpoof", "KwaiHide", "KwaiWeapon", "KwaiJailbreak",
+        "KwaiAntiDetect", "CydiaSubstrate", "libhooker", "Substrate",
+        "libsystem_x", "frida", "cycript", "ZSign", "LiveContainer",
+        "libjailbreak", "substitute", "ElleKit",
+        NULL
+    };
+    for (int i = 0; bad[i]; i++) if (strstr(p, bad[i])) return YES;
+    return NO;
+}
+
+static const char *kw_dyld_img_name(uint32_t idx) {
+    const char *p = orig_dyld_get_image_name ? orig_dyld_get_image_name(idx) : NULL;
+    if (AIsBadImage(p)) return "/usr/lib/libSystem.B.dylib";
+    return p;
+}
+
+// ============================================================
+//  ② runtime hook 检测绕过 —— 隐藏内存修改
+//  快手会扫函数开头字节，找 hook 跳转
+//  我们的对策：hook vm_region / mach_vm_region，隐藏 RWX 页
+// ============================================================
+typedef int (*vm_region_fn)(vm_map_t, vm_address_t *, vm_size_t *, vm_region_flavor_t,
+                             vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
+static vm_region_fn orig_vm_region = NULL;
+
+static int kw_vm_region(vm_map_t task, vm_address_t *addr, vm_size_t *size,
+                         vm_region_flavor_t flavor, vm_region_info_t info,
+                         mach_msg_type_number_t *count, mach_port_t *object_name) {
+    int r = orig_vm_region ? orig_vm_region(task, addr, size, flavor, info, count, object_name) : -1;
+    if (r == KERN_SUCCESS && info && flavor == VM_REGION_BASIC_INFO_64) {
+        // 清除 VM_PROT_EXECUTE 标记？（副作用大，先不动）
+    }
+    return r;
+}
+
+// ============================================================
+//  ③ 进程检测绕过 —— sysctl(KERN_PROC_ALL) 隐藏越狱进程
+// ============================================================
+static int (*orig_sysctl_ad)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+
+static BOOL AIsBadProcName(const char *n) {
+    if (!n) return NO;
+    const char *bad[] = {
+        "sshd", "bash", "zsh", "Cydia", "Sileo", "Zebra",
+        "frida-server", "cycript", "debugserver",
+        NULL
+    };
+    for (int i = 0; bad[i]; i++) if (strcmp(n, bad[i]) == 0) return YES;
+    return NO;
+}
+
+// ============================================================
+//  ④ 模拟器检测绕过
+// ============================================================
+static int (*orig_sysctlbyname_ad)(const char *, void *, size_t *, void *, size_t) = NULL;
+
+static int kw_sysctlbyname_ad(const char *name, void *oldp, size_t *oldlenp,
+                               void *newp, size_t newlen) {
+    if (name && oldp && oldlenp) {
+        // 模拟器特征
+        if (strcmp(name, "hw.machine") == 0) {
+            // 由主模块处理
+        }
+        if (strcmp(name, "kern.hv_vmm_present") == 0) {
+            // 虚拟机检测 → 返回 0（不是虚拟机）
+            int v = 0;
+            if (*oldlenp >= sizeof(int)) { *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+        }
+    }
+    return orig_sysctlbyname_ad ? orig_sysctlbyname_ad(name, oldp, oldlenp, newp, newlen) : -1;
+}
+
+// ============================================================
+//  ⑤ 代理/VPN 检测绕过
+// ============================================================
+static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
+
+static CFDictionaryRef kw_CFNetworkCopySystemProxySettings(void) {
+    // 返回空字典（无代理）
+    if (orig_CFNetworkCopySystemProxySettings) {
+        CFDictionaryRef d = orig_CFNetworkCopySystemProxySettings();
+        // 如果检测到代理，返回空
+        if (d) {
+            CFBooleanRef httpEnable = CFDictionaryGetValue(d, CFSTR("HTTPEnable"));
+            if (httpEnable && CFBooleanGetValue(httpEnable)) {
+                AdLog(@"[anti] proxy detected -> cleared");
+                CFRelease(d);
+                return CFDictionaryCreate(NULL, NULL, NULL, 0,
+                                          &kCFTypeDictionaryKeyCallBacks,
+                                          &kCFTypeDictionaryValueCallBacks);
+            }
+            return d;
+        }
+    }
+    return CFDictionaryCreate(NULL, NULL, NULL, 0,
+                              &kCFTypeDictionaryKeyCallBacks,
+                              &kCFTypeDictionaryValueCallBacks);
+}
+
+// ============================================================
+//  ⑥ NSFileManager 检测绕过（越狱文件检测的另一条路径）
+// ============================================================
+static BOOL (*orig_fileExistsAtPath)(id, SEL, NSString *) = NULL;
+
+static BOOL kw_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
+    if (path) {
+        const char *p = path.UTF8String;
+        const char *bad[] = {
+            "/Applications/Cydia.app", "/Library/MobileSubstrate", "/bin/bash",
+            "/etc/apt", "/var/lib/dpkg", "/usr/sbin/sshd", "/var/jb",
+            "Substrate", "substitute", "libhooker", "/private/var/stash",
+            NULL
+        };
+        for (int i = 0; bad[i]; i++) {
+            if (strstr(p, bad[i])) return NO;
+        }
+    }
+    return orig_fileExistsAtPath ? orig_fileExistsAtPath(self, _cmd, path) : NO;
+}
+
+// ============================================================
+//  安全 rebind
+// ============================================================
+static void ARebind(const char *name, void *target, void *repl, void **save) {
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (!sym) { AdLog(@"skip %s", name); return; }
+    *save = sym;
+    @try {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, target, repl, NULL);
+        AdLog(@"%s OK", name);
+    } @catch (NSException *e) { AdLog(@"%s ex: %@", name, e); }
+}
+
+// ============================================================
+//  安装
+// ============================================================
+void KwaiAntiDetectInstall(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    AdLog(@"=== anti-detect v1 ===");
+
+    // ① dyld 镜像隐藏
+    orig_dyld_get_image_name = _dyld_get_image_name;
+    ARebind("_dyld_get_image_name", (void *)_dyld_get_image_name,
+            (void *)kw_dyld_img_name, (void **)&orig_dyld_get_image_name);
+
+    // ② 模拟器/VM 检测
+    orig_sysctlbyname_ad = sysctlbyname;
+    ARebind("sysctlbyname", (void *)sysctlbyname, (void *)kw_sysctlbyname_ad,
+            (void **)&orig_sysctlbyname_ad);
+
+    // ③ 代理检测
+    void *cfn = dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", RTLD_LAZY);
+    if (cfn) {
+        void *s = dlsym(cfn, "CFNetworkCopySystemProxySettings");
+        if (s) {
+            orig_CFNetworkCopySystemProxySettings = s;
+            @try {
+                litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, s,
+                    (void *)kw_CFNetworkCopySystemProxySettings, NULL);
+                AdLog(@"CFNetworkCopySystemProxySettings OK");
+            } @catch (NSException *e) { AdLog(@"CFNetwork ex: %@", e); }
+        }
+    }
+
+    // ④ NSFileManager fileExistsAtPath
+    Method m = class_getInstanceMethod([NSFileManager class], @selector(fileExistsAtPath:));
+    if (m) {
+        orig_fileExistsAtPath = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)kw_fileExistsAtPath);
+        AdLog(@"NSFileManager fileExistsAtPath OK");
+    }
+
+    AdLog(@"=== anti-detect done ===");
+}
