@@ -15,7 +15,6 @@ jobs:
 
       - name: Select Xcode
         run: |
-          ls /Applications | grep -i xcode
           for X in Xcode_16.2.app Xcode_16.1.app Xcode_16.0.app Xcode.app; do
             if [ -d "/Applications/$X" ]; then sudo xcode-select -s "/Applications/$X"; break; fi
           done
@@ -24,11 +23,27 @@ jobs:
       - name: Install tools
         run: brew install ldid || true
 
+      - name: Re-sign OpenSSL xcframework
+        run: |
+          set -x
+          XCF="OpenSSL/Frameworks/OpenSSL.xcframework"
+          ls -la "$XCF"
+          # 移除旧签名
+          for f in $(find "$XCF" -name "OpenSSL" -type f); do
+            echo "processing: $f"
+            codesign --remove-signature "$f" 2>/dev/null || true
+          done
+          # 重新 ad-hoc 签名
+          for f in $(find "$XCF" -name "OpenSSL" -type f); do
+            codesign -f -s - "$f" 2>/dev/null || true
+          done
+          echo "resign done"
+
       - name: Resolve packages
         run: |
           xcodebuild -resolvePackageDependencies \
             -project LiveContainer.xcodeproj \
-            -scheme LiveContainer 2>&1 | tail -10 || true
+            -scheme LiveContainer 2>&1 | tail -5 || true
 
       - name: Build
         run: |
@@ -46,25 +61,20 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             ONLY_ACTIVE_ARCH=NO \
+            DISABLE_MANUAL_TARGET_ORDER_BUILD_WARNING=1 \
             archive \
             2>&1 | tail -100
 
       - name: Locate
         if: always()
         run: |
-          echo "=== build 目录 ==="
-          ls -la ./build 2>/dev/null || echo "build 不存在"
-          echo "=== xcarchive ==="
           find ./build -name "*.xcarchive" -maxdepth 3 -type d 2>/dev/null
-          echo "=== LiveContainer.app ==="
           find ./build -name "LiveContainer.app" -type d 2>/dev/null | head -3
 
       - name: Package
         run: |
           APP=$(find ./build -path "*.xcarchive/Products/Applications/LiveContainer.app" -type d 2>/dev/null | head -1)
-          if [ -z "$APP" ]; then
-            APP=$(find ./build -name "LiveContainer.app" -type d 2>/dev/null | head -1)
-          fi
+          if [ -z "$APP" ]; then APP=$(find ./build -name "LiveContainer.app" -type d 2>/dev/null | head -1); fi
           echo "APP=$APP"
           if [ -z "$APP" ]; then echo "::error::App not found"; exit 1; fi
           mkdir -p Payload
