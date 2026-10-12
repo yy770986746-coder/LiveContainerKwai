@@ -1071,6 +1071,22 @@ static void KwaiSetupSpoof(void) {
         if (envExec)    g_fakeExecPath   = [NSString stringWithUTF8String:envExec];
         KWLog(@"[spoof] FROM LC ENV: model=%s product=%s board=%s sn=%s",
               envModel, envProduct ?: "", envBoard ?: "", envSerial ?: "");
+
+        // ★ 兜底：若 LC 层未传 LC_SPOOF_SCALE（旧版 LC），按机型推断 nativeScale
+        if (!envScale || g_fakeScale <= 0) {
+            const char *mc = envModel;
+            if (mc) {
+                if (strcmp(mc, "iPhone11,8") == 0 || strcmp(mc, "iPhone12,1") == 0 ||
+                    strcmp(mc, "iPhone14,6") == 0) {
+                    g_fakeScale = 2.00f;   // XR / 11 / SE3（2x 面板）
+                } else if (strcmp(mc, "iPhone13,1") == 0 || strcmp(mc, "iPhone14,4") == 0) {
+                    g_fakeScale = 2.88f;   // 12/13 mini（下采样）
+                } else {
+                    g_fakeScale = 3.00f;   // 其余
+                }
+            }
+            KWLog(@"[spoof] nativeScale fallback -> %.2f", g_fakeScale);
+        }
         return;   // ★ 用 LC 的参数，不再自己算
     }
 
@@ -2555,10 +2571,9 @@ void KwaiInstallTimeSpoof(void) {
 // ============================================================
 
 // ---- 按机型生成合理容量 ----
-static long long KwaiDiskCapacityForMachine(const char *machine) {
-    // ★ 按机型档次选容量档（128 / 256 / 512GB），覆盖全部 26 款机型
+// ★ 返回「总容量」（由 KwaiSetupStorageSpoof 负责算可用容量）
+static long long KwaiDiskTotalForMachine(const char *machine) {
     unsigned long seed = KwaiContainerSeed();
-
     int tier = 256;   // 默认 256GB
     if (machine) {
         // Pro Max 级别 → 512
@@ -2579,30 +2594,24 @@ static long long KwaiDiskCapacityForMachine(const char *machine) {
             tier = (seed & 1) ? 128 : 256;
         }
     }
-
-    // 苹果格式化后的实际容量
-    long long total;
-    if (tier == 128)      total = 127700000000LL;   // ≈127.7GB
-    else if (tier == 256) total = 255700000000LL;   // ≈255.7GB
-    else                  total = 511600000000LL;   // ≈511.6GB
-
-    // 已用 70%~92%（长期使用特征，同一容器固定）
-    int usedPct = 70 + (int)(seed % 23);
-    long long used = total * usedPct / 100;
-    return total - used;   // 返回可用容量
+    if (tier == 128) return 127700000000LL;   // ≈127.7GB
+    if (tier == 256) return 255700000000LL;   // ≈255.7GB
+    return 511600000000LL;                    // ≈511.6GB
 }
 
 void KwaiSetupStorageSpoof(void) {
     if (g_fakeDiskTotal > 0) return;
-    g_fakeDiskFree = KwaiDiskCapacityForMachine(g_fakeMachineC);
-    // 反推总容量
-    if (g_fakeDiskFree > 510000000000LL) g_fakeDiskTotal = 511600000000LL;
-    else if (g_fakeDiskFree > 254000000000LL) g_fakeDiskTotal = 255700000000LL;
-    else g_fakeDiskTotal = 127700000000LL;
-    
-    KWLog(@"[disk] total=%.1fGB free=%.1fGB used=%.1fGB",
-          g_fakeDiskTotal/1e9, g_fakeDiskFree/1e9,
-          (g_fakeDiskTotal - g_fakeDiskFree)/1e9);
+
+    // ① 先定总容量（按机型档次）
+    g_fakeDiskTotal = KwaiDiskTotalForMachine(g_fakeMachineC);
+
+    // ② 再由总容量算可用（长期使用：已用 70%~92%）
+    unsigned long seed = KwaiContainerSeed();
+    int usedPct = 70 + (int)(seed % 23);
+    g_fakeDiskFree = g_fakeDiskTotal * (100 - usedPct) / 100;
+
+    KWLog(@"[disk] total=%.1fGB free=%.1fGB used=%d%%",
+          g_fakeDiskTotal/1e9, g_fakeDiskFree/1e9, usedPct);
 }
 
 // ---- ① statfs ----
