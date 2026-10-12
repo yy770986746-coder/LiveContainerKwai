@@ -18,6 +18,7 @@ typedef uint32_t SecCSFlags;
 #include <sys/socket.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
+#include <os/lock.h>   // ★ v45：os_unfair_lock（KWLog 线程安全）
 #include <mach/host_info.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -78,12 +79,14 @@ static NSFileHandle *g_logHandle = nil;
 static NSString *g_logPath = nil;
 static NSTimeInterval g_logLastFlush = 0;
 static int g_logCount = 0;
+static os_unfair_lock g_logLock = OS_UNFAIR_LOCK_INIT;   // ★ v45：KWLog 会被多线程 hook 同时调用
 
 static void KWLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
 
+    os_unfair_lock_lock(&g_logLock);
     if (!g_logPath) {
         NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         if (!doc) doc = NSTemporaryDirectory();
@@ -95,18 +98,24 @@ static void KWLog(NSString *fmt, ...) {
         }
         g_logHandle = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
     }
-
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - g_logLastFlush >= 1.0) { g_logLastFlush = now; g_logCount = 0; }
     g_logCount++;
-    if (g_logCount > 20) return;
+    BOOL over = (g_logCount > 20);
+    NSFileHandle *fh = over ? nil : g_logHandle;
+    os_unfair_lock_unlock(&g_logLock);
+    if (over) return;
 
-    if (g_logHandle) {
+    if (fh) {
         @try {
-            [g_logHandle seekToEndOfFile];
+            [fh seekToEndOfFile];
             NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
-            [g_logHandle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        } @catch (NSException *e) { g_logHandle = nil; }
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (NSException *e) {
+            os_unfair_lock_lock(&g_logLock);
+            if (fh == g_logHandle) g_logHandle = nil;
+            os_unfair_lock_unlock(&g_logLock);
+        }
     }
     NSLog(@"[KwaiWeChatLogin] %@", m);
 }
@@ -133,24 +142,20 @@ static NSString *CfgSharedPath(void) {
     return nil;
 }
 static NSMutableDictionary *CfgLoad(void) {
-    // ?? guest ??
+    // ★ v45 容器隔离修复：只读 guest 容器内的配置。
+    // 原实现在 guest 配置缺失时回退读取 CfgSharedPath()（LC 宿主 app group 目录，
+    // 所有容器共用同一份 kwlogin.plist）。容器1 登录写入的 username/password/appid
+    // 被容器2 读到，于是容器2 能直接用容器1 的微信一键登录。
+    // 现在共享路径不再参与读取，从根上断掉跨容器凭据泄漏。
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
     if (d && d.count) return [d mutableCopy];
-    // ??????
-    NSString *sp = CfgSharedPath();
-    if (sp) {
-        d = [NSDictionary dictionaryWithContentsOfFile:sp];
-        if (d && d.count) return [d mutableCopy];
-    }
     return [NSMutableDictionary dictionary];
 }
 static void CfgSave(NSDictionary *d) {
+    // ★ v45：同样不再写共享路径，避免容器2 覆盖容器1 的配置。
     [d writeToFile:CfgPath() atomically:YES];
-    NSString *sp = CfgSharedPath();
-    if (sp) {
-        @try { [d writeToFile:sp atomically:YES]; } @catch (NSException *e) {}
-    }
-}static NSString *CfgGet(NSString *k, NSString *def) {
+}
+static NSString *CfgGet(NSString *k, NSString *def) {
     id v = CfgLoad()[k];
     if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
     return def;
@@ -5179,13 +5184,13 @@ typedef OSStatus (*SecCodeCopySigningInfo_fn)(SecCodeRef, SecCSFlags, CFDictiona
 static SecCodeCopySigningInfo_fn orig_seccode_signinfo = NULL;
 
 static OSStatus kw_seccode_signinfo(SecCodeRef code, SecCSFlags flags, CFDictionaryRef *info) {
+    // ★ v45：不要在这里 CFRelease(*info)。
+    // 原函数按 Get 规则返回，但调用方（Security 框架内部）仍持有该对象的
+    // 所有权预期；我们在其上再 CFBridgingRetain 一个新对象后释放旧的，等于
+    // 双重释放 —— 接入签名绕过路径后必崩（v41 BUG-02 同型问题）。
+    // 这里只做只读校验与日志，不接管所有权。
     OSStatus r = orig_seccode_signinfo ? orig_seccode_signinfo(code, flags, info) : -1;
     if (r == 0 && info && *info) {
-        // 确保签名信息看起来合法
-        NSMutableDictionary *d = [(__bridge NSDictionary *)*info mutableCopy];
-        // 保持原有信息（LC 已经处理过），只确保关键字段
-        CFRelease(*info);
-        *info = CFBridgingRetain(d);
         KWLog(@"[sig] SecCodeCopySigningInformation OK");
     }
     return r;
