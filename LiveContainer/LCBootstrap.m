@@ -353,10 +353,21 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     // ===== 设备伪装：按容器生成完整设备指纹（参数自洽）=====
     {
-        NSString *seedSrc = [NSString stringWithFormat:@"%@|%@", docPath, guestAppInfo[@"LCDataUUID"] ?: @""];
+        // ★ v38 修复：机型不变（每次都是同一个）
+        //   原因：LCDataUUID 可能为 nil，seedSrc 只剩固定的 docPath -> h 恒定
+        //   修复：三层种子源（docPath 末尾 UUID + LCDataUUID + bundleId），任一变化即换机型
+        NSString *dataUUID = guestAppInfo[@"LCDataUUID"] ?: @"";
+        NSString *bundleId  = guestAppInfo[@"LCOrignalBundleIdentifier"] ?: @"";
+        // docPath 形如 .../Documents/Data/Application/<UUID>/，末段 UUID 每个容器都不同
+        NSString *containerUUID = docPath.lastPathComponent ?: @"";
+        NSString *seedSrc = [NSString stringWithFormat:@"%@|%@|%@",
+                             containerUUID, dataUUID, bundleId];
         unsigned long long h = 5381;
         for (NSUInteger i = 0; i < seedSrc.length; i++)
             h = ((h << 5) + h) + [seedSrc characterAtIndex:i];
+        // ★ 二次打散：避免 djb2 的低位相关性导致的分布不均
+        h ^= h >> 17; h *= 0x9E3779B97F4A7C15ULL; h ^= h >> 13;
+        NSLog(@"[LC] device seed=%llu (cu=%@ du=%@ bid=%@)", h, containerUUID, dataUUID, bundleId);
 
         // 完整机型表：所有参数互相匹配
         typedef struct {
