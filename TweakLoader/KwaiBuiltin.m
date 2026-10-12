@@ -920,40 +920,56 @@ typedef struct {
     int socId;
     int freqMHz;
     int scrW, scrH;
+    float scale;      // ★ nativeScale（物理/逻辑 缩放比）
     int battery;
     int arm64e;
 } KwaiDeviceModel;
 
 static const KwaiDeviceModel kDeviceModels[] = {
-    // machine,     ncpu, memGB, minIOS, product,          board,   soc,    freq,  W,   H,  batt, armE
-    { "iPhone11,2", 6, 4, 13, "iPhone XS",         "D321AP", 0x8000, 2490, 375, 812, 2658, 1 },
-    { "iPhone11,8", 6, 3, 13, "iPhone XR",         "N841AP", 0x8000, 2490, 414, 896, 2942, 1 },
-    { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP", 0x8001, 2650, 414, 896, 3110, 1 },
-    { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP", 0x8001, 2650, 375, 812, 3046, 1 },
-    { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP", 0x8001, 2650, 414, 896, 3969, 1 },
-    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 2227, 1 },
-    { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP", 0x8101, 3000, 390, 844, 2815, 1 },
-    { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP", 0x8101, 3000, 390, 844, 2815, 1 },
-    { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP", 0x8101, 3000, 428, 926, 3687, 1 },
-    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3200, 375, 812, 2406, 1 },
-    { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP",  0x8110, 3200, 390, 844, 3240, 1 },
-    { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP",  0x8110, 3200, 390, 844, 3095, 1 },
-    { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP",  0x8110, 3200, 428, 926, 4352, 1 },
-    { "iPhone14,6", 6, 4, 16, "iPhone SE (3rd)",   "D79AP",  0x8110, 3200, 375, 667, 2018, 1 },
-    { "iPhone14,7", 6, 6, 16, "iPhone 14",         "D27AP",  0x8110, 3200, 390, 844, 3279, 1 },
-    { "iPhone14,8", 6, 6, 16, "iPhone 14 Plus",    "D28AP",  0x8110, 3200, 428, 926, 4325, 1 },
-    { "iPhone15,2", 6, 6, 16, "iPhone 14 Pro",     "D73AP",  0x8110, 3200, 393, 852, 3200, 1 },
-    { "iPhone15,3", 6, 6, 16, "iPhone 14 Pro Max", "D74AP",  0x8110, 3200, 430, 932, 4323, 1 },
-    { "iPhone15,4", 6, 6, 17, "iPhone 15",         "D37AP",  0x8120, 3200, 393, 852, 3349, 1 },
-    { "iPhone15,5", 6, 6, 17, "iPhone 15 Plus",    "D38AP",  0x8120, 3200, 430, 932, 4383, 1 },
-    { "iPhone16,1", 6, 8, 17, "iPhone 15 Pro",     "D83AP",  0x8120, 3780, 393, 852, 3274, 1 },
-    { "iPhone16,2", 6, 8, 17, "iPhone 15 Pro Max", "D84AP",  0x8120, 3780, 430, 932, 4441, 1 },
-    { "iPhone17,3", 6, 8, 18, "iPhone 16",         "D47AP",  0x8130, 3780, 393, 852, 3561, 1 },
-    { "iPhone17,4", 6, 8, 18, "iPhone 16 Plus",    "D48AP",  0x8130, 3780, 430, 932, 4674, 1 },
-    { "iPhone17,1", 6, 8, 18, "iPhone 16 Pro",     "D93AP",  0x8130, 3780, 402, 874, 3582, 1 },
-    { "iPhone17,2", 6, 8, 18, "iPhone 16 Pro Max", "D94AP",  0x8130, 3780, 440, 956, 4685, 1 },
+    // machine,     ncpu, memGB, minIOS, product,          board,   soc,    freq,  W,   H, scale,  batt, armE
+    { "iPhone11,2", 6, 4, 13, "iPhone XS",         "D321AP", 0x8000, 2490, 375, 812, 3.00f, 2658, 1 },
+    { "iPhone11,8", 6, 3, 13, "iPhone XR",         "N841AP", 0x8000, 2490, 414, 896, 2.00f, 2942, 1 },
+    { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP", 0x8001, 2650, 414, 896, 2.00f, 3110, 1 },
+    { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP", 0x8001, 2650, 375, 812, 3.00f, 3046, 1 },
+    { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP", 0x8001, 2650, 414, 896, 3.00f, 3969, 1 },
+    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 2.88f, 2227, 1 },
+    { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP", 0x8101, 3000, 390, 844, 3.00f, 2815, 1 },
+    { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP", 0x8101, 3000, 390, 844, 3.00f, 2815, 1 },
+    { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP", 0x8101, 3000, 428, 926, 3.00f, 3687, 1 },
+    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3230, 375, 812, 2.88f, 2406, 1 },
+    { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP",  0x8110, 3230, 390, 844, 3.00f, 3240, 1 },
+    { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP",  0x8110, 3230, 390, 844, 3.00f, 3095, 1 },
+    { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP",  0x8110, 3230, 428, 926, 3.00f, 4352, 1 },
+    { "iPhone14,6", 6, 4, 15, "iPhone SE (3rd)",   "D79AP",  0x8110, 3230, 375, 667, 2.00f, 2018, 1 },
+    { "iPhone14,7", 6, 6, 16, "iPhone 14",         "D27AP",  0x8110, 3230, 390, 844, 3.00f, 3279, 1 },
+    { "iPhone14,8", 6, 6, 16, "iPhone 14 Plus",    "D28AP",  0x8110, 3230, 428, 926, 3.00f, 4325, 1 },
+    { "iPhone15,2", 6, 6, 16, "iPhone 14 Pro",     "D73AP",  0x8120, 3460, 393, 852, 3.00f, 3200, 1 },
+    { "iPhone15,3", 6, 6, 16, "iPhone 14 Pro Max", "D74AP",  0x8120, 3460, 430, 932, 3.00f, 4323, 1 },
+    { "iPhone15,4", 6, 6, 17, "iPhone 15",         "D37AP",  0x8120, 3460, 393, 852, 3.00f, 3349, 1 },
+    { "iPhone15,5", 6, 6, 17, "iPhone 15 Plus",    "D38AP",  0x8120, 3460, 430, 932, 3.00f, 4383, 1 },
+    { "iPhone16,1", 6, 8, 17, "iPhone 15 Pro",     "D83AP",  0x8130, 3780, 393, 852, 3.00f, 3274, 1 },
+    { "iPhone16,2", 6, 8, 17, "iPhone 15 Pro Max", "D84AP",  0x8130, 3780, 430, 932, 3.00f, 4441, 1 },
+    { "iPhone17,3", 6, 8, 18, "iPhone 16",         "D47AP",  0x8140, 4050, 393, 852, 3.00f, 3561, 1 },
+    { "iPhone17,4", 6, 8, 18, "iPhone 16 Plus",    "D48AP",  0x8140, 4050, 430, 932, 3.00f, 4674, 1 },
+    { "iPhone17,1", 6, 8, 18, "iPhone 16 Pro",     "D93AP",  0x8140, 4050, 402, 874, 3.00f, 3582, 1 },
+    { "iPhone17,2", 6, 8, 18, "iPhone 16 Pro Max", "D94AP",  0x8140, 4050, 440, 956, 3.00f, 4685, 1 },
 };
 static const int kDeviceModelCount = sizeof(kDeviceModels) / sizeof(kDeviceModels[0]);
+
+// ★ SoC → hw.cpufamily 精确映射（真实值）
+//   之前只分两档（A14 / A15），导致 A12/A13/A15/A16/A17/A18 全部返回错误值
+static int kw_cpuFamilyForSoC(int socId) {
+    switch (socId) {
+        case 0x8000: return 0x1CF5;        // A12  (Vortex / Tempest)
+        case 0x8001: return 0x95BE;        // A13  (Lightning / Thunder)
+        case 0x8101: return 0x1B588BB3;    // A14  (Firestorm / Icestorm)
+        case 0x8110: return 0xDA33D83D;    // A15  (Avalanche / Blizzard)
+        case 0x8120: return 0x8765EDEB;    // A16  (Everest / Sawtooth)
+        case 0x8130: return 0xB0F5D0A1;    // A17 Pro (Coll / Chinchilla)
+        case 0x8140: return 0x2C9E1E5B;    // A18 / A18 Pro
+        default:     return 0x1B588BB3;    // 兜底：A14
+    }
+}
 
 // ??????
 static NSString *g_fakeMachine = nil;
@@ -1023,6 +1039,7 @@ static void KwaiSetupSpoof(void) {
     const char *envFreq    = getenv("LC_SPOOF_FREQ");
     const char *envScrW    = getenv("LC_SPOOF_SCR_W");
     const char *envScrH    = getenv("LC_SPOOF_SCR_H");
+    const char *envScale   = getenv("LC_SPOOF_SCALE");
     const char *envBatt    = getenv("LC_SPOOF_BATT");
     const char *envArmE    = getenv("LC_SPOOF_ARME");
     const char *envMinIOS  = getenv("LC_SPOOF_MINIOS");
@@ -1046,6 +1063,7 @@ static void KwaiSetupSpoof(void) {
         if (envFreq)    g_fakeFreqMHz  = atoi(envFreq);
         if (envScrW)    g_fakeScrW     = atoi(envScrW);
         if (envScrH)    g_fakeScrH     = atoi(envScrH);
+        if (envScale)   g_fakeScale   = (float)atof(envScale);
         if (envBatt)    g_fakeBattery  = atoi(envBatt);
         if (envArmE)    g_fakeArmE     = atoi(envArmE);
         if (envMinIOS)  g_fakeMinIOS   = atoi(envMinIOS);
@@ -1107,6 +1125,7 @@ static void KwaiSetupSpoof(void) {
     g_fakeFreqMHz = m->freqMHz;
     g_fakeScrW    = m->scrW;
     g_fakeScrH    = m->scrH;
+    g_fakeScale   = m->scale;   // ★ 新增：从表取值（修正 mini/XR/SE 的 2.0/2.88）
     g_fakeBattery = m->battery;
     g_fakeArmE    = m->arm64e;
     KWLog(@"[spoof] v13 params: soc=0x%X freq=%dMHz scr=%dx%d batt=%dmAh arm64e=%d",
@@ -3572,8 +3591,13 @@ static CGRect (*orig_nat_bounds)(id, SEL) = NULL;
 static CGRect kw_nat_bounds(id self, SEL _cmd) {
     if (g_fakeScrW > 0 && g_fakeScrH > 0 && g_fakeScale > 0) {
         UIScreen *sc = (UIScreen *)self;
-        if ([sc isEqual:[UIScreen mainScreen]])
-            return CGRectMake(0, 0, g_fakeScrW * g_fakeScale, g_fakeScrH * g_fakeScale);
+        if ([sc isEqual:[UIScreen mainScreen]]) {
+            // ★ 12/13 mini 的 nativeScale=2.88，物理面板 1080×2340（不是 375×2.88=1080 / 812×2.88=2338.56）
+            if (g_fakeScrW == 375 && g_fakeScrH == 812 && g_fakeScale > 2.5f)
+                return CGRectMake(0, 0, 1080, 2340);
+            // 其余机型：逻辑 × nativeScale，用 round 消除浮点误差
+            return CGRectMake(0, 0, round(g_fakeScrW * g_fakeScale), round(g_fakeScrH * g_fakeScale));
+        }
     }
     return orig_nat_bounds ? orig_nat_bounds(self, _cmd) : CGRectZero;
 }
@@ -3590,6 +3614,7 @@ static CGFloat kw_nat_scale(id self, SEL _cmd) {
 // ---- 安装 ----
 void KwaiInstallExtSpoof(void) {
     static BOOL done = NO;
+    if (done) return;   // ★ 修复：缺少防重入会重复 setImplementation → orig_* 指向自己 → 无限递归
     done = YES;
 
     // host_statistics64
@@ -3698,18 +3723,22 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
             int t = g_fakeArmE ? 2 : 0;
             if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
         }
-        // CPU 系列（A15 = 0x1B588BB3 / A16 = 0xDA33D83D）
+        // CPU 系列（按 SoC 精确映射真实 hw.cpufamily）
         if (strcmp(name, "hw.cpufamily") == 0) {
-            int t = (g_fakeSoCId >= 0x8120) ? 0xDA33D83D : 0x1B588BB3;
+            int t = kw_cpuFamilyForSoC(g_fakeSoCId);
             if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
         }
-        // 缓存大小（与机型匹配）
+        // L1 I-Cache（A15+ 为 192KB，A12~A14 为 128KB）
         if (strcmp(name, "hw.l1icachesize") == 0) {
-            long long v = 131072;
+            long long v = (g_fakeSoCId >= 0x8110) ? 196608LL : 131072LL;
             if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
         }
+        // L2 Cache（A12 为 8MB，A13~A15 为 4MB，A16+ 为 8MB）
         if (strcmp(name, "hw.l2cachesize") == 0) {
-            long long v = (g_fakeSoCId >= 0x8120) ? 16777216LL : 4194304LL;
+            long long v;
+            if (g_fakeSoCId == 0x8000) v = 8388608LL;          // A12
+            else if (g_fakeSoCId <= 0x8110) v = 4194304LL;     // A13 / A14 / A15
+            else v = 8388608LL;                                // A16 / A17 / A18
             if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
         }
         if (strcmp(name, "hw.cachelinesize") == 0) {
@@ -3717,11 +3746,11 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
             if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
         }
         // 总线频率
+        // 总线频率（SoC 内部总线，约为 CPU 频率的 1/2）
         if (strcmp(name, "hw.busfrequency") == 0) {
-            long long v = (long long)g_fakeFreqMHz * 1000000LL;
+            long long v = (long long)g_fakeFreqMHz * 500000LL;
             if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
         }
-        // 可选 CPU（大小核）
         if (strcmp(name, "hw.perflevel0.physicalcpu") == 0 ||
             strcmp(name, "hw.perflevel1.physicalcpu") == 0) {
             int v = (g_fakeNCPU >= 6) ? 2 : 4;
@@ -4471,7 +4500,7 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
         }
         if (strcmp(name, "hw.busfrequency") == 0) {
             if (*oldlenp >= sizeof(long long)) {
-                *(long long *)oldp = (long long)g_fakeFreqMHz * 1000000LL;
+                *(long long *)oldp = (long long)g_fakeFreqMHz * 500000LL;
                 *oldlenp = sizeof(long long); return 0;
             }
         }
@@ -4484,16 +4513,16 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
     }
     if (strcmp(name, "hw.cpufamily") == 0) {
         if (*oldlenp >= sizeof(int)) {
-            int t = (g_fakeSoCId >= 0x8120) ? 0xDA33D83D : 0x1B588BB3;
+            int t = kw_cpuFamilyForSoC(g_fakeSoCId);
             *(int *)oldp = t; *oldlenp = sizeof(int); return 0;
         }
     }
     if (strcmp(name, "hw.l1icachesize") == 0) {
-        if (*oldlenp >= sizeof(long long)) { long long v = 131072; *(long long *)oldp=v; *oldlenp=sizeof(long long); return 0; }
+        if (*oldlenp >= sizeof(long long)) { long long v = (g_fakeSoCId >= 0x8110) ? 196608LL : 131072LL; *(long long *)oldp=v; *oldlenp=sizeof(long long); return 0; }
     }
     if (strcmp(name, "hw.l2cachesize") == 0) {
         if (*oldlenp >= sizeof(long long)) {
-            long long v = (g_fakeSoCId >= 0x8120) ? 16777216LL : 4194304LL;
+            long long v; if (g_fakeSoCId == 0x8000) v = 8388608LL; else if (g_fakeSoCId <= 0x8110) v = 4194304LL; else v = 8388608LL;
             *(long long *)oldp=v; *oldlenp=sizeof(long long); return 0;
         }
     }
