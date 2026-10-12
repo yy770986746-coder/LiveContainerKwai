@@ -6,7 +6,6 @@
 #include <mach/mach_time.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
-#include <os/lock.h>   // ★ v41: KWLog 限流计数需要 os_unfair_lock
 #include <sys/mount.h>
 #include <ifaddrs.h>
 // Sec* 类型的简化定义（SDK 无 SecCode.h）
@@ -97,17 +96,10 @@ static void KWLog(NSString *fmt, ...) {
         g_logHandle = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
     }
 
-    // ★ v41 BUG-08 修复：原来 g_logCount++ 是非原子操作，多线程并发时会竞争，
-    //   实际写入条数可能远超 20 条/秒 → I/O 压力 → 复现历史闪退
-    //   改用 os_unfair_lock 保护限流计数
-    os_unfair_lock spin = OS_UNFAIR_LOCK_INIT;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    os_unfair_lock_lock(&spin);
     if (now - g_logLastFlush >= 1.0) { g_logLastFlush = now; g_logCount = 0; }
     g_logCount++;
-    int overLimit = (g_logCount > 20);
-    os_unfair_lock_unlock(&spin);
-    if (overLimit) return;
+    if (g_logCount > 20) return;
 
     if (g_logHandle) {
         @try {
@@ -971,10 +963,7 @@ static int kw_cpuFamilyForSoC(int socId) {
         case 0x8120: return 0x8765EDEB;    // A16  (Everest / Sawtooth)
         case 0x8130: return 0xB0F5D0A1;    // A17 Pro (Coll / Chinchilla)
         case 0x8140: return 0x2C9E1E5B;    // A18 / A18 Pro
-        // ★ v41 BUG-07: 新增机型时若忘记更新映射，这里会静默返回错误值
-        default:
-            KWLog(@"[cpu] WARN: unknown socId=0x%X -> fallback A14", socId);
-            return 0x1B588BB3;
+        default:     return 0x1B588BB3;    // 兜底：A14
     }
 }
 
@@ -988,9 +977,7 @@ static const char *kw_cpuBrandForSoC(int socId) {
         case 0x8120: return "Apple A16 Bionic";
         case 0x8130: return "Apple A17 Pro";
         case 0x8140: return "Apple A18 Pro";
-        default:
-            KWLog(@"[cpu] WARN: unknown socId=0x%X -> fallback A14", socId);
-            return "Apple A14 Bionic";
+        default:     return "Apple A14 Bionic";
     }
 }
 
@@ -1034,7 +1021,7 @@ static unsigned long KwaiContainerSeed(void) {
         for (NSUInteger i = 0; i < uid.length; i++) {
             h = ((h << 5) + h) + [uid characterAtIndex:i];
         }
-        // GuestAppId 也参与
+        // ??? GuestAppId???????? App ?
         NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
         for (NSUInteger i = 0; i < bid.length; i++) {
             h = ((h << 5) + h) + [bid characterAtIndex:i];
@@ -1260,15 +1247,9 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
             const char *bad[] = {
                 "LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
                 "JB_ROOT", "DOPAMINE", "SUBSTRATE",
-                // ★ v41 BUG-04 修复：原用 "LC_SPOOF_" 前缀（9 字符）匹配，
-                //   只覆盖变量名前 9 字符，残留 "PRODUCT=xxx" 等孤立片段
-                //   改为完整变量名匹配（与 KwaiCleanEnv 保持一致）
-                "LC_SPOOF_MODEL", "LC_SPOOF_PRODUCT", "LC_SPOOF_BOARD", "LC_SPOOF_SERIAL",
-                "LC_SPOOF_UUID", "LC_SPOOF_IDFV", "LC_SPOOF_IDFA", "LC_SPOOF_NAME",
-                "LC_SPOOF_NCPU", "LC_SPOOF_MEM", "LC_SPOOF_SOC", "LC_SPOOF_FREQ",
-                "LC_SPOOF_SCR_W", "LC_SPOOF_SCR_H", "LC_SPOOF_SCALE", "LC_SPOOF_BATT",
-                "LC_SPOOF_ARME", "LC_SPOOF_MINIOS", "LC_SPOOF_BUNDLE", "LC_SPOOF_EXEC",
-                "LC_SPOOF_PROCID",
+                // ★ v35: 前缀匹配，一次覆盖 22 个 LC_SPOOF_* 变量
+                //   快手读 KERN_PROCARGS2 就能看到 LC_SPOOF_SERIAL=... → 暴露伪装环境
+                "LC_SPOOF_",
                 "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER",
                 NULL
             };
@@ -1402,11 +1383,8 @@ static BOOL g_spoofInstalled = NO;
 
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
 
-// ★ v41: 电池属性伪装（Consume 语义：接管 val 所有权，见函数注释）
-static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val);
-
 static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
-                                                      CFAllocatorRef alloc, IOOptionBits opts) {
+                                                     CFAllocatorRef alloc, IOOptionBits opts) {
     if (key) {
         NSString *k = (__bridge NSString *)key;
         if ([k isEqualToString:@"IOPlatformSerialNumber"] && g_fakeSerial) {
@@ -1416,11 +1394,9 @@ static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, C
             return CFBridgingRetain([g_fakeUUID copy]);
         }
     }
-    CFTypeRef r = orig_IORegistryEntryCreateCFProperty
-                     ? orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts) : NULL;
-    // ★ v41 BUG-01: 接入电池伪装（Consume 语义，接管 r 的所有权）
-    if (r && key) r = KwaiProcessBatteryProp(key, r);
-    return r;
+    if (orig_IORegistryEntryCreateCFProperty)
+        return orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
+    return NULL;
 }
 
 // ---- Search 版本 ----
@@ -1434,11 +1410,9 @@ static CFTypeRef kw_IORegEntrySearchCFProp(io_registry_entry_t entry, const io_n
         if ([k isEqualToString:@"IOPlatformUUID"] && g_fakeUUID)
             return CFBridgingRetain([g_fakeUUID copy]);
     }
-    CFTypeRef r = orig_IORegEntrySearchCFProp
-                     ? orig_IORegEntrySearchCFProp(entry, plane, key, alloc, opts) : NULL;
-    // ★ v41 BUG-01: 接入电池伪装（Consume 语义，接管 r 的所有权）
-    if (r && key) r = KwaiProcessBatteryProp(key, r);
-    return r;
+    if (orig_IORegEntrySearchCFProp)
+        return orig_IORegEntrySearchCFProp(entry, plane, key, alloc, opts);
+    return NULL;
 }
 
 // ---- CreateCFProperties（批量）----
@@ -2694,15 +2668,18 @@ static NSDictionary *(*orig_attrs_fs)(id, SEL, NSString *, NSError **) = NULL;
 static NSDictionary *kw_attrs_fs(id self, SEL _cmd, NSString *path, NSError **err) {
     NSDictionary *d = orig_attrs_fs ? orig_attrs_fs(self, _cmd, path, err) : nil;
     if (d && g_fakeDiskTotal > 0) {
-        // ★ v41 BUG-03 修复：原实现用 static 缓存忽略了 path 参数，
-        //   一旦原字典含路径相关字段（如 NSFileSystemName）就会串味
-        //   改为每次从原字典 mutableCopy（实测调用仅 26 次，开销可忽略）
-        NSMutableDictionary *m = [d mutableCopy];
-        m[NSFileSystemSize]              = @(g_fakeDiskTotal);
-        m[NSFileSystemFreeSize]          = @(g_fakeDiskFree);
-        m[@"NSFileSystemFreeSpaceInBytes"] = @(g_fakeDiskFree);
-        m[@"NSFileSystemTotalSizeInBytes"] = @(g_fakeDiskTotal);
-        return [m copy];
+        // ★ 性能：缓存结果字典，避免每次 mutableCopy + 4 次装箱
+        //   实测日志显示该 hook 被调 26 次，每次都重建字典
+        static NSDictionary *cached = nil;
+        if (!cached) {
+            NSMutableDictionary *m = [d mutableCopy];
+            m[NSFileSystemSize]              = @(g_fakeDiskTotal);
+            m[NSFileSystemFreeSize]          = @(g_fakeDiskFree);
+            m[@"NSFileSystemFreeSpaceInBytes"] = @(g_fakeDiskFree);
+            m[@"NSFileSystemTotalSizeInBytes"] = @(g_fakeDiskTotal);
+            cached = [m copy];
+        }
+        return cached;
     }
     return d;
 }
@@ -2820,57 +2797,51 @@ void KwaiSetupBatterySpoof(void) {
 
 // 处理 IOKit 返回的电池属性（在已有的 CreateCFProperty hook 里调用）
 // 返回替换后的值，或原值
-// ★ v41 BUG-01 修复：电池伪装此前【完全未接入】（本函数从未被调用）
-//   现象：CycleCount / AppleRawMaxCapacity / NominalChargeCapacity /
-//         MaxCapacity / BatteryHealth / BatterySerialNumber / Temperature
-//         共 7 个 key 全部读到真机值 → 与「使用 326 天的旧设备」矛盾
-// ★ v41 BUG-02 修复：原实现直接 CFRelease(val)，而 IORegistryEntryCreateCFProperty
-//   返回 Get 规则对象（调用方不拥有）→ 过度释放 = 崩溃
-//   修复：改为 Consume 语义 —— 本函数接管 val 的所有权并负责释放，
-//        调用方必须【不再使用】传入的原值
-//
-// 返回值所有权：始终为 Get（调用方需自行 CFRelease），与原函数一致
 static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
-    if (!key || g_fakeCycleCount <= 0) return val;   // 不接管，原样返回
+    if (!key || g_fakeCycleCount <= 0) return val;
 
     CFStringRef k = key;
-    CFTypeRef result = NULL;
-
-    // 循环次数（400~900）
+    // 循环次数
     if (CFStringCompare(k, CFSTR("CycleCount"), 0) == kCFCompareEqualTo) {
-        result = (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
     }
-    // ★ v37 语义拆分：标称容量（固定）vs 当前容量（衰减后）
-    //   若两者相同，快手算出 health = 100%，与上报的 g_fakeBatteryHealth 矛盾
-    else if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo ||
-             CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
-        result = (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
+    // ★ v37 修复：三个容量 key 语义必须不同
+    //   原来三个都返回 g_fakeBatteryCapacity → 快手算出 health = 2816/2816 = 100%
+    //   但我们上报 health = 91% → 自相矛盾
+    //   正确：NominalChargeCapacity = 标称（固定），MaxCapacity = 衰减后
+    if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
     }
-    else if (CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
-             CFStringCompare(k, CFSTR("AppleCurrentCapacity"), 0) == kCFCompareEqualTo) {
-        result = (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
+    if (CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
     }
-    // 健康度百分比（78%~92%）
-    else if (CFStringCompare(k, CFSTR("BatteryHealth"), 0) == kCFCompareEqualTo) {
+    if (CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("AppleCurrentCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
+    }
+    // 健康度百分比
+    if (CFStringCompare(k, CFSTR("BatteryHealth"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
         int h = g_fakeBatteryHealth;
-        result = (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &h);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &h);
     }
     // 电池序列号
-    else if (CFStringCompare(k, CFSTR("BatterySerialNumber"), 0) == kCFCompareEqualTo ||
-             CFStringCompare(k, CFSTR("Serial"), 0) == kCFCompareEqualTo) {
-        if (g_fakeBatterySerial) result = (CFTypeRef)CFRetain(g_fakeBatterySerial);
+    if (CFStringCompare(k, CFSTR("BatterySerialNumber"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("Serial"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFRetain(g_fakeBatterySerial);
     }
-    // 温度 29.00~31.00 ℃（长期使用略高）
-    else if (CFStringCompare(k, CFSTR("Temperature"), 0) == kCFCompareEqualTo) {
-        int t = 2900 + (int)(KwaiContainerSeed() % 200);
-        result = (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &t);
+    // 温度（长期使用会稍高）
+    if (CFStringCompare(k, CFSTR("Temperature"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        int t = 2900 + (int)(KwaiContainerSeed() % 200);   // 29.00~31.00 ℃
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &t);
     }
-
-    if (!result) return val;   // 未命中的 key：原样返回，不接管
-
-    // ★ Consume：接管 val 的所有权并释放（修复过度释放）
-    if (val) CFRelease(val);
-    return result;
+    return val;
 }
 
 void KwaiInstallBatterySpoof(void) {
@@ -2893,7 +2864,6 @@ void KwaiInstallBatterySpoof(void) {
 #include <time.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
-#include <os/lock.h>   // ★ v41: KWLog 限流计数需要 os_unfair_lock
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include "litehook.h"
@@ -3425,7 +3395,6 @@ void KwaiJailbreakInstall(void) {
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
-#include <os/lock.h>   // ★ v41: KWLog 限流计数需要 os_unfair_lock
 #include <sys/stat.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -3634,24 +3603,16 @@ static int kw_host_stat(host_t host, host_flavor_t flavor, host_info64_t info,
         // HOST_VM_INFO64 = 4
         if (flavor == 4 && *count >= sizeof(vm_statistics64_data_t) / sizeof(integer_t)) {
             vm_statistics64_data_t *vs = (vm_statistics64_data_t *)info;
-            // ★ v41 BUG-06 修复：原来只改 free/inactive，active 保持真机值，
-            //   三者之和与 hw.memsize 不匹配 → 交叉验证即可发现伪造
-            //   改为按比例分配 total = free + inactive + active
+            // 长期使用：可用内存约为总量的 20%~45%
             unsigned long seed = KwaiContainerSeed();
-            long long freePct = 20 + (seed % 26);          // 可用 20%~45%
+            long long freePct = 20 + (seed % 26);
+            long long wantFree = g_fakeMemSize * freePct / 100;
+            // 通过调整 free_count（页数）实现
             vm_size_t pageSize = 16384;
             host_page_size(host, &pageSize);
-            if (pageSize == 0) pageSize = 16384;
-            uint64_t totalPages = (uint64_t)(g_fakeMemSize / pageSize);
-            // 比例：free 20~45%, inactive = free/3, active = 其余
-            uint64_t freePages  = (uint64_t)(totalPages * freePct / 100);
-            uint64_t inactPages = freePages / 3;
-            uint64_t actPages   = (totalPages > freePages + inactPages)
-                                ? (totalPages - freePages - inactPages) : 0;
-            vs->free_count         = (natural_t)freePages;
-            vs->inactive_count     = (natural_t)inactPages;
-            vs->active_count       = (natural_t)actPages;
-            vs->speculative_count  = 0;
+            uint64_t pages = (uint64_t)(wantFree / pageSize);
+            vs->free_count = (natural_t)pages;
+            vs->inactive_count = (natural_t)(pages / 3);
         }
     }
     return r;
@@ -3774,7 +3735,12 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
             long long f = (long long)g_fakeFreqMHz * 1000000LL;
             if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = f; *oldlenp = sizeof(long long); return 0; }
         }
-        // ★ v39: 不处理 hw.cpufrequency_max / _min（iOS 真机不存在）
+        if (strcmp(name, "hw.cpufrequency_max") == 0 ||
+            strcmp(name, "hw.cpufrequency_min") == 0) {
+            long long f = (long long)g_fakeFreqMHz * 1000000LL;
+            if (strcmp(name, "hw.cpufrequency_min") == 0) f = f / 2;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = f; *oldlenp = sizeof(long long); return 0; }
+        }
         // CPU 类型（arm64 = 16777228 = 0x100000C）
         if (strcmp(name, "hw.cputype") == 0) {
             int t = 16777228;
@@ -3826,7 +3792,12 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
             if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) { *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
         }
         }
-        // ★ v39: 不处理 hw.busfrequency（iOS 真机不存在这个 key）
+        // 总线频率
+        // 总线频率（SoC 内部总线，约为 CPU 频率的 1/2）
+        if (strcmp(name, "hw.busfrequency") == 0) {
+            long long v = (long long)g_fakeFreqMHz * 500000LL;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        }
         if (strcmp(name, "hw.perflevel0.physicalcpu") == 0 ||
             strcmp(name, "hw.perflevel1.physicalcpu") == 0) {
             int v = (g_fakeNCPU >= 6) ? 2 : 4;
@@ -4573,13 +4544,25 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
     }
 
     // ---- ③ CPU ----
-    // ★ v39: 只处理 hw.cpufrequency（iOS 真机唯一存在的 CPU 频率 key）
-    //   hw.cpufrequency_max / _min / hw.busfrequency 在 iOS 上【不存在】
-    //   我们凭空返回值 = 快手遍历 sysctl 时发现「真机没有的 key」= 自相矛盾
-    if (g_fakeFreqMHz > 0 && strcmp(name, "hw.cpufrequency") == 0) {
-        if (*oldlenp >= sizeof(long long)) {
-            *(long long *)oldp = (long long)g_fakeFreqMHz * 1000000LL;
-            *oldlenp = sizeof(long long); return 0;
+    if (g_fakeFreqMHz > 0) {
+        if (strcmp(name, "hw.cpufrequency") == 0 ||
+            strcmp(name, "hw.cpufrequency_max") == 0) {
+            if (*oldlenp >= sizeof(long long)) {
+                *(long long *)oldp = (long long)g_fakeFreqMHz * 1000000LL;
+                *oldlenp = sizeof(long long); return 0;
+            }
+        }
+        if (strcmp(name, "hw.cpufrequency_min") == 0) {
+            if (*oldlenp >= sizeof(long long)) {
+                *(long long *)oldp = (long long)g_fakeFreqMHz * 500000LL;
+                *oldlenp = sizeof(long long); return 0;
+            }
+        }
+        if (strcmp(name, "hw.busfrequency") == 0) {
+            if (*oldlenp >= sizeof(long long)) {
+                *(long long *)oldp = (long long)g_fakeFreqMHz * 500000LL;
+                *oldlenp = sizeof(long long); return 0;
+            }
         }
     }
     if (strcmp(name, "hw.cputype") == 0) {
@@ -5274,20 +5257,16 @@ void KwaiInstallSigBypass(void) {
 // ---------- 判断地址是否属于我们的 dylib ----------
 // 用于 vm_protect / vm_region 的精确处理
 BOOL kw_isOurAddress(vm_address_t addr) {
-    // ★ v40 修复：dispatch_once 会【永久缓存失败结果】
-    //   如果第一次调用时 TweakLoader 还没进 dyld 链表 → ourBase=0 被永久缓存
-    //   → 所有伪装类 hook 静默失效（变成透传），不崩溃不报错但保护全无
-    //   修复：失败时允许重试 + 用 __builtin_return_address(0) 拿兜底基址
+    // ★ 线程安全 + 避免递归：只在首次初始化时用 _dyld_* 
     static vm_address_t ourBase = 0;
     static vm_size_t ourSize = 0;
     static dispatch_once_t onceToken;
-    static BOOL warned = NO;
-
     dispatch_once(&onceToken, ^{
         int count = _dyld_image_count();
         for (int i = 0; i < count; i++) {
             const struct mach_header *hdr = _dyld_get_image_header(i);
             if (!hdr) continue;
+            // 用 dladdr 反查路径（比 _dyld_get_image_name 安全，不会触发我们的 hook）
             Dl_info info;
             memset(&info, 0, sizeof(info));
             if (dladdr((const void *)hdr, &info) && info.dli_fname) {
@@ -5311,23 +5290,7 @@ BOOL kw_isOurAddress(vm_address_t addr) {
                 }
             }
         }
-        // ★ 兜底：遍历失败时用本函数地址反查（保证一定能定位到自己）
-        if (ourBase == 0) {
-            Dl_info self;
-            memset(&self, 0, sizeof(self));
-            if (dladdr((const void *)&kw_isOurAddress, &self) && self.dli_fbase) {
-                ourBase = (vm_address_t)self.dli_fbase;
-                ourSize = 0x400000;   // 保守估计 4MB
-                KWLog(@"[addr] fallback via dladdr: base=0x%llx size=0x%llx",
-                      (unsigned long long)ourBase, (unsigned long long)ourSize);
-            }
-        }
-        if (ourBase == 0 && !warned) {
-            warned = YES;
-            KWLog(@"[addr] WARN: 无法定位自身地址，伪装 hook 将全部失效");
-        }
     });
-
     if (ourBase == 0) return NO;
     return (addr >= ourBase && addr < ourBase + ourSize + 0x10000);
 }
