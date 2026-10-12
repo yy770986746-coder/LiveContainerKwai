@@ -1295,8 +1295,9 @@ static int kw_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
         }
     }
     if (strcmp(name, "hw.physicalcpu") == 0) {
+        // ★ 修复：真机 6 核（2 性能 + 4 能效）的 hw.physicalcpu = 6，不是 3！
         if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) {
-            *(int *)oldp = g_fakeNCPU / 2;
+            *(int *)oldp = g_fakeNCPU;
             *oldlenp = sizeof(int);
             return 0;
         }
