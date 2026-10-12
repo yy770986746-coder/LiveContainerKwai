@@ -3337,10 +3337,16 @@ static FILE *kw_fopen(const char *p, const char *mode) {
     return orig_fopen ? orig_fopen(p, mode) : NULL;
 }
 
+// ★ v46：跨容器隔离（定义在文件后部，这里前置声明）
+static BOOL kw_isCrossContainerPath(const char *path);
+static void KwaiInitContainerRoot(void);
+
 // ---------- ④ opendir ----------
 static DIR *(*orig_opendir)(const char *) = NULL;
 static DIR *kw_opendir(const char *p) {
     if (JIsJailbreakPath(p)) { errno = ENOENT; return NULL; }
+    // ★ v46：拒绝列举兄弟容器
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return NULL; }
     return orig_opendir ? orig_opendir(p) : NULL;
 }
 
@@ -3367,6 +3373,9 @@ void KwaiJailbreakInstall(void) {
     if (done) return;
     done = YES;
     KWJbLog(@"=== jailbreak bypass v1 ===");
+
+    // ★ v46：初始化本容器根路径（跨容器访问拦截的前置条件）
+    KwaiInitContainerRoot();
 
     orig_stat = stat;
     JRebind("stat", (void *)stat, (void *)kw_stat, (void **)&orig_stat);
@@ -4818,35 +4827,105 @@ static BOOL kw_isLCFeaturePath(const char *path) {
     return NO;
 }
 
+// ============================================================
+//  ★ v46 容器隔离：拦截对【兄弟容器】的跨容器访问
+// ============================================================
+//  背景：所有 guest 容器都是 mobile 属主 drwxr-xr-x，父目录同为
+//  <LC容器>/Documents/Data/Application/。快手进程从自己的 HOME 上溯
+//  ".." 就能列出并读取其他容器的 Documents —— 实测已验证可行。
+//  这意味着快手只要遍历一次就能拿到本机全部容器的账号数据，
+//  判定同设备多账号 -> 封号。
+//
+//  kw_isLCFeaturePath 只拦 LC 特征文件，拦不住这种普通路径遍历，
+//  所以必须单独判定：路径若解析到自己容器之外 -> 拒绝。
+
+static NSString *g_myContainerRoot = nil;   // 形如 .../Data/Application/<我的UUID>
+
+static void KwaiInitContainerRoot(void) {
+    if (g_myContainerRoot) return;
+    NSString *home = NSHomeDirectory();
+    if (!home.length) return;
+    // guest HOME = .../Data/Application/<LCUUID>/Documents/Data/Application/<GUESTUUID>/Documents
+    // 取 .../Data/Application/<GUESTUUID> 这一段
+    NSString *marker = @"/Documents/Data/Application/";
+    NSRange r = [home rangeOfString:marker options:NSBackwardsSearch];
+    if (r.location == NSNotFound) {
+        KWLog(@"[iso] container root not recognised: %@", home);
+        return;
+    }
+    NSUInteger start = r.location + marker.length;
+    NSString *rest = [home substringFromIndex:start];
+    NSString *uuid = [[rest componentsSeparatedByString:@"/"] firstObject];
+    if (!uuid.length) return;
+    NSString *appDir = [home substringToIndex:start + uuid.length];
+    g_myContainerRoot = appDir;
+    KWLog(@"[iso] my container root: %@", g_myContainerRoot);
+}
+
+// 判断 path 是否越出自己容器（兄弟容器 / LC 宿主容器 / 上级目录）
+static BOOL kw_isCrossContainerPath(const char *path) {
+    if (!path) return NO;
+    if (path[0] != 47) return NO;                    // 相对路径交由沙盒处理
+    if (!g_myContainerRoot.length) return NO;         // 未初始化则不拦，避免误伤
+    const char *root = g_myContainerRoot.UTF8String;
+    // 快路径：直接以自己容器根开头
+    if (strncmp(path, root, strlen(root)) == 0) return NO;
+
+    // 归一化：解析 ".." / "." / 重复斜杠，再与容器根比对
+    char stack[1024];
+    size_t sl = 0;
+    const char *seg = path;
+    while (*seg == 47) seg++;                        // 跳过前导 "/"
+    while (*seg) {
+        const char *e = strchr(seg, 47);
+        size_t len = e ? (size_t)(e - seg) : strlen(seg);
+        const char *next = e ? e + 1 : seg + len;
+        if (len == 0 || (len == 1 && seg[0] == 46)) { seg = next; continue; }
+        if (len == 2 && seg[0] == 46 && seg[1] == 46) {
+            while (sl > 0 && stack[sl-1] != 47) sl--;
+            if (sl > 0) sl--;
+            seg = next; continue;
+        }
+        if (sl > 0 && stack[sl-1] != 47) stack[sl++] = 47;
+        if (sl + len >= sizeof(stack)) { seg = next; continue; }   // 超长放行，不误伤
+        memcpy(stack + sl, seg, len);
+        sl += len;
+        seg = next;
+    }
+    stack[sl] = 0;
+    if (strncmp(stack, root, strlen(root)) == 0) return NO;
+    return YES;
+}
+
 static int (*orig_stat_v12)(const char *, struct stat *) = NULL;
 static int kw_stat_v12(const char *p, struct stat *buf) {
-    // 原有：LC 特征路径拦截
     if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
-    // [DISABLED-v25] 签名拦截已移除（导致闪退）
+    // ★ v46：拒绝读取兄弟容器
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
     if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature") || strstr(p, "CodeResources"))) {
         errno = ENOENT; return -1;
     }
     return orig_stat_v12 ? orig_stat_v12(p, buf) : -1;
 }
 
-// ---------- kw_access_v12（含 v25 签名路径拦截）----------
 static int (*orig_access_v12)(const char *, int) = NULL;
 static int kw_access_v12(const char *p, int mode) {
     if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
-    // [DISABLED-v25] 签名拦截已移除（导致闪退）
+    // ★ v46：拒绝读取兄弟容器
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
     if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature") || strstr(p, "CodeResources"))) {
         errno = ENOENT; return -1;
     }
     return orig_access_v12 ? orig_access_v12(p, mode) : -1;
 }
 
-// ---------- kw_fileExists_v12（含 v25 签名路径拦截）----------
 static BOOL (*orig_fileExists_v12)(id, SEL, NSString *) = NULL;
 static BOOL kw_fileExists_v12(id self, SEL _cmd, NSString *path) {
     if (path) {
         const char *p = path.UTF8String;
         if (kw_isLCFeaturePath(p)) return NO;
-        // ★ v25 合并：签名文件路径
+        // ★ v46：拒绝探测兄弟容器
+        if (kw_isCrossContainerPath(p)) return NO;
         if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature"))) return NO;
     }
     return orig_fileExists_v12 ? orig_fileExists_v12(self, _cmd, path) : NO;
