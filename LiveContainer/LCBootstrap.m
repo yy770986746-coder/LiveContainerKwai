@@ -367,7 +367,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     //   2) 换 FNV-1a（雪崩性优于 djb2）
     //   3) 加 splitmix64 finalizer 彻底打散 + 取【高 32 位】选机型
     {
-        NSString *containerUUID = docPath.lastPathComponent ?: @"";
+        // ★ v44 关键修复：
+        //   之前用 docPath.lastPathComponent，但 docPath = "$LC_HOME_PATH/Documents"
+        //   → lastPathComponent 恒为字符串 "Documents" → 种子恒定 → 机型永远一样
+        //   正确：selectedContainer 是每容器不同的 guest 容器 UUID
+        NSString *containerUUID = selectedContainer ?: @"";
         NSString *dataUUID = guestAppInfo[@"LCDataUUID"] ?: @"";
         NSString *bundleId = guestAppInfo[@"LCOrignalBundleIdentifier"] ?: @"";
 
