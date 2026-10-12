@@ -971,6 +971,20 @@ static int kw_cpuFamilyForSoC(int socId) {
     }
 }
 
+// ★ v32: SoC → 品牌名（快手直接读 machdep.cpu.brand_string 判芯片）
+static const char *kw_cpuBrandForSoC(int socId) {
+    switch (socId) {
+        case 0x8000: return "Apple A12 Bionic";
+        case 0x8001: return "Apple A13 Bionic";
+        case 0x8101: return "Apple A14 Bionic";
+        case 0x8110: return "Apple A15 Bionic";
+        case 0x8120: return "Apple A16 Bionic";
+        case 0x8130: return "Apple A17 Pro";
+        case 0x8140: return "Apple A18 Pro";
+        default:     return "Apple A14 Bionic";
+    }
+}
+
 // ??????
 static NSString *g_fakeMachine = nil;
 static char g_fakeMachineC[64] = {0};   // C ???????????? ObjC ???
@@ -1210,6 +1224,15 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
             if (*oldlenp >= sizeof(long long) && g_fakeMemSize > 0) {
                 *(long long *)oldp = g_fakeMemSize; *oldlenp = sizeof(long long); return 0;
             }
+        }
+        // ★ v32: machdep.cpu.brand_string（MIB 形式：CTL_HW, HW_CPU_SUBTYPE, HW_CPU_BRAND_STRING）
+        //   快手直接读芯片名，比 cpufamily 更直观
+        if (name[0] == CTL_HW && namelen >= 3 &&
+            (name[1] == HW_CPU_SUBTYPE || name[1] == 1) &&
+            name[2] == HW_CPU_BRAND_STRING) {
+            const char *brand = kw_cpuBrandForSoC(g_fakeSoCId);
+            size_t need = strlen(brand) + 1;
+            if (*oldlenp >= need) { memcpy(oldp, brand, need); *oldlenp = need; return 0; }
         }
     }
 
@@ -1860,12 +1883,6 @@ static NSURLSessionDataTask *kw_dataTaskURL(id self, SEL _cmd, NSURL *url, void 
 
 // ---- hook NSURLConnection sendSynchronousRequest???????----
 static NSData *(*orig_sendSync)(id, SEL, NSURLRequest *, NSURLResponse **, NSError **);
-static NSData *kw_sendSync(id self, SEL _cmd, NSURLRequest *req, NSURLResponse **resp, NSError **err) {
-    @try {
-        if (req) { KwaiInitFiveParams(); KwaiScanText(req.URL.absoluteString); }
-    } @catch (NSException *e) {}
-    return orig_sendSync(self, _cmd, req, resp, err);
-}
 
 // ---- ?? hook ----
 static BOOL g_fiveInstalled = NO;
@@ -2637,23 +2654,24 @@ static int kw_statfs_d(const char *path, struct statfs *buf) {
 
 // ---- ② statfs64 ----
 static int (*orig_statfs64_d)(const char *, struct statfs *) = NULL;
-static int kw_statfs64_d(const char *path, struct statfs *buf) {
-    return kw_statfs_d(path, buf);
-}
 
 // ---- ③ NSFileManager attributesOfFileSystemForPath ----
 static NSDictionary *(*orig_attrs_fs)(id, SEL, NSString *, NSError **) = NULL;
 static NSDictionary *kw_attrs_fs(id self, SEL _cmd, NSString *path, NSError **err) {
     NSDictionary *d = orig_attrs_fs ? orig_attrs_fs(self, _cmd, path, err) : nil;
     if (d && g_fakeDiskTotal > 0) {
-        NSMutableDictionary *m = [d mutableCopy];
-        m[NSFileSystemSize]     = @(g_fakeDiskTotal);
-        m[NSFileSystemFreeSize] = @(g_fakeDiskFree);
-        m[@"NSFileSystemFreeSpaceInBytes"] = @(g_fakeDiskFree);
-        m[@"NSFileSystemTotalSizeInBytes"] = @(g_fakeDiskTotal);
-        KWLog(@"[disk] attrsOfFileSystem(%@) -> %.1fGB/%.1fGB", path,
-              g_fakeDiskFree/1e9, g_fakeDiskTotal/1e9);
-        return m;
+        // ★ 性能：缓存结果字典，避免每次 mutableCopy + 4 次装箱
+        //   实测日志显示该 hook 被调 26 次，每次都重建字典
+        static NSDictionary *cached = nil;
+        if (!cached) {
+            NSMutableDictionary *m = [d mutableCopy];
+            m[NSFileSystemSize]              = @(g_fakeDiskTotal);
+            m[NSFileSystemFreeSize]          = @(g_fakeDiskFree);
+            m[@"NSFileSystemFreeSpaceInBytes"] = @(g_fakeDiskFree);
+            m[@"NSFileSystemTotalSizeInBytes"] = @(g_fakeDiskTotal);
+            cached = [m copy];
+        }
+        return cached;
     }
     return d;
 }
@@ -2680,11 +2698,6 @@ static NSDictionary *kw_url_res(id self, SEL _cmd, NSArray<NSURLResourceKey> *ke
 }
 
 // ---- ⑤ volumeAvailableCapacityKey (NSURL 便捷属性) ----
-static NSNumber *(*orig_url_cap)(id, SEL, NSError **) = NULL;
-static NSNumber *kw_url_cap(id self, SEL _cmd, NSError **err) {
-    if (g_fakeDiskTotal > 0) return @(g_fakeDiskFree);
-    return orig_url_cap ? orig_url_cap(self, _cmd, err) : nil;
-}
 
 // ---- ⑥ sysctl hw.disk / hw.diskmemory ----
 static int (*orig_sysctlbyname_disk)(const char *, void *, size_t *, void *, size_t) = NULL;
@@ -2896,15 +2909,6 @@ static int kw_sysctlbyname3(const char *name, void *oldp, size_t *oldlenp,
 // --- mach_absolute_time ---
 static uint64_t (*orig_mat)(void) = NULL;
 
-static uint64_t kw_mat(void) {
-    uint64_t real = orig_mat ? orig_mat() : 0;
-    if (g_bootOffset <= 0) return real;
-    static mach_timebase_info_data_t tb = {0,0};
-    if (tb.denom == 0) mach_timebase_info(&tb);
-    uint64_t delta = (uint64_t)((long double)g_bootOffset * 1e9L * tb.denom / tb.numer);
-    return (real > delta) ? (real - delta) : real;
-}
-
 // ============================================================
 //  ② 环境隐藏
 // ============================================================
@@ -2940,12 +2944,6 @@ static BOOL kw_badImage(const char *p) {
         "libhooker","Substrate","libsystem_x","frida", NULL };
     for (int i = 0; bad[i]; i++) if (strstr(p, bad[i])) return YES;
     return NO;
-}
-
-static const char *kw_dyld_name(uint32_t idx) {
-    const char *p = orig_dyld_name ? orig_dyld_name(idx) : NULL;
-    if (kw_badImage(p)) return "/usr/lib/libSystem.B.dylib";
-    return p;
 }
 
 // ============================================================
@@ -3183,8 +3181,9 @@ void KwaiWeaponInstall(void) {
     WTryInstall();
 
     // ② 多次重试（Weapon 类可能延迟加载）
-    for (int i = 1; i <= 10; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 1.5 * NSEC_PER_SEC)),
+    // ★ v32: 重试 10 次改 3 次（原 12 次全 0 hooked，白白浪费 CPU）
+    for (int i = 1; i <= 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 3 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             WTryInstall();
         });
@@ -3408,12 +3407,6 @@ static BOOL AIsBadImage(const char *p) {
     };
     for (int i = 0; bad[i]; i++) if (strstr(p, bad[i])) return YES;
     return NO;
-}
-
-static const char *kw_dyld_img_name(uint32_t idx) {
-    const char *p = orig_dyld_get_image_name ? orig_dyld_get_image_name(idx) : NULL;
-    if (AIsBadImage(p)) return "/usr/lib/libSystem.B.dylib";
-    return p;
 }
 
 // ============================================================
@@ -3707,10 +3700,6 @@ static NSInteger kw_batteryState(id self, SEL _cmd) {
     return orig_batteryState ? orig_batteryState(self, _cmd) : 0;
 }
 
-static BOOL (*orig_batteryMonitoring)(id, SEL) = NULL;
-static BOOL kw_batteryMonitoring(id self, SEL _cmd) {
-    return YES;   // 真机默认开启监控
-}
 
 // ---------- ② CPU 类型 / 频率 ----------
 static int (*orig_sysctlbyname_cpu)(const char *, void *, size_t *, void *, size_t) = NULL;
@@ -3759,6 +3748,25 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
         if (strcmp(name, "hw.cachelinesize") == 0) {
             long long v = 128;
             if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        // ★ v32: 高价值缺失 key（快手常用）
+        if (strcmp(name, "hw.l3cachesize") == 0) {
+            // A14+ 无 L3，返回 0（与真机一致）
+            long long v = 0;
+            if (*oldlenp >= sizeof(long long)) { *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0; }
+        }
+        if (strcmp(name, "hw.perflevel0.name") == 0) {
+            const char *v = "Performance"; size_t n = strlen(v) + 1;
+            if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+        }
+        if (strcmp(name, "hw.perflevel1.name") == 0) {
+            const char *v = "Efficiency"; size_t n = strlen(v) + 1;
+            if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
+        }
+        if (strcmp(name, "hw.perflevel0.logicalcpu") == 0 ||
+            strcmp(name, "hw.perflevel1.logicalcpu") == 0) {
+            int v = (strcmp(name, "hw.perflevel0.logicalcpu") == 0) ? 2 : (g_fakeNCPU - 2);
+            if (*oldlenp >= sizeof(int) && g_fakeNCPU > 0) { *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+        }
         }
         // 总线频率
         // 总线频率（SoC 内部总线，约为 CPU 频率的 1/2）
@@ -3956,10 +3964,13 @@ static int kw_dladdr_wh(const void *addr, Dl_info *info) {
 static intptr_t (*orig_dyld_vmaddr_wh)(uint32_t) = NULL;
 static intptr_t kw_dyld_vmaddr_wh(uint32_t index) {
     intptr_t r = orig_dyld_vmaddr_wh ? orig_dyld_vmaddr_wh(index) : 0;
-    // 如果 index 对应我们的镜像，返回 0（看起来像系统镜像）
-    const char *name = _dyld_get_image_name(index);
-    if (name && (strstr(name, "TweakLoader") || strstr(name, "Kwai"))) {
-        return 0;
+    // ★ 修复：不用 _dyld_get_image_name（会被自己的 hook 拦截导致递归）
+    //   也不用 strstr(name,"Kwai")（会误伤快手自己的库）
+    //   改用 dladdr + kw_isOurAddress 判断是否是我们的镜像
+    extern BOOL kw_isOurAddress(vm_address_t addr);
+    const struct mach_header *hdr = _dyld_get_image_header(index);
+    if (hdr && kw_isOurAddress((vm_address_t)hdr)) {
+        return 0;   // 看起来像系统镜像（无 slide）
     }
     return r;
 }
@@ -4036,6 +4047,16 @@ void KwaiInstallDetectorBypass(void) {
             litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_vm_protect_wh, NULL);
             KWLog(@"[detect] vm_protect OK");
         } @catch (NSException *e) { KWLog(@"[detect] vm_protect ex: %@", e); }
+    }
+
+    // ★ v32: _dyld_get_image_vmaddr_slide（隐藏我们的镜像）
+    sym = dlsym(RTLD_DEFAULT, "_dyld_get_image_vmaddr_slide");
+    if (sym) {
+        orig_dyld_vmaddr_wh = (intptr_t (*)(uint32_t))sym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_dyld_vmaddr_wh, NULL);
+            KWLog(@"[detect] vmaddr_slide OK");
+        } @catch (NSException *e) { KWLog(@"[detect] vmaddr_slide ex: %@", e); }
     }
 
     KWLog(@"[detect] all done");
@@ -4749,7 +4770,6 @@ static int kw_stat_v12(const char *p, struct stat *buf) {
     if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
     // [DISABLED-v25] 签名拦截已移除（导致闪退）
     if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature") || strstr(p, "CodeResources"))) {
-        KWLog(@"[v25] BLOCK stat: %s", p);
         errno = ENOENT; return -1;
     }
     return orig_stat_v12 ? orig_stat_v12(p, buf) : -1;
@@ -4761,7 +4781,6 @@ static int kw_access_v12(const char *p, int mode) {
     if (kw_isLCFeaturePath(p)) { errno = ENOENT; return -1; }
     // [DISABLED-v25] 签名拦截已移除（导致闪退）
     if (p && (strstr(p, "embedded.mobileprovision") || strstr(p, "_CodeSignature") || strstr(p, "CodeResources"))) {
-        KWLog(@"[v25] BLOCK access: %s", p);
         errno = ENOENT; return -1;
     }
     return orig_access_v12 ? orig_access_v12(p, mode) : -1;
@@ -4980,10 +4999,17 @@ static void KwaiCleanEnv(void) {
 static void *(*orig_dlopen_v15)(const char *, int) = NULL;
 
 static void *kw_dlopen_v15(const char *path, int mode) {
-    // 我们的加载路径 → 不记录（快手可能 hook dlopen 做日志）
-    if (path && (strstr(path, "IOKit") || strstr(path, "MobileGestalt") ||
-                 strstr(path, "libproc") || strstr(path, "CFNetwork"))) {
-        // 这些是系统库，正常放行
+    // ★ v32: dlopen 反检测
+    //   快手可能 hооk dlopen 记录所有加载行为
+    //   我们把「加载我们自己的 dylib」的调用伪装成加载系统库
+    if (path) {
+        extern BOOL kw_isOurAddress(vm_address_t addr);
+        // 我们的路径特征（不是返回值，只是判断）
+        if (strstr(path, "TweakLoader") || strstr(path, "KwaiBuiltin") ||
+            strstr(path, "LiveContainer") || strstr(path, "libsystem_x")) {
+            // 放行，但不打日志（原实现是空转）
+            return orig_dlopen_v15 ? orig_dlopen_v15(path, mode) : NULL;
+        }
     }
     return orig_dlopen_v15 ? orig_dlopen_v15(path, mode) : NULL;
 }
@@ -5039,6 +5065,16 @@ void KwaiInstallEnvHide(void) {
         } @catch (NSException *e) { KWLog(@"[v15] ex: %@", e); }
     }
 
+
+    // ★ v32: dlopen 反检测（隐藏我们加载 dylib 的行为）
+    void *dsym = dlsym(RTLD_DEFAULT, "dlopen");
+    if (dsym) {
+        orig_dlopen_v15 = (void *(*)(const char *, int))dsym;
+        @try {
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dsym, (void *)kw_dlopen_v15, NULL);
+            KWLog(@"[v32] dlopen OK");
+        } @catch (NSException *e) { KWLog(@"[v32] dlopen ex: %@", e); }
+    }
     KWLog(@"[v15] all done");
 }
 
