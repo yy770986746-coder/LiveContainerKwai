@@ -366,18 +366,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     //   1) 种子源用【容器目录名】（每容器必然不同，不依赖任何 plist）
     //   2) 换 FNV-1a（雪崩性优于 djb2）
     //   3) 加 splitmix64 finalizer 彻底打散 + 取【高 32 位】选机型
+    // ★ v47.8 关键修复：种子源必须用【真实的 guest 容器 UUID】
+    //   原实现用 selectedContainer，但 selectedContainer 在启动早期
+    //   常已被 removeObjectForKey 清掉（904/929/973 行），此时会回落到
+    //   findDefaultContainerWithBundleId: → 返回【第一个】匹配容器
+    //   → 所有容器种子相同 → 机型永远 iPhone14,8。
+    //   dataUUID 来自 guestAppInfo[@"LCDataUUID"]，是真实且唯一的容器 UUID。
     {
-        // ★ v44 关键修复：
-        //   之前用 docPath.lastPathComponent，但 docPath = "$LC_HOME_PATH/Documents"
-        //   → lastPathComponent 恒为字符串 "Documents" → 种子恒定 → 机型永远一样
-        //   正确：selectedContainer 是每容器不同的 guest 容器 UUID
-        NSString *containerUUID = selectedContainer ?: @"";
-        NSString *dataUUID = guestAppInfo[@"LCDataUUID"] ?: @"";
+        NSString *containerUUID = dataUUID.length ? dataUUID : (selectedContainer ?: @"");
+        NSString *du2 = guestAppInfo[@"LCDataUUID"] ?: @"";
         NSString *bundleId = guestAppInfo[@"LCOrignalBundleIdentifier"] ?: @"";
 
         unsigned long long h = 1469598103934665603ULL;   // FNV-1a offset basis
         NSString *seedSrc = [NSString stringWithFormat:@"%@|%@|%@",
-                             containerUUID, dataUUID, bundleId];
+                             containerUUID, du2, bundleId];
         const char *bytes = [seedSrc UTF8String];
         size_t len = strlen(bytes);
         for (size_t i = 0; i < len; i++) {
@@ -390,10 +392,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         h ^= h >> 27; h *= 0x94D049BB133111EBULL;
         h ^= h >> 31;
 
-        // ★ 用高 32 位选机型（低位已被 finalizer 充分打散，取模分布最均匀）
         unsigned long long pickKey = (h >> 32);
         NSLog(@"[LC] device seed=%llu pick=%llu (cu=%@ du=%@ bid=%@)",
-              h, pickKey, containerUUID, dataUUID, bundleId);
+              h, pickKey, containerUUID, du2, bundleId);
 
         // 完整机型表：所有参数互相匹配
         typedef struct {
