@@ -41,7 +41,9 @@ void NSFMGuestHooksInit(void) {
     NSURL *result;
     if(isolateAppGroup) {
         const char *h = getenv("HOME"); if(!h) h = "";
-        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/LCAppGroup/%@", h, groupIdentifier]];
+        // v33: LCAppGroup -> .appGroup（避免暴露 LiveContainer 特征）
+        // 用点开头的隐藏目录名，符合 Unix「系统目录」约定，最不显眼
+        result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/.appGroup/%@", h, groupIdentifier]];
     } else if (NSUserDefaults.lcAppGroupPath){
         result = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/LiveContainer/Data/AppGroup/%@", NSUserDefaults.lcAppGroupPath, groupIdentifier]];
     } else {
