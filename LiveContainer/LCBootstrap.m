@@ -352,22 +352,44 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     setenv("LC_GLOBAL_TWEAKS_FOLDER", tweakFolder.UTF8String, 1);
 
     // ===== 设备伪装：按容器生成完整设备指纹（参数自洽）=====
+    // ★ v43: 机型随机化修复（只改 LC 层，Tweak 层不动）
+    //
+    // 现象：每次新建容器机型都是 iPhone14,x（iPhone 13 Pro Max），从不变化
+    //
+    // 根因：
+    //   1) 旧种子 = djb2(docPath | LCDataUUID)，docPath 每台设备固定
+    //      LCDataUUID 常为 nil → 种子几乎恒定
+    //   2) 即使 UUID 不同，djb2 的 h % 26 分布【极度不均匀】
+    //      UUID 的十六进制字符差异被线性递推放大到同一索引
+    //
+    // 修复（三重保障）：
+    //   1) 种子源用【容器目录名】（每容器必然不同，不依赖任何 plist）
+    //   2) 换 FNV-1a（雪崩性优于 djb2）
+    //   3) 加 splitmix64 finalizer 彻底打散 + 取【高 32 位】选机型
     {
-        // ★ v38 修复：机型不变（每次都是同一个）
-        //   原因：LCDataUUID 可能为 nil，seedSrc 只剩固定的 docPath -> h 恒定
-        //   修复：三层种子源（docPath 末尾 UUID + LCDataUUID + bundleId），任一变化即换机型
-        NSString *dataUUID = guestAppInfo[@"LCDataUUID"] ?: @"";
-        NSString *bundleId  = guestAppInfo[@"LCOrignalBundleIdentifier"] ?: @"";
-        // docPath 形如 .../Documents/Data/Application/<UUID>/，末段 UUID 每个容器都不同
         NSString *containerUUID = docPath.lastPathComponent ?: @"";
+        NSString *dataUUID = guestAppInfo[@"LCDataUUID"] ?: @"";
+        NSString *bundleId = guestAppInfo[@"LCOrignalBundleIdentifier"] ?: @"";
+
+        unsigned long long h = 1469598103934665603ULL;   // FNV-1a offset basis
         NSString *seedSrc = [NSString stringWithFormat:@"%@|%@|%@",
                              containerUUID, dataUUID, bundleId];
-        unsigned long long h = 5381;
-        for (NSUInteger i = 0; i < seedSrc.length; i++)
-            h = ((h << 5) + h) + [seedSrc characterAtIndex:i];
-        // ★ 二次打散：避免 djb2 的低位相关性导致的分布不均
-        h ^= h >> 17; h *= 0x9E3779B97F4A7C15ULL; h ^= h >> 13;
-        NSLog(@"[LC] device seed=%llu (cu=%@ du=%@ bid=%@)", h, containerUUID, dataUUID, bundleId);
+        const char *bytes = [seedSrc UTF8String];
+        size_t len = strlen(bytes);
+        for (size_t i = 0; i < len; i++) {
+            h ^= (unsigned long long)(unsigned char)bytes[i];
+            h *= 1099511628211ULL;                          // FNV-1a prime
+        }
+
+        // splitmix64 finalizer：彻底打散低位相关性
+        h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 27; h *= 0x94D049BB133111EBULL;
+        h ^= h >> 31;
+
+        // ★ 用高 32 位选机型（低位已被 finalizer 充分打散，取模分布最均匀）
+        unsigned long long pickKey = (h >> 32);
+        NSLog(@"[LC] device seed=%llu pick=%llu (cu=%@ du=%@ bid=%@)",
+              h, pickKey, containerUUID, dataUUID, bundleId);
 
         // 完整机型表：所有参数互相匹配
         typedef struct {
@@ -416,7 +438,8 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
             {"iPhone17,2","iPhone 16 Pro Max", "D94AP",  6, 8LL*1024*1024*1024, 0x8140, 4050, 440, 956, 3.00f, 460.0f, 4685, 18, 1},
         };
         int n = (int)(sizeof(pool)/sizeof(pool[0]));
-        const LCDeviceProfile *d = &pool[h % n];
+        // ★ v43: 用 pickKey（已 splitmix64 打散的高 32 位）选机型，分布均匀
+        const LCDeviceProfile *d = &pool[pickKey % (unsigned long long)n];
 
         // ---- 序列号（12位，苹果格式，真实前缀）----
         static const char cs[] = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
