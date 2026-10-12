@@ -45,12 +45,8 @@ void KwaiInstallHistorySpoof(void);
 void KwaiInstallTrueParamSpoof(void);
 void KwaiInstallV11Spoof(void);
 void KwaiInstallLCFeatureHide(void);
-void KwaiInstallHomeSpoof(void);
 void KwaiInstallEnvHide(void);
 void KwaiInstallRepackBypass(void);
-void KwaiInstallBinRedirect(void);
-void KwaiInstallMachOFake(void);
-void KwaiInstallSignPathBlock(void);
 void KwaiInstallSigBypass(void);
 
 
@@ -1248,9 +1244,15 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
         if (r == 0 && *oldlenp > 0) {
             char *p = (char *)oldp;
             size_t len = *oldlenp;
-            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
-                                 "LC_DATA_UUID", "JB_ROOT", "DOPAMINE", "SUBSTRATE",
-                                 "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER", NULL};
+            const char *bad[] = {
+                "LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
+                "JB_ROOT", "DOPAMINE", "SUBSTRATE",
+                // ★ v35: 前缀匹配，一次覆盖 22 个 LC_SPOOF_* 变量
+                //   快手读 KERN_PROCARGS2 就能看到 LC_SPOOF_SERIAL=... → 暴露伪装环境
+                "LC_SPOOF_",
+                "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER",
+                NULL
+            };
             for (int i = 0; bad[i]; i++) {
                 size_t bl = strlen(bad[i]);
                 for (size_t j = 0; j + bl <= len; j++) {
@@ -2769,6 +2771,7 @@ void KwaiInstallStorageSpoof(void) {
 static int g_fakeCycleCount = 0;
 static int g_fakeBatteryHealth = 0;
 static long long g_fakeBatteryCapacity = 0;
+static long long g_fakeBatteryNominal = 0;      // ★ v37: 出厂标称容量
 static CFStringRef g_fakeBatterySerial = NULL;
 
 void KwaiSetupBatterySpoof(void) {
@@ -2776,8 +2779,14 @@ void KwaiSetupBatterySpoof(void) {
     unsigned long seed = KwaiContainerSeed();
     g_fakeCycleCount = 400 + (int)((seed >> 3) % 501);        // 400~900
     g_fakeBatteryHealth = 78 + (int)((seed >> 7) % 15);       // 78%~92%
+    // ★ v37 修复：三个容量 key 的语义必须不同，否则快手能算出矛盾的健康度
+    //   NominalChargeCapacity = 出厂标称（固定，不随健康衰减）
+    //   MaxCapacity            = 当前最大容量（衰减后）
+    //   AppleRawMaxCapacity    = 设计容量（工厂值，通常 = 标称）
+    //   健康度 = MaxCapacity / NominalChargeCapacity
     long long nominal = g_fakeBattery > 0 ? g_fakeBattery : 3200;
-    g_fakeBatteryCapacity = nominal * g_fakeBatteryHealth / 100;
+    g_fakeBatteryNominal = nominal;                        // 标称（固定）
+    g_fakeBatteryCapacity = nominal * g_fakeBatteryHealth / 100;   // 当前容量
     // 电池序列号（假）
     char bs[24];
     snprintf(bs, sizeof(bs), "%08X%04X", (unsigned)(seed & 0xFFFFFFFF), (unsigned)((seed >> 32) & 0xFFFF));
@@ -2797,10 +2806,20 @@ static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
         if (val) CFRelease(val);
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
     }
-    // 设计容量 vs 实际容量
-    if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo ||
-        CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
-        CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
+    // ★ v37 修复：三个容量 key 语义必须不同
+    //   原来三个都返回 g_fakeBatteryCapacity → 快手算出 health = 2816/2816 = 100%
+    //   但我们上报 health = 91% → 自相矛盾
+    //   正确：NominalChargeCapacity = 标称（固定），MaxCapacity = 衰减后
+    if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
+    }
+    if (CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
+    }
+    if (CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("AppleCurrentCapacity"), 0) == kCFCompareEqualTo) {
         if (val) CFRelease(val);
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
     }
@@ -2928,6 +2947,13 @@ static BOOL kw_badEnv(const char *n) {
         "DYLD_INSERT_LIBRARIES","DYLD_LIBRARY_PATH","DYLD_FRAMEWORK_PATH",
         "JB_ROOT","DOPAMINE_ROOT","THEOS","JB_PATHS",
         "SUBSTRATE_ROOT","LIBHOOKER",
+        // ★ v35: LC_SPOOF_* 也必须拦截（快手 getenv 就能看到 LC_SPOOF_SERIAL=...）
+        "LC_SPOOF_MODEL","LC_SPOOF_PRODUCT","LC_SPOOF_BOARD","LC_SPOOF_SERIAL",
+        "LC_SPOOF_UUID","LC_SPOOF_IDFV","LC_SPOOF_IDFA","LC_SPOOF_NAME",
+        "LC_SPOOF_NCPU","LC_SPOOF_MEM","LC_SPOOF_SOC","LC_SPOOF_FREQ",
+        "LC_SPOOF_SCR_W","LC_SPOOF_SCR_H","LC_SPOOF_SCALE","LC_SPOOF_BATT",
+        "LC_SPOOF_ARME","LC_SPOOF_MINIOS","LC_SPOOF_BUNDLE","LC_SPOOF_EXEC",
+        "LC_SPOOF_PROCID",
         NULL };
     for (int i = 0; bad[i]; i++) if (strcmp(n, bad[i]) == 0) return YES;
     return NO;
@@ -2943,14 +2969,6 @@ static char *kw_getenv(const char *name) {
 // ============================================================
 static const char *(*orig_dyld_name)(uint32_t) = NULL;
 
-static BOOL kw_badImage(const char *p) {
-    if (!p) return NO;
-    static const char *bad[] = {
-        "TweakLoader","KwaiSpoof","KwaiHide","CydiaSubstrate",
-        "libhooker","Substrate","libsystem_x","frida", NULL };
-    for (int i = 0; bad[i]; i++) if (strstr(p, bad[i])) return YES;
-    return NO;
-}
 
 // ============================================================
 //  安全 rebind：先 dlsym 确认存在，再 rebind
@@ -4656,6 +4674,31 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
     if (strcmp(name, "hw.optional.armv8_2") == 0) {
         if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
     }
+    // ★ v37: 补齐高价值 hw.optional（一致性关键）
+    //   isa-arm64e 必须与 arm64e 一致，否则快手能直接判定伪造
+    if (strcmp(name, "hw.optional.isa-arm64e") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = g_fakeArmE; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.ARMv8_1_atomics") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    // A11+ 都有 armv8_5（A12 起用 PAC）
+    if (strcmp(name, "hw.optional.armv8_5") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.AdvSIMD") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.FloatingPoint") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.neon") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    // PAC（Pointer Authentication）A12+ 才有
+    if (strcmp(name, "hw.optional.pointer_authentication") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = (g_fakeSoCId >= 0x8101) ? 1 : 0; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
     return -1;   // 未处理
 }
 
@@ -4870,108 +4913,7 @@ void KwaiInstallLCFeatureHide(void) {
 
 static NSString *g_fakeHomePath = nil;   // 伪装后的 HOME
 
-static void KwaiSetupHomeSpoof(void) {
-    // ★ 修复：不再抹平 HOME 路径！
-    //   原因：抹平后的路径不存在 → 文件访问全部失败 → 签名验证失败
-    //   收益：LC 嵌套路径特征其实不重要（LC 自己会处理）
-    //   现在：只记录，不做任何改动（HomedirSpoof hook 也移除）
-    if (g_fakeHomePath) return;
-    g_fakeHomePath = NSHomeDirectory();   // 保持真实路径
-    KWLog(@"[v14] HOME: %@ (unchanged)", g_fakeHomePath);
-}
 
-// ---------- ① NSHomeDirectory ----------
-static NSString *(*orig_homeDir)(void) = NULL;
-static NSString *kw_homeDir(void) {
-    if (g_fakeHomePath) return g_fakeHomePath;
-    return orig_homeDir ? orig_homeDir() : NSHomeDirectory();
-}
-
-// ---------- ② NSSearchPathForDirectoriesInDomains ----------
-static NSArray<NSString *> *(*orig_searchPaths)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL) = NULL;
-static NSArray<NSString *> *kw_searchPaths(NSSearchPathDirectory dir, NSSearchPathDomainMask mask, BOOL expand) {
-    NSArray *r = orig_searchPaths ? orig_searchPaths(dir, mask, expand) : @[];
-    if (g_fakeHomePath && r.count > 0) {
-        NSMutableArray *out = [NSMutableArray array];
-        NSString *realHOME = NSHomeDirectory();
-        for (NSString *p in r) {
-            if ([p hasPrefix:realHOME]) {
-                NSString *rest = [p substringFromIndex:realHOME.length];
-                [out addObject:[g_fakeHomePath stringByAppendingString:rest]];
-            } else {
-                [out addObject:p];
-            }
-        }
-        return out;
-    }
-    return r;
-}
-
-// ---------- ③ NSTemporaryDirectory ----------
-static NSString *(*orig_tempDir)(void) = NULL;
-static NSString *kw_tempDir(void) {
-    NSString *t = orig_tempDir ? orig_tempDir() : NSTemporaryDirectory();
-    if (g_fakeHomePath && t) {
-        NSString *realHOME = NSHomeDirectory();
-        if ([t hasPrefix:realHOME]) {
-            return [g_fakeHomePath stringByAppendingString:[t substringFromIndex:realHOME.length]];
-        }
-    }
-    return t;
-}
-
-// ---------- ④ NSBundle.bundlePath / executablePath ----------
-static NSString *(*orig_bundlePath)(id, SEL) = NULL;
-static NSString *kw_bundlePath(id self, SEL _cmd) {
-    NSString *p = orig_bundlePath ? orig_bundlePath(self, _cmd) : nil;
-    if (g_fakeBundlePath && p && [p containsString:@"/Documents/Applications/"]) {
-        return g_fakeBundlePath;   // 用 LC 层生成的假路径
-    }
-    return p;
-}
-
-// ---------- 安装 ----------
-void KwaiInstallHomeSpoof(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    KwaiSetupHomeSpoof();
-
-    // ① NSHomeDirectory —— 已禁用（会破坏文件访问）
-    //    kw_homeDir 保留但不再安装
-
-
-    void *sym = NULL;
-    // ② NSSearchPathForDirectoriesInDomains
-    sym = dlsym(RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
-    if (sym) {
-        orig_searchPaths = (NSArray<NSString *> *(*)(NSSearchPathDirectory, NSSearchPathDomainMask, BOOL))sym;
-        @try {
-            // [DISABLED] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_searchPaths, NULL);
-            KWLog(@"[v14] NSSearchPath OK");
-        } @catch (NSException *e) { KWLog(@"[v14] search ex: %@", e); }
-    }
-
-    // ③ NSTemporaryDirectory
-    sym = dlsym(RTLD_DEFAULT, "NSTemporaryDirectory");
-    if (sym) {
-        orig_tempDir = (NSString *(*)(void))sym;
-        @try {
-            // [DISABLED] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_tempDir, NULL);
-            KWLog(@"[v14] NSTemporaryDirectory OK");
-        } @catch (NSException *e) { KWLog(@"[v14] temp ex: %@", e); }
-    }
-
-    // ④ NSBundle.bundlePath
-    Method m1 = class_getInstanceMethod([NSBundle class], @selector(bundlePath));
-    if (m1) {
-        orig_bundlePath = (void *)method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)kw_bundlePath);
-        KWLog(@"[v14] NSBundle.bundlePath OK");
-    }
-
-    KWLog(@"[v14] all done");
-}
 
 // ============================================================
 //  v15: 修复 3 个隐患
@@ -4987,6 +4929,14 @@ static void KwaiCleanEnv(void) {
     //       因为 LC 自己的 NSFileManager+GuestHooks 依赖它们
     //       清了会 getenv 返回 NULL → stringWithUTF8String:NULL → 崩溃
     const char *vars[] = {
+        // ★ v35: 补上 22 个 LC_SPOOF_*（原版完全没清）
+        //   快手读 KERN_PROCARGS2 就能看到 LC_SPOOF_SERIAL=... → 直接暴露伪装环境
+        "LC_SPOOF_MODEL", "LC_SPOOF_PRODUCT", "LC_SPOOF_BOARD", "LC_SPOOF_SERIAL",
+        "LC_SPOOF_UUID", "LC_SPOOF_IDFV", "LC_SPOOF_IDFA", "LC_SPOOF_NAME",
+        "LC_SPOOF_NCPU", "LC_SPOOF_MEM", "LC_SPOOF_SOC", "LC_SPOOF_FREQ",
+        "LC_SPOOF_SCR_W", "LC_SPOOF_SCR_H", "LC_SPOOF_SCALE", "LC_SPOOF_BATT",
+        "LC_SPOOF_ARME", "LC_SPOOF_MINIOS", "LC_SPOOF_BUNDLE", "LC_SPOOF_EXEC",
+        "LC_SPOOF_PROCID",
         "JB_ROOT", "DOPAMINE_ROOT", "SUBSTRATE_ROOT",
         "THEOS", "LIBHOOKER", "ellekit", "DISABLE_TWEAKS",
         "_MSSafeMode",
@@ -5354,151 +5304,15 @@ BOOL kw_isOurAddress(vm_address_t addr) {
 // ============================================================
 
 // ---------- 正版快手路径（需要动态查找）----------
-static char g_realKwaiBinPath[512] = {0};
-static char g_fakeKwaiBinPath[512] = {0};
 
-static void KwaiSetupBinRedirect(void) {
-    if (g_realKwaiBinPath[0]) return;
-
-    // ① 我们的（被改过的）路径
-    NSString *ourBundle = [[NSBundle mainBundle] bundlePath];
-    // 例：/var/mobile/Containers/Data/Application/<UUID>/Documents/Applications/com.jiangjia.gif.app
-    NSString *ourBin = [[NSBundle mainBundle] executablePath];
-
-    if (ourBin) {
-        strncpy(g_fakeKwaiBinPath, ourBin.UTF8String, sizeof(g_fakeKwaiBinPath) - 1);
-    }
-
-    // ② 找正版路径（多方式尝试）
-    NSFileManager *fm = [NSFileManager defaultManager];
-    const char *roots[] = {
-        "/var/containers/Bundle/Application",
-        "/private/var/containers/Bundle/Application",
-        NULL
-    };
-    for (int ri = 0; roots[ri] && !g_realKwaiBinPath[0]; ri++) {
-        NSString *bundleRoot = @(roots[ri]);
-        NSArray *dirs = [fm contentsOfDirectoryAtPath:bundleRoot error:nil];
-        for (NSString *d in dirs) {
-            NSString *appPath = [[bundleRoot stringByAppendingPathComponent:d]
-                                 stringByAppendingPathComponent:@"com_kwai_gif.app"];
-            NSString *binPath = [appPath stringByAppendingPathComponent:@"com_kwai_gif"];
-            if ([fm fileExistsAtPath:binPath]) {
-                strncpy(g_realKwaiBinPath, binPath.UTF8String, sizeof(g_realKwaiBinPath) - 1);
-                KWLog(@"[v23] real bin (scan): %s", g_realKwaiBinPath);
-                break;
-            }
-        }
-    }
-
-    // ③ 硬编码兜底（已知路径）
-    if (!g_realKwaiBinPath[0]) {
-        const char *known[] = {
-            "/var/containers/Bundle/Application/0D51A6AE-4035-47D8-9C4C-C97EDFE4F2CD/com_kwai_gif.app/com_kwai_gif",
-            "/private/var/containers/Bundle/Application/0D51A6AE-4035-47D8-9C4C-C97EDFE4F2CD/com_kwai_gif.app/com_kwai_gif",
-            NULL
-        };
-        for (int i = 0; known[i]; i++) {
-            if (access(known[i], F_OK) == 0) {
-                strncpy(g_realKwaiBinPath, known[i], sizeof(g_realKwaiBinPath) - 1);
-                KWLog(@"[v23] real bin (known): %s", g_realKwaiBinPath);
-                break;
-            }
-        }
-    }
-
-    if (!g_realKwaiBinPath[0]) {
-        KWLog(@"[v23] real bin NOT FOUND (正版快手未安装？)");
-    }
-    KWLog(@"[v23] fake bin: %s", g_fakeKwaiBinPath);
-}
 
 // ---------- hook open() ----------
-static int (*orig_open_v23)(const char *, int, ...) = NULL;
 
-static int kw_open_v23(const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags);
-        mode = va_arg(ap, mode_t);
-        va_end(ap);
-    }
-
-    // [DISABLED-v25] 签名拦截已移除（导致闪退）
-    if (path && (strstr(path, "embedded.mobileprovision") ||
-                 strstr(path, "_CodeSignature") ||
-                 strstr(path, "CodeResources"))) {
-        KWLog(@"[v25] BLOCK open: %s", path);
-        errno = ENOENT;
-        return -1;
-    }
-
-    // v23：二进制路径重定向
-    if (path && g_realKwaiBinPath[0] && g_fakeKwaiBinPath[0]) {
-        if (strcmp(path, g_fakeKwaiBinPath) == 0) {
-            KWLog(@"[v23] REDIRECT open(%s) -> %s", path, g_realKwaiBinPath);
-            return orig_open_v23 ? orig_open_v23(g_realKwaiBinPath, flags, mode) : -1;
-        }
-    }
-
-    return orig_open_v23 ? orig_open_v23(path, flags, mode) : -1;
-}
 
 // ---------- hook openat()（更常用）----------
-static int (*orig_openat_v23)(int, const char *, int, ...) = NULL;
 
-static int kw_openat_v23(int fd, const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags);
-        mode = va_arg(ap, mode_t);
-        va_end(ap);
-    }
-
-    if (path && g_realKwaiBinPath[0] && g_fakeKwaiBinPath[0]) {
-        if (strcmp(path, g_fakeKwaiBinPath) == 0) {
-            KWLog(@"[v23] REDIRECT openat(%s) -> %s", path, g_realKwaiBinPath);
-            return orig_openat_v23 ? orig_openat_v23(fd, g_realKwaiBinPath, flags, mode) : -1;
-        }
-    }
-
-    return orig_openat_v23 ? orig_openat_v23(fd, path, flags, mode) : -1;
-}
 
 // ---------- 安装 ----------
-void KwaiInstallBinRedirect(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    KwaiSetupBinRedirect();
-
-    if (!g_realKwaiBinPath[0]) {
-        KWLog(@"[v23] skip (no real bin)");
-        return;
-    }
-
-    // ① open
-    void *sym = dlsym(RTLD_DEFAULT, "open");
-    if (sym) {
-        orig_open_v23 = (int (*)(const char *, int, ...))sym;
-        @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_open_v23, NULL);
-            KWLog(@"[v23] open OK");
-        } @catch (NSException *e) { KWLog(@"[v23] open ex: %@", e); }
-    }
-
-    // ② openat
-    sym = dlsym(RTLD_DEFAULT, "openat");
-    if (sym) {
-        orig_openat_v23 = (int (*)(int, const char *, int, ...))sym;
-        @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_openat_v23, NULL);
-            KWLog(@"[v23] openat OK");
-        } @catch (NSException *e) { KWLog(@"[v23] openat ex: %@", e); }
-    }
-
-    KWLog(@"[v23] all done");
-}
 
 // ============================================================
 //  v24: Mach-O 头伪造（解决签名验证失败的真正方案）
@@ -5509,112 +5323,15 @@ void KwaiInstallBinRedirect(void) {
 // ============================================================
 
 // 伪造的 Mach-O 头 + load commands（只读，全局）
-static struct mach_header_64 *g_fakeMainHeader = NULL;
-static size_t g_fakeMainHeaderSize = 0;
 
 // 原始值（从正版二进制读，或推断）
-static uint32_t g_realFiletype = 2;      // MH_EXECUTE
-static uint32_t g_realNcmds = 0;
-static uint32_t g_realSizeofcmds = 0;
 
-static void KwaiSetupMachOFake(void) {
-    if (g_fakeMainHeader) return;
-
-    // ① 找主程序的 header
-    const struct mach_header_64 *hdr = NULL;
-    int count = _dyld_image_count();
-    for (int i = 0; i < count; i++) {
-        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!h) continue;
-        if (h->filetype == MH_EXECUTE || h->filetype == MH_DYLIB) {
-            // 用 dladdr 判断是不是主程序
-            Dl_info info;
-            memset(&info, 0, sizeof(info));
-            if (dladdr((const void *)h, &info) && info.dli_fname) {
-                if (strstr(info.dli_fname, "com_kwai_gif")) {
-                    hdr = h;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!hdr) {
-        KWLog(@"[v24] main header NOT FOUND");
-        return;
-    }
-
-    KWLog(@"[v24] found main header: filetype=0x%X ncmds=%u sizeofcmds=%u",
-          hdr->filetype, hdr->ncmds, hdr->sizeofcmds);
-
-    // ② 记录原始值（LC 改动是 +2 ncmds / +112 bytes）
-    g_realNcmds = hdr->ncmds - 2;              // 恢复
-    g_realSizeofcmds = hdr->sizeofcmds - 112;  // 恢复
-
-    // ③ 创建伪造的 header 副本
-    size_t totalSize = sizeof(struct mach_header_64) + hdr->sizeofcmds;
-    struct mach_header_64 *fake = malloc(totalSize);
-    memcpy(fake, hdr, totalSize);
-
-    // ④ 改回 MH_EXECUTE
-    fake->filetype = MH_EXECUTE;
-    // ⑤ 恢复 ncmds / sizeofcmds（但保持数据完整性）
-    // 注：不能真的删 load commands，只改计数
-    fake->ncmds = g_realNcmds;
-    fake->sizeofcmds = g_realSizeofcmds;
-
-    g_fakeMainHeader = fake;
-    g_fakeMainHeaderSize = totalSize;
-
-    KWLog(@"[v24] fake header created: filetype=%u ncmds=%u sizeofcmds=%u",
-          fake->filetype, fake->ncmds, fake->sizeofcmds);
-}
 
 // ---------- hook _dyld_get_image_header ----------
 static const struct mach_header *(*orig_dyld_get_hdr_v24)(uint32_t) = NULL;
 
-static const struct mach_header *kw_dyld_get_hdr_v24(uint32_t index) {
-    const struct mach_header *h = orig_dyld_get_hdr_v24 ? orig_dyld_get_hdr_v24(index) : NULL;
-    if (!h || !g_fakeMainHeader) return h;
-
-    // 判断是否是主程序
-    if (h->filetype == MH_DYLIB) {
-        // 用 dladdr 确认
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr((const void *)h, &info) && info.dli_fname) {
-            if (strstr(info.dli_fname, "com_kwai_gif")) {
-                KWLog(@"[v24] RETURN FAKE HEADER for index %u", index);
-                return (const struct mach_header *)g_fakeMainHeader;
-            }
-        }
-    }
-    return h;
-}
 
 // ---------- 安装 ----------
-void KwaiInstallMachOFake(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    KwaiSetupMachOFake();
-
-    if (!g_fakeMainHeader) {
-        KWLog(@"[v24] skip (no fake header)");
-        return;
-    }
-
-    void *sym = dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
-    if (sym) {
-        orig_dyld_get_hdr_v24 = (const struct mach_header *(*)(uint32_t))sym;
-        @try {
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_dyld_get_hdr_v24, NULL);
-            KWLog(@"[v24] _dyld_get_image_header OK");
-        } @catch (NSException *e) { KWLog(@"[v24] ex: %@", e); }
-    }
-
-    KWLog(@"[v24] all done");
-}
 
 // ============================================================
 //  v25: 快手签名检测对抗（基于二进制逆向后确认的检测点）
@@ -5627,122 +5344,16 @@ void KwaiInstallMachOFake(void) {
 
 // ---------- ① 拦截 open/openat：重定向签名文件 ----------
 static int (*orig_open_v25)(const char *, int, ...) = NULL;
-static int (*orig_openat_v25)(int, const char *, int, ...) = NULL;
 
 // 判断是否签名相关文件
-static BOOL kw_isSignPath(const char *path) {
-    if (!path) return NO;
-    if (strstr(path, "embedded.mobileprovision")) return YES;
-    if (strstr(path, "_CodeSignature")) return YES;
-    if (strstr(path, "CodeResources")) return YES;
-    return NO;
-}
 
-static int kw_open_v25(const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags);
-        mode = va_arg(ap, mode_t);
-        va_end(ap);
-    }
 
-    // 签名文件 → 直接返回不存在（快手会走"无签名"分支，而非"签名错误"）
-    if (kw_isSignPath(path)) {
-        KWLog(@"[v25] BLOCK sign path: %s", path);
-        errno = ENOENT;
-        return -1;
-    }
-
-    return orig_open_v25 ? orig_open_v25(path, flags, mode) : -1;
-}
-
-static int kw_openat_v25(int fd, const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags);
-        mode = va_arg(ap, mode_t);
-        va_end(ap);
-    }
-
-    if (kw_isSignPath(path)) {
-        KWLog(@"[v25] BLOCK sign path(openat): %s", path);
-        errno = ENOENT;
-        return -1;
-    }
-
-    return orig_openat_v25 ? orig_openat_v25(fd, path, flags, mode) : -1;
-}
 
 // ---------- ② 拦截 stat / access：签名路径返回不存在 ----------
-static int (*orig_stat_v25)(const char *, struct stat *) = NULL;
-static int kw_stat_v25(const char *path, struct stat *buf) {
-    if (kw_isSignPath(path)) { errno = ENOENT; return -1; }
-    return orig_stat_v25 ? orig_stat_v25(path, buf) : -1;
-}
 
-static int (*orig_access_v25)(const char *, int) = NULL;
-static int kw_access_v25(const char *path, int mode) {
-    if (kw_isSignPath(path)) { errno = ENOENT; return -1; }
-    return orig_access_v25 ? orig_access_v25(path, mode) : -1;
-}
 
 // ---------- ③ NSFileManager 签名路径 ----------
-static BOOL (*orig_fileExists_v25)(id, SEL, NSString *) = NULL;
-static BOOL kw_fileExists_v25(id self, SEL _cmd, NSString *path) {
-    if (path && kw_isSignPath(path.UTF8String)) return NO;
-    return orig_fileExists_v25 ? orig_fileExists_v25(self, _cmd, path) : NO;
-}
 
 // ---------- 安装 ----------
-void KwaiInstallSignPathBlock(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-
-    void *sym = dlsym(RTLD_DEFAULT, "open");
-    if (sym) {
-        orig_open_v25 = (int (*)(const char *, int, ...))sym;
-        @try {
-            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_open_v25, NULL);
-            KWLog(@"[v25] open OK");
-        } @catch (NSException *e) { KWLog(@"[v25] open ex: %@", e); }
-    }
-
-    sym = dlsym(RTLD_DEFAULT, "openat");
-    if (sym) {
-        orig_openat_v25 = (int (*)(int, const char *, int, ...))sym;
-        @try {
-            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_openat_v25, NULL);
-            KWLog(@"[v25] openat OK");
-        } @catch (NSException *e) { KWLog(@"[v25] openat ex: %@", e); }
-    }
-
-    sym = dlsym(RTLD_DEFAULT, "stat");
-    if (sym) {
-        orig_stat_v25 = (int (*)(const char *, struct stat *))sym;
-        @try {
-            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_stat_v25, NULL);
-            KWLog(@"[v25] stat OK");
-        } @catch (NSException *e) { KWLog(@"[v25] stat ex: %@", e); }
-    }
-
-    sym = dlsym(RTLD_DEFAULT, "access");
-    if (sym) {
-        orig_access_v25 = (int (*)(const char *, int))sym;
-        @try {
-            // [MERGED-INTO-v12/v23] litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sym, (void *)kw_access_v25, NULL);
-            KWLog(@"[v25] access OK");
-        } @catch (NSException *e) { KWLog(@"[v25] access ex: %@", e); }
-    }
-
-    Method m1 = class_getInstanceMethod([NSFileManager class], @selector(fileExistsAtPath:));
-    if (m1) {
-        orig_fileExists_v25 = (void *)method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)kw_fileExists_v25);
-        KWLog(@"[v25] fileExistsAtPath OK");
-    }
-
-    KWLog(@"[v25] all done");
-}
 
 // ============================================================
