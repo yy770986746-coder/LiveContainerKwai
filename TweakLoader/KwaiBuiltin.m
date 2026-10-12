@@ -2555,35 +2555,40 @@ void KwaiInstallTimeSpoof(void) {
 
 // ---- 按机型生成合理容量 ----
 static long long KwaiDiskCapacityForMachine(const char *machine) {
-    // 与机型档次匹配的容量（字节）
-    // 常见：128 / 256 / 512 GB
+    // ★ 按机型档次选容量档（128 / 256 / 512GB），覆盖全部 26 款机型
     unsigned long seed = KwaiContainerSeed();
-    // 按机型档次选容量档
-    int tier = 128;
+
+    int tier = 256;   // 默认 256GB
     if (machine) {
-        if (strstr(machine, "iPhone13"))      tier = 128;   // 13 系列
-        else if (strstr(machine, "iPhone14,5")) tier = 128;
-        else if (strstr(machine, "iPhone14,7")) tier = 256;
-        else if (strstr(machine, "iPhone14,8")) tier = 128;
-        else if (strstr(machine, "iPhone15,2")) tier = 256;
-        else if (strstr(machine, "iPhone15,3")) tier = 256;
-        else if (strstr(machine, "iPhone15,4")) tier = 128;
-        else if (strstr(machine, "iPhone15,5")) tier = 256;
-        else if (strstr(machine, "iPhone16,1")) tier = 256;
-        else if (strstr(machine, "iPhone16,2")) tier = 512;
-        else tier = 256;
+        // Pro Max 级别 → 512
+        if (strcmp(machine, "iPhone16,2") == 0 ||    // 15 Pro Max
+            strcmp(machine, "iPhone17,2") == 0) {    // 16 Pro Max
+            tier = 512;
+        }
+        // Pro 级别 → 256
+        else if (strcmp(machine, "iPhone13,3") == 0 || strcmp(machine, "iPhone13,4") == 0 ||
+                 strcmp(machine, "iPhone14,2") == 0 || strcmp(machine, "iPhone14,3") == 0 ||
+                 strcmp(machine, "iPhone15,2") == 0 || strcmp(machine, "iPhone15,3") == 0 ||
+                 strcmp(machine, "iPhone16,1") == 0 ||
+                 strcmp(machine, "iPhone17,1") == 0) {
+            tier = 256;
+        }
+        // 其余（标准版 / mini / SE / XS / XR / 11 系列）→ 128 或 256
+        else {
+            tier = (seed & 1) ? 128 : 256;
+        }
     }
-    // 实际容量略小于标称（苹果格式化损耗）
-    long long total = (long long)tier * 1000LL * 1000LL * 1000LL * 100LL / 1000LL;
-    // 更精确：128GB 实际约 127.7GB / 256GB 约 255.7GB / 512GB 约 511.6GB
-    if (tier == 128) total = 127700000000LL;
-    else if (tier == 256) total = 255700000000LL;
-    else if (tier == 512) total = 511600000000LL;
-    
-    // 已用：长期使用 70%~92%（按 seed 决定，同一容器固定）
-    int usedPct = 70 + (int)(seed % 23);   // 长期使用：70%~92%
+
+    // 苹果格式化后的实际容量
+    long long total;
+    if (tier == 128)      total = 127700000000LL;   // ≈127.7GB
+    else if (tier == 256) total = 255700000000LL;   // ≈255.7GB
+    else                  total = 511600000000LL;   // ≈511.6GB
+
+    // 已用 70%~92%（长期使用特征，同一容器固定）
+    int usedPct = 70 + (int)(seed % 23);
     long long used = total * usedPct / 100;
-    return total - used;   // 返回可用
+    return total - used;   // 返回可用容量
 }
 
 void KwaiSetupStorageSpoof(void) {
