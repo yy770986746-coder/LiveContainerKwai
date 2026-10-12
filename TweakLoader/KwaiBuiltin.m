@@ -1226,10 +1226,16 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
             }
         }
         // ★ v32: machdep.cpu.brand_string（MIB 形式：CTL_HW, HW_CPU_SUBTYPE, HW_CPU_BRAND_STRING）
+        // ★ v32: Apple 私有常量（SDK 未公开）
+        //   CTL_HW=1, HW_CPU_SUBTYPE(HW_CPU_FAMILY)=1, HW_CPU_BRAND_STRING=0x100
+        //   参考 XNU：sysctl_hw.c
+#define LC_HW_CPU_FAMILY      1
+#define LC_HW_CPU_BRAND_STRING 0x100
+
         //   快手直接读芯片名，比 cpufamily 更直观
         if (name[0] == CTL_HW && namelen >= 3 &&
-            (name[1] == HW_CPU_SUBTYPE || name[1] == 1) &&
-            name[2] == HW_CPU_BRAND_STRING) {
+            name[1] == LC_HW_CPU_FAMILY &&
+            name[2] == LC_HW_CPU_BRAND_STRING) {
             const char *brand = kw_cpuBrandForSoC(g_fakeSoCId);
             size_t need = strlen(brand) + 1;
             if (*oldlenp >= need) { memcpy(oldp, brand, need); *oldlenp = need; return 0; }
@@ -5738,3 +5744,5 @@ void KwaiInstallSignPathBlock(void) {
 
     KWLog(@"[v25] all done");
 }
+
+// ============================================================
