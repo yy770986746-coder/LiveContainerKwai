@@ -960,28 +960,6 @@ static const KwaiDeviceModel kDeviceModels[] = {
 };
 static const int kDeviceModelCount = sizeof(kDeviceModels) / sizeof(kDeviceModels[0]);
 
-// ★ v42: 本地机型选择（供 KwaiSetupSpoof 与一致性校验共用）
-//   用 splitmix64 打散后的 seed + minIOS 过滤，保证每个容器机型不同
-int kw_pickLocalModelIndex(unsigned long seed) {
-    // 宿主 iOS 主版本（用于 minIOS 过滤）
-    int hostMajor = 15;
-    NSString *ver = [[UIDevice currentDevice] systemVersion];
-    if (ver.length > 0) {
-        NSInteger first = [[ver componentsSeparatedByString:@"."].firstObject integerValue];
-        if (first > 0) hostMajor = (int)first;
-    }
-    int cand[64];
-    int candCount = 0;
-    for (int i = 0; i < kDeviceModelCount && candCount < 64; i++) {
-        if (kDeviceModels[i].minIOS <= hostMajor) cand[candCount++] = i;
-    }
-    if (candCount == 0) {
-        for (int i = 0; i < kDeviceModelCount && candCount < 64; i++) cand[candCount++] = i;
-    }
-    if (candCount <= 0) return 0;
-    return cand[seed % (unsigned long)candCount];
-}
-
 // ★ SoC → hw.cpufamily 精确映射（真实值）
 //   之前只分两档（A14 / A15），导致 A12/A13/A15/A16/A17/A18 全部返回错误值
 static int kw_cpuFamilyForSoC(int socId) {
@@ -1061,13 +1039,6 @@ static unsigned long KwaiContainerSeed(void) {
         for (NSUInteger i = 0; i < bid.length; i++) {
             h = ((h << 5) + h) + [bid characterAtIndex:i];
         }
-        // ★ v42: splitmix64 finalizer —— djb2 低位与输入高度相关，
-        //   导致 seed % N 分布极不均匀（实测机型总是落在 iPhone14,x）
-        h ^= h >> 17;
-        h *= 0x9E3779B97F4A7C15UL;
-        h ^= h >> 13;
-        h *= 0x9E3779B97F4A7C15UL;
-        h ^= h >> 16;
         seed = h;
         KWLog(@"[spoof] container seed: %lu (home=%s)", h, home.UTF8String);
     });
@@ -1121,39 +1092,6 @@ static void KwaiSetupSpoof(void) {
         if (envMinIOS)  g_fakeMinIOS   = atoi(envMinIOS);
         if (envBundle)  g_fakeBundlePath = [NSString stringWithUTF8String:envBundle];
         if (envExec)    g_fakeExecPath   = [NSString stringWithUTF8String:envExec];
-
-        // ★ v42 BUG-10 修复：旧版 LC（无 splitmix64）送来的机型固定为 iPhone14,x，
-        //   Tweak 若无条件信任会导致「每个新容器机型都一样」。
-        //   方案：若 LC 送来的机型与本地 seed 选出的机型不一致，
-        //        且检测到 LC 是旧版（无 LC_SPOOF_SCALE），则用本地选型覆盖。
-        {
-            extern int kw_pickLocalModelIndex(unsigned long seed);
-            unsigned long s2 = KwaiContainerSeed();
-            int localIdx = kw_pickLocalModelIndex(s2);
-            const char *localMachine = kDeviceModels[localIdx].machine;
-            if (localMachine && envModel && strcmp(localMachine, envModel) != 0) {
-                KWLog(@"[spoof] LC model=%s 与本地 seed 选出的 %s 不一致 -> 使用本地选型",
-                      envModel, localMachine);
-                const KwaiDeviceModel *m2 = &kDeviceModels[localIdx];
-                g_fakeMachine  = [NSString stringWithUTF8String:m2->machine];
-                strncpy(g_fakeMachineC, m2->machine, sizeof(g_fakeMachineC)-1);
-                strncpy(g_fakeModelC,   m2->machine, sizeof(g_fakeModelC)-1);
-                strncpy(g_fakeProductC, m2->product, sizeof(g_fakeProductC)-1);
-                strncpy(g_fakeBoardC,   m2->board,   sizeof(g_fakeBoardC)-1);
-                g_fakeNCPU     = m2->ncpu;
-                g_fakeMemSize  = (long long)m2->memGB * 1024LL*1024LL*1024LL;
-                g_fakeSoCId    = m2->socId;
-                g_fakeFreqMHz  = m2->freqMHz;
-                g_fakeScrW     = m2->scrW;
-                g_fakeScrH     = m2->scrH;
-                g_fakeScale    = m2->scale;
-                g_fakeBattery  = m2->battery;
-                g_fakeArmE     = m2->arm64e;
-                g_fakeMinIOS   = m2->minIOS;
-                KWLog(@"[spoof] 本地选型: %s (%s) soc=0x%X scale=%.2f",
-                      m2->machine, m2->product, m2->socId, m2->scale);
-            }
-        }
         KWLog(@"[spoof] FROM LC ENV: model=%s product=%s board=%s sn=%s",
               envModel, envProduct ?: "", envBoard ?: "", envSerial ?: "");
 
