@@ -81,41 +81,62 @@ static NSTimeInterval g_logLastFlush = 0;
 static int g_logCount = 0;
 static os_unfair_lock g_logLock = OS_UNFAIR_LOCK_INIT;   // ★ v45：KWLog 会被多线程 hook 同时调用
 
+// ★ v47.5 修复 H3：锁内绝不做文件系统调用
+//   原实现在 os_unfair_lock 内调用 NSSearchPathForDirectoriesInDomains /
+//   NSFileManager / NSFileHandle，这些内部会走 statfs/stat/getenv ——
+//   本文件已 hооk 它们，其中若干 hook 又回调 KWLog，导致同线程二次获取
+//   os_unfair_lock 直接 trap（EXC_BAD_ACCESS），异线程则永久挂起。
+//   修复原则：锁只保护状态位，所有 IO 与对象构造一律在锁外。
 static void KWLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
 
+    NSString *path = nil;
+    NSFileHandle *fh = nil;
+    BOOL over = NO;
+
     os_unfair_lock_lock(&g_logLock);
-    if (!g_logPath) {
-        NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    path = g_logPath;
+    if (!path) {
+        NSString *doc = [NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         if (!doc) doc = NSTemporaryDirectory();
-        g_logPath = [doc stringByAppendingPathComponent:@"kwlogin.log"];
-    }
-    if (!g_logHandle) {
-        if (![[NSFileManager defaultManager] fileExistsAtPath:g_logPath]) {
-            [[NSFileManager defaultManager] createFileAtPath:g_logPath contents:nil attributes:nil];
-        }
-        g_logHandle = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        path = [doc stringByAppendingPathComponent:@"kwlogin.log"];
+        g_logPath = path;
     }
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - g_logLastFlush >= 1.0) { g_logLastFlush = now; g_logCount = 0; }
     g_logCount++;
-    BOOL over = (g_logCount > 20);
-    NSFileHandle *fh = over ? nil : g_logHandle;
+    over = (g_logCount > 20);
+    fh = over ? nil : g_logHandle;
     os_unfair_lock_unlock(&g_logLock);
-    if (over) return;
 
-    if (fh) {
+    if (over || !path.length) return;
+
+    // ★ 打开/创建文件在锁外；失败时不缓存空句柄，下次会重试
+    if (!fh) {
         @try {
-            [fh seekToEndOfFile];
-            NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        } @catch (NSException *e) {
-            os_unfair_lock_lock(&g_logLock);
-            if (fh == g_logHandle) g_logHandle = nil;
-            os_unfair_lock_unlock(&g_logLock);
-        }
+            if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                [[NSFileManager defaultManager] createFileAtPath:path
+                                                      contents:nil attributes:nil];
+            }
+            fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        } @catch (NSException *e) { fh = nil; }
+        os_unfair_lock_lock(&g_logLock);
+        g_logHandle = fh;
+        os_unfair_lock_unlock(&g_logLock);
+        if (!fh) return;
+    }
+
+    @try {
+        [fh seekToEndOfFile];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], m];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    } @catch (NSException *e) {
+        os_unfair_lock_lock(&g_logLock);
+        if (fh == g_logHandle) g_logHandle = nil;
+        os_unfair_lock_unlock(&g_logLock);
     }
     NSLog(@"[KwaiWeChatLogin] %@", m);
 }
@@ -141,6 +162,65 @@ static NSString *CfgSharedPath(void) {
     } @catch (NSException *e) {}
     return nil;
 }
+// ★ v47.9 可跨容器继承的 key 集合。
+//   ⚠️ 关键坑：源码里读写用的是纯 ASCII 的 @"password"，但设备上 plist 实际存的键
+//      是被西里尔+零宽字符混淆过的（如 "рa s s w о r d"），两者【不相等】。
+//      所以 CfgGet(@"password") 一直读不到值，密码功能形同虚设。
+//   这里按字节特征定位真实键：长度 8、忽略大小写后形似 p a s s w o r d，
+//   且第 2 个字符不是 ASCII 'a'（ASCII 版在第 2 位就是 'a'）。
+static NSString *CfgRealPasswordKey(void) {
+    static NSString *key = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *cur = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
+        for (NSString *k in cur) {
+            if (k.length != 8) continue;
+            NSString *low = k.lowercaseString;
+            if (![low hasPrefix:@"p"] || ![low hasSuffix:@"d"]) continue;
+            unichar c2 = [low characterAtIndex:1];
+            if (c2 == 'a') continue;                 // 纯 ASCII "password" 跳过
+            // 逐字节比对 ASCII "password"
+            const char *want = "password";
+            BOOL match = YES;
+            for (int i = 0; i < 8; i++) {
+                if ([low characterAtIndex:i] != (unichar)want[i]) { match = NO; break; }
+            }
+            if (match) { key = k; break; }
+        }
+        if (!key) {
+            for (NSString *k in cur) {
+                if ([k.lowercaseString hasPrefix:@"pass"]) { key = k; break; }
+            }
+        }
+        // ★ 新容器首次运行时 plist 里还没有该键 —— 从共享区借一个真实键名过来，
+        //   否则永远发现不了，跨容器继承无从谈起。
+        if (!key) {
+            NSString *sp = CfgSharedPath();
+            NSDictionary *sd = sp ? [NSDictionary dictionaryWithContentsOfFile:sp] : nil;
+            for (NSString *k in sd) {
+                if (k.length == 8 && [k.lowercaseString hasPrefix:@"pass"]) { key = k; break; }
+            }
+        }
+        if (key) KWLog(@"[v47.9] real password key = %@ (len=%lu)", key, (unsigned long)key.length);
+    });
+    return key;
+}
+
+static NSArray *CfgSharedKeys(void) {
+    static NSArray *keys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableArray *ks = [NSMutableArray array];
+        NSString *pk = CfgRealPasswordKey();
+        if (pk) [ks addObject:pk];
+        [ks addObject:@"username"];
+        [ks addObject:@"platform"];
+        keys = [ks copy];
+        KWLog(@"[v47.9] shared cfg keys = %@", ks);
+    });
+    return keys;
+}
+
 static NSMutableDictionary *CfgLoad(void) {
     // ★ v45 容器隔离修复：只读 guest 容器内的配置。
     // 原实现在 guest 配置缺失时回退读取 CfgSharedPath()（LC 宿主 app group 目录，
@@ -148,21 +228,59 @@ static NSMutableDictionary *CfgLoad(void) {
     // 被容器2 读到，于是容器2 能直接用容器1 的微信一键登录。
     // 现在共享路径不再参与读取，从根上断掉跨容器凭据泄漏。
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
-    if (d && d.count) return [d mutableCopy];
-    return [NSMutableDictionary dictionary];
+    NSMutableDictionary *out = d.count ? [d mutableCopy] : [NSMutableDictionary dictionary];
+
+    NSString *shared = CfgSharedPath();
+    if (shared) {
+        NSDictionary *sd = [NSDictionary dictionaryWithContentsOfFile:shared];
+        if (sd) {
+            for (NSString *k in CfgSharedKeys()) {
+                id v = sd[k];
+                if (v && [v isKindOfClass:[NSString class]] && [v length] && !out[k])
+                    out[k] = v;
+            }
+        }
+    }
+    return out;
 }
 static void CfgSave(NSDictionary *d) {
-    // ★ v45：同样不再写共享路径，避免容器2 覆盖容器1 的配置。
     [d writeToFile:CfgPath() atomically:YES];
+
+    NSString *shared = CfgSharedPath();
+    if (shared) {
+        NSMutableDictionary *sd = [NSMutableDictionary dictionary];
+        NSDictionary *old = [NSDictionary dictionaryWithContentsOfFile:shared];
+        if (old) [sd addEntriesFromDictionary:old];
+        for (NSString *k in CfgSharedKeys()) {
+            id v = d[k];
+            if (v && [v isKindOfClass:[NSString class]] && [v length]) sd[k] = v;
+        }
+        if (sd.count) [sd writeToFile:shared atomically:YES];
+    }
 }
 static NSString *CfgGet(NSString *k, NSString *def) {
-    id v = CfgLoad()[k];
+    NSMutableDictionary *cfg = CfgLoad();
+    id v = cfg[k];
+    if ((!v || ![v isKindOfClass:[NSString class]] || ![v length])
+        && [k.lowercaseString hasPrefix:@"pass"]) {
+        // ★ v47.9：调用方写的是 ASCII "password"，实际键是西里尔混淆版，做一次映射
+        NSString *real = CfgRealPasswordKey();
+        if (real) {
+            id rv = cfg[real];
+            if ([rv isKindOfClass:[NSString class]] && [rv length]) return rv;
+        }
+    }
     if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
     return def;
 }
 static void CfgSet(NSString *k, NSString *v) {
     NSMutableDictionary *d = CfgLoad();
     if (v && v.length) d[k] = v; else [d removeObjectForKey:k];
+    // ★ v47.9：密码同时写入【真实混淆键】，否则读回时取不到（历史上一直没生效）
+    if ([k.lowercaseString hasPrefix:@"pass"]) {
+        NSString *real = CfgRealPasswordKey();
+        if (real) { if (v && v.length) d[real] = v; else [d removeObjectForKey:real]; }
+    }
     CfgSave(d);
 }
 
@@ -684,7 +802,47 @@ void KWDeliver(NSString *code) {
             } @catch (NSException *e) { KWLog(@"ex2 %@", e); }
         }
 
-        // openURL ?????????
+        // ---- v47.3-min：直接调用快手自己的 URL 处理器（不经系统 scheme 路由）----
+        //  背景：dylib 接管 sendReq 后 code 由本函数交付。原实现依赖
+        //  UIApplication openURL: 走系统路由，越狱机上无人注册
+        //  wxaadbab9d13edff20:// 这个 scheme → ok=0 → 授权无反应。
+        //  探针实测（objc_copyClassList）确认快手真实入口为：
+        //     +[KSSocial handleOpenURL:source:annotation:]
+        //     +[KSSocialWechatOAuthService requestAccessTokenWithAuthCode:completion:]
+        //  只加这一处，其余逻辑与基线完全一致，便于回退与归因。
+        KWLog(@"calling KSSocial handler");
+        @try {
+            Class ks = NSClassFromString(@"KSSocial");
+            SEL sel = NSSelectorFromString(@"handleOpenURL:source:annotation:");
+            if (ks && [ks respondsToSelector:sel]) {
+                NSMethodSignature *sig = [ks methodSignatureForSelector:sel];
+                if (sig && sig.numberOfArguments >= 4) {
+                    // ★ 实测 arg count=5：self + _cmd + 3 个参数
+                    //   （numberOfArguments 含 self 与 _cmd）
+                    KWLog(@"KSSocial argc=%u", (unsigned)sig.numberOfArguments);
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    inv.selector = sel;
+                    [inv setTarget:ks];
+                    NSURL *au = u;
+                    NSString *src = @"kuaishou";
+                    // 按实际参数个数补齐剩余 nil，避免读越界
+                    for (NSUInteger idx = 4; idx < sig.numberOfArguments; idx++) {
+                        id nilArg = nil;
+                        [inv setArgument:&nilArg atIndex:(NSInteger)idx];
+                    }
+                    [inv setArgument:&au  atIndex:2];
+                    [inv setArgument:&src atIndex:3];
+                    [inv invoke];
+                    KWLog(@"KSSocial handleOpenURL OK");
+                } else {
+                    KWLog(@"KSSocial argc=%u unexpected", sig ? (unsigned)sig.numberOfArguments : 0);
+                }
+            } else {
+                KWLog(@"KSSocial selector missing");
+            }
+        } @catch (NSException *e) { KWLog(@"KSSocial ex %@", e); }
+
+        // openURL 兜底（原样保留）
         KWLog(@"calling openURL sync");
         @try {
             if ([NSThread isMainThread]) {
@@ -829,12 +987,29 @@ static id kw_sendAuthReq(id self, SEL _cmd, id req, id vc, id delegate, id comp)
     return f ? f(self, _cmd, req, vc, delegate, comp) : nil;
 }
 void KwaiBuiltinInit(void) {
+    // ★ v47.6 修 M14：原来没有一次性守卫。若被调两次（如 dyld 重入），
+    //   method_setImplementation 的返回值会把【自己的 IMP】存进 g_orig_*，
+    //   形成无限递归 → 栈溢出崩溃。
+    static BOOL doneInit = NO;
+    if (doneInit) return;
+    doneInit = YES;
     @autoreleasepool {
         NSString *bid = [NSBundle mainBundle].bundleIdentifier;
         KWLog(@"");
         KWLog(@"##### KwaiWeChatLogin v1.0 #####");
         KWLog(@"bundleId=%@", bid);
-        if (![bid isEqualToString:@"com.jiangjia.gif"]) { KWLog(@"not kwai"); return; }
+        // ★ v48：改为【宽松匹配】。
+        //   注入正版快手时 bid = com.jiangjia.gif；
+        //   若为多开改了 bundle ID（com.jiangjia.gif2 / com.kwai.xxx），也要继续工作。
+        BOOL isKwai = NO;
+        if (bid.length) {
+            NSString *low = bid.lowercaseString;
+            if ([low containsString:@"jiangjia"] || [low containsString:@"kwai"]
+                || [low containsString:@"smile.gifmaker"] || [low containsString:@"kuaishou"]) {
+                isKwai = YES;
+            }
+        }
+        if (!isKwai) { KWLog(@"not kwai (bid=%@), skip", bid); return; }
 
         // ===== 反检测 v4（开机时长 / 环境隐藏 / 镜像过滤 / 进程伪装）=====
         extern void KwaiHideInstall(void);
@@ -1019,20 +1194,30 @@ static unsigned long KwaiContainerSeed(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *home = NSHomeDirectory();
-        // HOME ???? UUID??????
-        // ?: .../Documents/Data/Application/33DDF79A-A61D-.../
-        NSString *uid = home.lastPathComponent;
+        // ★★ v47.8 关键修复：原来用 home.lastPathComponent，但 guest HOME 形如
+        //   .../Data/Application/<GUEST-UUID>/Documents
+        //   → lastPathComponent 【恒为 "Documents"】→ djb2 哈希完全相同
+        //   → 所有容器种子相同 → 电量/存储/电池/时间等全部恒定。
+        //   （同一个坑在 v43 出现过，v44 只修了 LC 层，Tweak 层漏了。）
+        //   正确：取 "/Documents/Data/Application/" 之后的 guest UUID 段。
+        NSString *uid = nil;
+        NSString *marker = @"/Documents/Data/Application/";
+        NSRange r = [home rangeOfString:marker options:NSBackwardsSearch];
+        if (r.location != NSNotFound) {
+            NSString *rest = [home substringFromIndex:r.location + marker.length];
+            uid = [[rest componentsSeparatedByString:@"/"] firstObject];
+        }
+        if (!uid.length) uid = home.lastPathComponent;   // 兜底
         unsigned long h = 5381;
         for (NSUInteger i = 0; i < uid.length; i++) {
             h = ((h << 5) + h) + [uid characterAtIndex:i];
         }
-        // ??? GuestAppId???????? App ?
         NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
         for (NSUInteger i = 0; i < bid.length; i++) {
             h = ((h << 5) + h) + [bid characterAtIndex:i];
         }
         seed = h;
-        KWLog(@"[spoof] container seed: %lu (home=%s)", h, home.UTF8String);
+        KWLog(@"[v47.8] container seed: %lu (uuid=%@ home=%s)", h, uid, home.UTF8String);
     });
     return seed;
 }
@@ -1065,6 +1250,15 @@ static void KwaiSetupSpoof(void) {
         g_fakeMachine = [NSString stringWithUTF8String:envModel];
         strncpy(g_fakeMachineC, envModel, sizeof(g_fakeMachineC)-1);
         strncpy(g_fakeModelC, envModel, sizeof(g_fakeModelC)-1);
+        // ★ v47.8 诊断：把 LC 实际传入的值全部打出来。
+        //   若 model 每容器相同 → 问题在 LC 层种子；
+        //   若 model 每容器不同但下面 seed 相同 → Tweak 层种子（已修）。
+        KWLog(@"[v47.8] LC env: model=%s product=%s board=%s scr=%dx%d@%.2f ncpu=%s mem=%s soc=%s minIOS=%s",
+              envModel, envProduct ? envProduct : "-", envBoard ? envBoard : "-",
+              envScrW ? atoi(envScrW) : 0, envScrH ? atoi(envScrH) : 0,
+              envScale ? atof(envScale) : 0.0,
+              envNCPU ? envNCPU : "-", envMem ? envMem : "-",
+              envSoC ? envSoC : "-", envMinIOS ? envMinIOS : "-");
         if (envProduct) strncpy(g_fakeProductC, envProduct, sizeof(g_fakeProductC)-1);
         if (envBoard)   strncpy(g_fakeBoardC,   envBoard,   sizeof(g_fakeBoardC)-1);
         if (envSerial)  g_fakeSerial = [NSString stringWithUTF8String:envSerial];
@@ -1162,6 +1356,26 @@ static void KwaiSetupSpoof(void) {
     KWLog(@"[spoof] v13 params: soc=0x%X freq=%dMHz scr=%dx%d batt=%dmAh arm64e=%d",
           m->socId, m->freqMHz, m->scrW, m->scrH, m->battery, m->arm64e);
 
+    // ★ v48：脱离 LiveContainer 后，下述三项原本只由 LC 层经 LC_SPOOF_* 注入。
+    //   不补的话 g_fakeMinIOS=0（系统版本文案会落默认）、IDFA 为空（漏真值）、
+    //   设备名为空 —— 都是可被检测的破绽。现在从机型表与种子自生成。
+    g_fakeMinIOS = m->minIOS;                  // 与所伪装机型的最低系统版本一致
+    if (!g_fakeDevName.length) g_fakeDevName = @"iPhone";
+    if (!g_fakeIDFA.length) {
+        // IDFA：与 IDFV 同源但用不同盐，保证同机同容器稳定、不同容器不同
+        unsigned char ab[16];
+        unsigned long as = seed ^ 0x3C3C3C3CUL;
+        for (int i = 0; i < 16; i++) {
+            as = as * 6364136223846793005ULL + 1442695040888963407ULL;
+            ab[i] = (unsigned char)(as >> 33);
+        }
+        ab[6] = (ab[6] & 0x0F) | 0x40;
+        ab[8] = (ab[8] & 0x3F) | 0x80;
+        g_fakeIDFA = [[NSUUID alloc] initWithUUIDBytes:ab].UUIDString;
+    }
+    KWLog(@"[v48] self-gen: minIOS=%d idfa=%@ name=%@",
+          g_fakeMinIOS, g_fakeIDFA, g_fakeDevName);
+
     // ---- 序列号（12位，苹果格式）----
     {
         static const char cs[] = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789";
@@ -1243,30 +1457,82 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
         }
     }
 
+    // ---- ★ v47.5 修复 H2：KERN_PROC（进程列表）过滤 ----
+    //  原实现在 kw_sysctl_proc 里，但它从未 rebind（只赋值 + 打 OK 日志），
+    //  进程列表过滤实际从未运行；且 orig_sysctl_proc = sysctl 取到的是
+    //  【已被 hооk 的 kw_sysctl_mib 地址】，补 rebind 即无限递归。
+    //  改为：逻辑落在唯一入口 kw_sysctl_mib 上。
+    //  只遍历 kinfo_proc.p_comm + 严格等长替换，杜绝越界与跨字段写。
+    if (name && namelen >= 2 && name[0] == 1 && name[1] == 14 /*KERN_PROC*/
+        && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
+        int r = orig_sysctl_mib ? orig_sysctl_mib(name, namelen, oldp, oldlenp, newp, newlen) : -1;
+        if (r == 0) {
+            size_t nproc = *oldlenp / sizeof(struct kinfo_proc);
+            struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
+            const char *bad[]  = {"LiveContainer", "LiveProcess", "TweakLoader",
+                                  "SideStore", NULL};
+            const char *good[] = {"launchd",      "backboardd",   "backboardd",
+                                  "configd",      NULL};
+            int hits = 0;
+            for (size_t k = 0; k < nproc; k++) {
+                char *comm = kp[k].kp_proc.p_comm;   // MAXCOMLEN=16
+                for (int i = 0; bad[i]; i++) {
+                    size_t bl = strlen(bad[i]);
+                    if (bl != strlen(good[i])) continue;   // 只做等长替换
+                    if (bl >= MAXCOMLEN) continue;
+                    if (memcmp(comm, bad[i], bl) == 0) {
+                        memcpy(comm, good[i], bl);
+                        comm[bl] = '\0';
+                        hits++;
+                    }
+                }
+            }
+            static int procLogged = 0;
+            if (procLogged < 3) { procLogged++;
+                KWLog(@"[v47.5] KERN_PROC filtered (%zu procs, %d hits)", nproc, hits); }
+        }
+        return r;
+    }
+
     // ---- v15: KERN_PROCARGS2 环境变量清理 ----
-    if (name && namelen >= 2 && name[0] == 1 && name[1] == 49 && oldp && oldlenp) {
+    // ★ v47.5：① 抹到 '=' 之后，KEY 与 VALUE 一起抹（原来只抹 VALUE，
+    //   残留 "LC_SPOOF_SERIAL=" 这样的键名反而更可疑）；
+    //   ② O(N*M) 双层 memcmp → memmem 一次定位（热路径不再全缓冲扫描）；
+    //   ③ 日志节流，避免 sysctl 高频调用把磁盘打爆。
+    if (name && namelen >= 2 && name[0] == 1 && name[1] == 49 /*KERN_PROCARGS2*/
+        && oldp && oldlenp) {
+        // ★ v35: "LC_SPOOF_" 前缀匹配，一次覆盖 22 个变量
+        const char *bad[] = {
+            "LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
+            "JB_ROOT", "DOPAMINE", "SUBSTRATE",
+            "LC_SPOOF_",
+            "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER",
+            NULL
+        };
         int r = orig_sysctl_mib ? orig_sysctl_mib(name, namelen, oldp, oldlenp, newp, newlen) : -1;
         if (r == 0 && *oldlenp > 0) {
             char *p = (char *)oldp;
             size_t len = *oldlenp;
-            const char *bad[] = {
-                "LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
-                "JB_ROOT", "DOPAMINE", "SUBSTRATE",
-                // ★ v35: 前缀匹配，一次覆盖 22 个 LC_SPOOF_* 变量
-                //   快手读 KERN_PROCARGS2 就能看到 LC_SPOOF_SERIAL=... → 暴露伪装环境
-                "LC_SPOOF_",
-                "LC_APP_GROUP_PATH", "LC_SELECTED_CONTAINER",
-                NULL
-            };
+            int hits = 0;
             for (int i = 0; bad[i]; i++) {
                 size_t bl = strlen(bad[i]);
-                for (size_t j = 0; j + bl <= len; j++) {
-                    if (memcmp(p + j, bad[i], bl) == 0) {
-                        memset(p + j, 0x20, bl);
-                    }
+                size_t off = 0;
+                while (off < len) {
+                    const char *hit = (const char *)memmem(p + off, len - off, bad[i], bl);
+                    if (!hit) break;
+                    size_t at = (size_t)(hit - p);
+                    const char *eq = (const char *)memchr(p + at, '=', len - at);
+                    size_t segEnd = eq ? (size_t)(eq - p) : (at + bl);
+                    const char *nul = (const char *)memchr(p + segEnd, '\0', len - segEnd);
+                    size_t stop = nul ? (size_t)(nul - p) : len;
+                    if (stop > at) memset(p + at, 0x20, stop - at);
+                    hits++;
+                    off = stop + 1;
                 }
             }
-            KWLog(@"[v15] procargs sanitized (len=%zu)", len);
+            static int sanLogged = 0;
+            if (sanLogged < 5) { sanLogged++;
+                KWLog(@"[v47.5] procargs sanitized (len=%zu, hits=%d)", len, hits); }
         }
         return r;
     }
@@ -1277,7 +1543,9 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 // ---- ⑤ UIDevice.model ----
 static NSString *(*orig_dev_model)(id, SEL) = NULL;
 static NSString *kw_dev_model(id self, SEL _cmd) {
-    return @"iPhone";   // 通用值，避免暴露具体型号
+    // ★ v47.6 修 M2：原来硬编码 @"iPhone"，与 hw.machine / LC_SPOOF_MODEL 不一致。
+    if (g_fakeMachineC[0]) return [NSString stringWithUTF8String:g_fakeMachineC];
+    return @"iPhone";
 }
 
 // ---- ⑥ NSProcessInfo.physicalMemory ----
@@ -1319,7 +1587,11 @@ static int kw_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
         return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     }
 
-    if (strcmp(name, "hw.machine") == 0 || strcmp(name, "hw.model") == 0) {
+    // ★ v47.6 修 M1：真机语义是 hw.machine = "iPhone14,2"（机型标识符），
+    //   hw.model = 内部代号 "D73AP"，hw.product = "iPhone14,2"。
+    //   原实现把 hw.model 也返回机型标识符，且 hw.product 返回营销名 ——
+    //   两者对调且都不对，交叉比对 sysctlbyname("hw.model") 与 uname().machine 即露。
+    if (strcmp(name, "hw.machine") == 0) {
         size_t need = strlen(g_fakeMachineC) + 1;
         if (*oldlenp >= need) {
             memcpy(oldp, g_fakeMachineC, need);
@@ -1328,9 +1600,17 @@ static int kw_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
         }
     }
     if (strcmp(name, "hw.product") == 0) {
-        if (g_fakeProductC[0]) {
-            size_t need = strlen(g_fakeProductC) + 1;
-            if (*oldlenp >= need) { memcpy(oldp, g_fakeProductC, need); *oldlenp = need; return 0; }
+        if (g_fakeMachineC[0]) {
+            size_t need = strlen(g_fakeMachineC) + 1;
+            if (*oldlenp >= need) { memcpy(oldp, g_fakeMachineC, need); *oldlenp = need; return 0; }
+        }
+    }
+    if (strcmp(name, "hw.model") == 0) {
+        // 返回主板代号（真机语义），无代号时退回 hw.target 的板子 ID
+        const char *board = g_fakeBoardC[0] ? g_fakeBoardC : g_fakeProductC;
+        if (board[0]) {
+            size_t need = strlen(board) + 1;
+            if (*oldlenp >= need) { memcpy(oldp, board, need); *oldlenp = need; return 0; }
         }
     }
     if (strcmp(name, "hw.target") == 0) {
@@ -2470,21 +2750,30 @@ static int kw_sysctlbyname_time(const char *name, void *oldp, size_t *oldlenp,
 }
 
 // mach_absolute_time
+// ★ v47.6 修 M16：原实现 `(r > d) ? r - d : r` 用的是【减法】，方向与
+//   kern.boottime（往前推 → uptime 变大）相反，同一秒内多个值互相矛盾。
+//   正确口径：mach_absolute_time 也应【加】偏移。
+//   tick 换算：秒 → tick = s * 1e9 * denom / numer。
+//   同时 dispatch_once 取代 tb.denom==0 的非线程安全惰性初始化。
 static uint64_t (*orig_mach_abs_time)(void) = NULL;
 static uint64_t kw_mach_abs_time(void) {
     uint64_t r = orig_mach_abs_time ? orig_mach_abs_time() : 0;
     if (g_timeOffset <= 0) return r;
-    static mach_timebase_info_data_t tb = {0,0};
-    if (tb.denom == 0) mach_timebase_info(&tb);
-    uint64_t d = (uint64_t)((long double)g_timeOffset * 1e9L * tb.denom / tb.numer);
-    return (r > d) ? (r - d) : r;
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t tbOnce;
+    dispatch_once(&tbOnce, ^{ mach_timebase_info(&tb); });
+    if (tb.numer == 0) return r;
+    uint64_t d = (uint64_t)((long double)g_timeOffset * 1e9L
+                            * (long double)tb.denom / (long double)tb.numer);
+    return r + d;
 }
 
 // NSProcessInfo.systemUptime
 static NSTimeInterval (*orig_sys_uptime)(id, SEL) = NULL;
 static NSTimeInterval kw_sys_uptime(id self, SEL _cmd) {
     NSTimeInterval up = orig_sys_uptime ? orig_sys_uptime(self, _cmd) : 0;
-    return (up > g_timeOffset) ? (up - g_timeOffset) : up;
+    // ★ 与 kern.boottime 同源同向：boottime 往前推 ⇒ uptime 变大
+    return up + (NSTimeInterval)g_timeOffset;
 }
 
 // --- ② 屏幕 / 电池 / 设备名 hook ---
@@ -2506,6 +2795,27 @@ static CGFloat kw_screen_scale(id self, SEL _cmd) {
         if ([sc isEqual:[UIScreen mainScreen]]) return g_fakeScale;
     }
     return orig_screen_scale ? orig_screen_scale(self, _cmd) : 3.0;
+}
+
+// ★ v47.6 修 M3：此前只伪装 bounds/scale，nativeBounds/nativeScale 未伪装，
+//   快手用 nativeBounds.size / scale 反推机型 → 逻辑分辨率与像素密度矛盾。
+static CGRect (*orig_screen_nativeBounds)(id, SEL) = NULL;
+static CGRect kw_screen_nativeBounds(id self, SEL _cmd) {
+    if (g_fakeScrW > 0 && g_fakeScrH > 0 && g_fakeScale > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]])
+            return CGRectMake(0, 0, g_fakeScrW * g_fakeScale, g_fakeScrH * g_fakeScale);
+    }
+    return orig_screen_nativeBounds ? orig_screen_nativeBounds(self, _cmd) : CGRectZero;
+}
+
+static CGFloat (*orig_screen_nativeScale)(id, SEL) = NULL;
+static CGFloat kw_screen_nativeScale(id self, SEL _cmd) {
+    if (g_fakeScale > 0) {
+        UIScreen *sc = (UIScreen *)self;
+        if ([sc isEqual:[UIScreen mainScreen]]) return g_fakeScale;
+    }
+    return orig_screen_nativeScale ? orig_screen_nativeScale(self, _cmd) : 2.0;
 }
 
 // UIDevice.name
@@ -2580,6 +2890,16 @@ void KwaiInstallTimeSpoof(void) {
               method_setImplementation(m4, (IMP)kw_screen_scale);
               KWLog(@"[screen] scale OK"); }
 
+    // ★ v47.6 补 nativeBounds / nativeScale
+    Method m3b = class_getInstanceMethod([UIScreen class], @selector(nativeBounds));
+    if (m3b) { orig_screen_nativeBounds = (void *)method_getImplementation(m3b);
+               method_setImplementation(m3b, (IMP)kw_screen_nativeBounds);
+               KWLog(@"[v47.6] nativeBounds OK"); }
+    Method m4b = class_getInstanceMethod([UIScreen class], @selector(nativeScale));
+    if (m4b) { orig_screen_nativeScale = (void *)method_getImplementation(m4b);
+               method_setImplementation(m4b, (IMP)kw_screen_nativeScale);
+               KWLog(@"[v47.6] nativeScale OK"); }
+
     // UIDevice
     Method m5 = class_getInstanceMethod([UIDevice class], @selector(name));
     if (m5) { orig_dev_name = (void *)method_getImplementation(m5);
@@ -2649,17 +2969,26 @@ static int (*orig_statfs_d)(const char *, struct statfs *) = NULL;
 static int kw_statfs_d(const char *path, struct statfs *buf) {
     int r = orig_statfs_d ? orig_statfs_d(path, buf) : -1;
     if (r == 0 && buf && g_fakeDiskTotal > 0) {
-        // 判断是否根卷/数据卷
-        if (path && (strcmp(path, "/") == 0 ||
-                     strncmp(path, "/private/var", 12) == 0 ||
-                     strncmp(path, "/var", 4) == 0 ||
-                     strstr(path, "/Containers") ||
-                     strstr(path, "/Data/Application"))) {
-            uint32_t bsize = buf->f_bsize;
-            if (bsize == 0) bsize = 4096;
+        // ★ v47.6 修 M2：strncmp(path,"/var",4) 会误命中 /variant、/var-tmp
+        BOOL dataVol = NO;
+        if (path) {
+            if (strcmp(path, "/") == 0) dataVol = YES;
+            else if (strncmp(path, "/private/var/", 13) == 0) dataVol = YES;
+            else if (strncmp(path, "/var/", 5) == 0) dataVol = YES;
+            else if (strstr(path, "/private/var/mobile/Containers/Data/Application")) dataVol = YES;
+        }
+        if (dataVol) {
+            // ★ 修 M11：补 2% 保留块（真机 bavail < bfree）与 inode 数，
+            //   否则风控用 f_files 或 bavail==bfree 即可判定非真机文件系统。
+            //   注意：Darwin 的 struct statfs 既没有 f_bused 也没有 f_frsize 字段。
+            uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
             buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
             buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
-            buf->f_bavail = buf->f_bfree;
+            uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
+            buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
+            uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 128.0 / 64.0);
+            buf->f_files = inodes;
+            buf->f_ffree = (uint64_t)((double)inodes * 0.88);
         }
     }
     return r;
@@ -2907,13 +3236,17 @@ static void HSet(NSString *k, NSString *v){
 static long long g_bootOffset = 0;
 
 static void setupBootOffset(void) {
-    NSString *saved = HGet(@"boot_offset");
-    if (saved.length) { g_bootOffset = saved.longLongValue; }
-    else {
+    // ★ v47.6 修 M16：g_bootOffset 与 g_timeOffset 原是两个独立随机值，
+    //   却都作用于 kern.boottime —— 同一属性两个答案，风控取 min/max 即判异常。
+    //   改为复用 g_timeOffset（单一真相源）。g_timeOffset 为 0 时才兜底随机。
+    if (g_timeOffset > 0) {
+        g_bootOffset = g_timeOffset;
+    } else if (!HGet(@"boot_offset").length) {
         long long days = arc4random_uniform(90) + 1;
-        long long secs = days * 24LL * 3600LL + arc4random_uniform(86400);
-        g_bootOffset = secs;
+        g_bootOffset = days * 24LL * 3600LL + arc4random_uniform(86400);
         HSet(@"boot_offset", [NSString stringWithFormat:@"%lld", g_bootOffset]);
+    } else {
+        g_bootOffset = [HGet(@"boot_offset") longLongValue];
     }
     KWLog(@"[hide] boot offset=%llds (%.1fd)", g_bootOffset, g_bootOffset/86400.0);
 }
@@ -3311,6 +3644,14 @@ static BOOL JIsJailbreakPath(const char *path) {
 }
 
 // ---------- ① stat / lstat ----------
+// ★ v47：跨容器隔离（定义在文件后部，这里前置声明）
+static BOOL kw_isCrossContainerPath(const char *path);
+static void KwaiInitContainerRoot(void);
+// ★ v47.7：容器根变量同样定义在文件后部，此处前置声明供自检使用
+static NSString *g_myContainerRoot = nil;
+static NSString *g_myGuestUUID = nil;
+static NSString *g_lcHostRoot = nil;
+
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
 
@@ -3320,6 +3661,8 @@ static int kw_stat(const char *p, struct stat *buf) {
 }
 static int kw_lstat(const char *p, struct stat *buf) {
     if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    // ★ v47.7：补隔离（原只判越狱路径）
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
     return orig_lstat ? orig_lstat(p, buf) : -1;
 }
 
@@ -3327,6 +3670,7 @@ static int kw_lstat(const char *p, struct stat *buf) {
 static int (*orig_access)(const char *, int) = NULL;
 static int kw_access(const char *p, int mode) {
     if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
     return orig_access ? orig_access(p, mode) : -1;
 }
 
@@ -3334,12 +3678,39 @@ static int kw_access(const char *p, int mode) {
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
 static FILE *kw_fopen(const char *p, const char *mode) {
     if (JIsJailbreakPath(p)) { errno = ENOENT; return NULL; }
+    // ★ v47.7：补隔离（原只判越狱路径）
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return NULL; }
     return orig_fopen ? orig_fopen(p, mode) : NULL;
 }
 
-// ★ v46：跨容器隔离（定义在文件后部，这里前置声明）
-static BOOL kw_isCrossContainerPath(const char *path);
-static void KwaiInitContainerRoot(void);
+// ★ v47：跨容器隔离（定义在文件后部，这里前置声明）
+// ---------- ③-b open / openat（v47.7 新增）----------
+//   ★ 此前 opendir 被拦但 open 没拦 —— 目录列不出，文件却能按已知路径直读，
+//   隔离形同虚设。这是最关键的缺口。
+static int (*orig_open)(const char *, int, ...) = NULL;
+static int (*orig_openat)(int, const char *, int, ...) = NULL;
+
+static int kw_open(const char *p, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {                 // ★ Darwin 无 O_TMPFILE
+        va_list ap; va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    if (JIsJailbreakPath(p) || kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    return orig_open ? orig_open(p, flags, mode) : -1;
+}
+
+static int kw_openat(int dirfd, const char *p, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    if (JIsJailbreakPath(p) || kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    return orig_openat ? orig_openat(dirfd, p, flags, mode) : -1;
+}
 
 // ---------- ④ opendir ----------
 static DIR *(*orig_opendir)(const char *) = NULL;
@@ -3350,10 +3721,10 @@ static DIR *kw_opendir(const char *p) {
     return orig_opendir ? orig_opendir(p) : NULL;
 }
 
-// ---------- ⑤ statfs ----------
+// ---------- ⑤ statfs（v47.7 补隔离）----------
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
 static int kw_statfs(const char *p, struct statfs *buf) {
-    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (JIsJailbreakPath(p) || kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
     return orig_statfs ? orig_statfs(p, buf) : -1;
 }
 
@@ -3394,6 +3765,88 @@ void KwaiJailbreakInstall(void) {
 
     orig_statfs = statfs;
     JRebind("statfs", (void *)statfs, (void *)kw_statfs, (void **)&orig_statfs);
+
+    // ★ v47.7：补 open / openat —— 这是隔离的最大缺口。
+    //   此前 opendir 被拦但 open 没拦，目录列不出、文件却能按已知路径直读。
+    orig_open = open;
+    JRebind("open", (void *)open, (void *)kw_open, (void **)&orig_open);
+
+    orig_openat = openat;
+    JRebind("openat", (void *)openat, (void *)kw_openat, (void **)&orig_openat);
+
+    // ★ v47.7 自检：纯字符串判定，构造路径字符串直接问判定函数。
+    //   ⚠️ 绝不能用 contentsOfDirectoryAtPath: —— 它会走我们自己 hook 的 opendir，
+    //      造成递归 → 崩溃（v47.3 就是这么闪退的）。
+    {
+        NSString *mine = g_myGuestUUID;
+        if (mine.length) {
+            NSString *base = g_lcHostRoot;
+            NSString *sibRoot = [NSString stringWithFormat:
+                @"%@/Documents/Data/Application/DEADBEEF-0000-0000-0000-000000000000", base];
+            NSString *sibDoc  = [sibRoot stringByAppendingPathComponent:@"Documents"];
+            NSString *selfRoot = [NSString stringWithFormat:
+                @"%@/Documents/Data/Application/%@", base, mine];
+            NSString *selfLib  = [selfRoot stringByAppendingPathComponent:@"Library"];
+            NSString *selfDoc  = [selfRoot stringByAppendingPathComponent:@"Documents"];
+            NSString *lcTmp    = [base stringByAppendingPathComponent:@"tmp"];
+            NSString *lcLib    = [base stringByAppendingPathComponent:@"Library"];
+            BOOL bSib  = kw_isCrossContainerPath(sibRoot.fileSystemRepresentation);
+            BOOL bSibD = kw_isCrossContainerPath(sibDoc.fileSystemRepresentation);
+            BOOL aSelf = !kw_isCrossContainerPath(selfRoot.fileSystemRepresentation);
+            BOOL aSelfL= !kw_isCrossContainerPath(selfLib.fileSystemRepresentation);
+            BOOL aSelfD= !kw_isCrossContainerPath(selfDoc.fileSystemRepresentation);
+            BOOL aTmp  = !kw_isCrossContainerPath(lcTmp.fileSystemRepresentation);
+            BOOL aLcLib= !kw_isCrossContainerPath(lcLib.fileSystemRepresentation);
+            BOOL aUsr  = !kw_isCrossContainerPath("/usr/lib/dylib");
+            BOOL aDev  = !kw_isCrossContainerPath("/dev/null");
+            // ★ 真实兄弟：用 orig_opendir 读目录，绕开自己的 hook（不触发递归）
+            NSString *realSib = nil;
+            NSString *appDir = [NSString stringWithFormat:@"%@/Documents/Data/Application", base];
+            if (orig_opendir) {
+                DIR *d = orig_opendir(appDir.fileSystemRepresentation);
+                if (d) {
+                    struct dirent *ent;
+                    while ((ent = readdir(d))) {
+                        if (ent->d_name[0] == '.') continue;
+                        if ([@(ent->d_name) isEqualToString:mine]) continue;
+                        realSib = [appDir stringByAppendingPathComponent:
+                                   [NSString stringWithUTF8String:ent->d_name]];
+                        break;
+                    }
+                    closedir(d);
+                }
+            }
+            BOOL bReal = realSib
+                ? kw_isCrossContainerPath(realSib.fileSystemRepresentation) : NO;
+            // ★ v47.7.2：同时测 /private/var 形态 —— NSHomeDirectory 返回 /var/...，
+            //   而 App 传给 open/statfs 的常是 /private/var/...，同 inode 不同前缀。
+            //   v47.7.1 就是栽在这里（realSib=0，隔离形同虚设）。
+            NSString *sibPriv = [sibRoot stringByReplacingOccurrencesOfString:@"/var/"
+                                                          withString:@"/private/var/"];
+            NSString *selfPriv = [selfRoot stringByReplacingOccurrencesOfString:@"/var/"
+                                                           withString:@"/private/var/"];
+            NSString *tmpPriv = [lcTmp stringByReplacingOccurrencesOfString:@"/var/"
+                                                        withString:@"/private/var/"];
+            BOOL bSibP  = kw_isCrossContainerPath(sibPriv.fileSystemRepresentation);
+            BOOL aSelfP = !kw_isCrossContainerPath(selfPriv.fileSystemRepresentation);
+            BOOL aTmpP  = !kw_isCrossContainerPath(tmpPriv.fileSystemRepresentation);
+            NSString *realSibP = realSib
+                ? [realSib stringByReplacingOccurrencesOfString:@"/var/" withString:@"/private/var/"] : nil;
+            BOOL bRealP = realSibP
+                ? kw_isCrossContainerPath(realSibP.fileSystemRepresentation) : NO;
+            KWLog(@"[v47.7] iso self-test: sib=%d sibDoc=%d selfOK=%d selfLibOK=%d selfDocOK=%d lcTmpOK=%d lcLibOK=%d usrOK=%d devOK=%d realSib=%d(%.8s)",
+                  bSib, bSibD, aSelf, aSelfL, aSelfD, aTmp, aLcLib, aUsr, aDev,
+                  bReal, realSib ? [realSib.lastPathComponent UTF8String] : "none");
+            KWLog(@"[v47.7] iso self-test(/private): sib=%d selfOK=%d lcTmpOK=%d realSib=%d(%.8s)",
+                  bSibP, aSelfP, aTmpP, bRealP,
+                  realSibP ? [realSibP.lastPathComponent UTF8String] : "none");
+            if (!bSib || !bSibD || !aSelf || !aSelfL || !aSelfD || !aTmp || !aLcLib
+                || !aUsr || !aDev || !bReal || !bSibP || !aSelfP || !aTmpP || !bRealP)
+                KWLog(@"[v47.7] *** ISOLATION SELF-TEST FAILED ***");
+        } else {
+            KWLog(@"[v47.7] *** guest UUID unknown, isolation NOT active ***");
+        }
+    }
 
     KWJbLog(@"=== jailbreak bypass done ===");
 }
@@ -4356,19 +4809,30 @@ void KwaiInstallHistorySpoof(void) {
 static char g_fakeKernelVersion[128] = {0};
 static char g_fakeMacAddr[32] = {0};
 
+// ★ v47.6 修 M4：osversion / osrelease / darwin / kernel 串此前各写各的。
+//   g_fakeMinIOS=15 时 darwin=21.4.0 但 osversion 却是 16.6 的 20G75 → 自相矛盾。
+//   统一查表，所有位置共用同一真相源。
+typedef struct { int minIOS; const char *build; const char *osrel; const char *darwin; const char *xnu; } LCVers;
+static const LCVers kLcVers[] = {
+    {15, "19G82",   "19.6.0", "21.4.0", "xnu-8792.81.2~2"},
+    {16, "20G75",   "20.6.0", "22.6.0", "xnu-8792.81.2~2"},
+    {17, "21C62",   "21.6.0", "23.6.0", "xnu-10063.121.6~2"},
+    {18, "22A3354", "24.0.0", "24.0.0", "xnu-11215.81.2~2"},
+};
+static const LCVers *kw_lcVers(void) {
+    int ios = g_fakeMinIOS > 0 ? g_fakeMinIOS : 16;
+    for (size_t i = 0; i < sizeof(kLcVers)/sizeof(kLcVers[0]); i++) {
+        if (kLcVers[i].minIOS == ios) return &kLcVers[i];
+    }
+    return &kLcVers[1];   // 默认 iOS 16
+}
+
 void KwaiSetupKernelSpoof(void) {
     if (g_fakeKernelVersion[0]) return;
-    // 内核版本与 iOS 版本匹配
-    // iOS 15.4 -> Darwin 21.4.0 / iOS 16.6 -> 22.6.0 / iOS 17.x -> 23.x
-    int ios = g_fakeMinIOS > 0 ? g_fakeMinIOS : 16;
-    const char *darwin = "22.6.0";
-    if (ios <= 15) darwin = "21.4.0";
-    else if (ios == 16) darwin = "22.6.0";
-    else if (ios == 17) darwin = "23.0.0";
-    else if (ios >= 18) darwin = "24.0.0";
+    const LCVers *v = kw_lcVers();
     snprintf(g_fakeKernelVersion, sizeof(g_fakeKernelVersion),
-             "Darwin Kernel Version %s: Mon Jan  1 00:00:00 PST 2024; root:xnu-8792.81.2~2/RELEASE_ARM64_T8103",
-             darwin);
+             "Darwin Kernel Version %s: Mon Jan  1 00:00:00 PST 2024; root:%s/RELEASE_ARM64_T8103",
+             v->darwin, v->xnu);
 
     // MAC 地址（与机型匹配的真实 OUI）
     unsigned long seed = KwaiContainerSeed();
@@ -4377,7 +4841,7 @@ void KwaiSetupKernelSpoof(void) {
     const char *oui = ouis[seed % 5];
     snprintf(g_fakeMacAddr, sizeof(g_fakeMacAddr), "%s:%02lX:%02lX:%02lX",
              oui, (seed >> 8) & 0xFF, (seed >> 16) & 0xFF, (seed >> 24) & 0xFF);
-    KWLog(@"[net] fake MAC=%s kernel=%s", g_fakeMacAddr, darwin);
+    KWLog(@"[net] fake MAC=%s kernel=%s", g_fakeMacAddr, g_fakeKernelVersion);
 }
 
 // ---------- ① MAC 地址 / 接口信息 ----------
@@ -4403,7 +4867,10 @@ static int kw_getifaddrs(struct ifaddrs **ifap) {
         if (sscanf(g_fakeMacAddr, "%x:%x:%x:%x:%x:%x", &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) == 6) {
             struct ifaddrs *cur = *ifap;
             while (cur) {
-                if (cur->ifa_addr && cur->ifa_addr->sa_family == 18 /* AF_LINK */) {
+                // ★ v47.6 修 M12：原实现给【所有】AF_LINK 接口写同一 MAC，
+                //   utun0-3（隧道）与 en0 同 MAC 本身就是破绽。只改 en0。
+                if (cur->ifa_addr && cur->ifa_addr->sa_family == 18 /* AF_LINK */
+                    && cur->ifa_name && strcmp(cur->ifa_name, "en0") == 0) {
                     struct sockaddr_dl_fake *dl = (struct sockaddr_dl_fake *)cur->ifa_addr;
                     if (dl->sdl_alen == 6) {
                         char *addr = dl->sdl_data + dl->sdl_nlen;
@@ -4425,7 +4892,7 @@ static int kw_sysctlbyname_k(const char *name, void *oldp, size_t *oldlenp,
     if (name && oldp && oldlenp && g_fakeKernelVersion[0]) {
         if (strcmp(name, "kern.osversion") == 0) {
             // iOS 版本号（如 16F62）
-            const char *v = "20G75";
+            const char *v = kw_lcVers()->build;   // ★ v47.6：与 darwin/kernel 同源
             size_t n = strlen(v) + 1;
             if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
         }
@@ -4438,34 +4905,13 @@ static int kw_sysctlbyname_k(const char *name, void *oldp, size_t *oldlenp,
 }
 
 // ---------- ③ 进程列表（过滤 LC 相关）----------
-static int (*orig_sysctl_proc)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static int kw_sysctl_proc(int *name, u_int namelen, void *oldp, size_t *oldlenp,
-                           void *newp, size_t newlen) {
-    int r = orig_sysctl_proc ? orig_sysctl_proc(name, namelen, oldp, oldlenp, newp, newlen) : -1;
-    // CTL_KERN=1, KERN_PROC=14 / KERN_PROC_ALL=0
-    if (r == 0 && name && namelen >= 2 && name[0] == 1 && name[1] == 14) {
-        // 改名可疑进程（原地替换，不改大小）
-        if (oldp && oldlenp) {
-            char *p = (char *)oldp;
-            size_t len = *oldlenp;
-            // 查找并替换 LC 相关进程名
-            const char *bad[] = {"LiveContainer", "LiveProcess", "TweakLoader",
-                                 "SideStore", "sshd", "frida", NULL};
-            const char *good[] = {"launchd", "SpringBoard", "backboardd",
-                                  "configd", "wifid", "sh", NULL};
-            for (int i = 0; bad[i]; i++) {
-                size_t bl = strlen(bad[i]);
-                for (size_t j = 0; j + bl < len; j++) {
-                    if (memcmp(p + j, bad[i], bl) == 0) {
-                        // 替换
-                        memcpy(p + j, good[i], bl);
-                    }
-                }
-            }
-        }
-    }
-    return r;
-}
+// ★ v47.5 修复 H2：此函数【已删除】。三个致命问题：
+//   ① 从未 rebind —— 只赋值 orig_sysctl_proc 就打了 "proc list OK" 日志，
+//      进程列表过滤实际从未运行；
+//   ② orig_sysctl_proc = sysctl 取到的是【已被 hооk 的 kw_sysctl_mib 地址】
+//      （KwaiInstallSpoof 先执行），将来补 rebind 立刻无限递归；
+//   ③ memcpy(p+j, good[i], strlen(bad[i])) 长度不匹配 → 越界读字面量。
+//   逻辑已并入 kw_sysctl_mib 的 KERN_PROC 分支（唯一入口，orig 正确）。
 
 // ---------- ④ GPU 信息（与假机型匹配）----------
 // Metal 的 GPU 名字由系统给，真实机型匹配
@@ -4508,11 +4954,8 @@ void KwaiInstallTrueParamSpoof(void) {
         KWLog(@"[net] kernel version OK");
     } @catch (NSException *e) { KWLog(@"[net] kernel ex: %@", e); }
 
-    // ③ 进程列表
-    orig_sysctl_proc = sysctl;
-    @try {
-        KWLog(@"[net] proc list OK");
-    } @catch (NSException *e) { KWLog(@"[net] proc ex: %@", e); }
+    // ③ 进程列表：★ v47.5 起并入 kw_sysctl_mib，不再在此重复 rebind sysctl
+    KWLog(@"[net] KERN_PROC filter active via kw_sysctl_mib");
 
     KWLog(@"[net] all done");
 }
@@ -4630,7 +5073,7 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
             if (*oldlenp >= n) { memcpy(oldp, g_fakeKernelVersion, n); *oldlenp = n; return 0; }
         }
         if (strcmp(name, "kern.osversion") == 0) {
-            const char *v = "20G75"; size_t n = strlen(v)+1;
+            const char *v = kw_lcVers()->build; size_t n = strlen(v)+1;
             if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
         }
     }
@@ -4668,7 +5111,7 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
         if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
     }
     if (strcmp(name, "kern.osrelease") == 0) {
-        const char *v = "22.6.0"; size_t n = strlen(v)+1;
+        const char *v = kw_lcVers()->osrel; size_t n = strlen(v)+1;
         if (*oldlenp >= n) { memcpy(oldp, v, n); *oldlenp = n; return 0; }
     }
     if (strcmp(name, "kern.hostname") == 0) {
@@ -4839,14 +5282,12 @@ static BOOL kw_isLCFeaturePath(const char *path) {
 //  kw_isLCFeaturePath 只拦 LC 特征文件，拦不住这种普通路径遍历，
 //  所以必须单独判定：路径若解析到自己容器之外 -> 拒绝。
 
-static NSString *g_myContainerRoot = nil;   // 形如 .../Data/Application/<我的UUID>
+static NSString *g_myContainerRoot_unused_placeholder_removed = nil;
 
 static void KwaiInitContainerRoot(void) {
     if (g_myContainerRoot) return;
     NSString *home = NSHomeDirectory();
     if (!home.length) return;
-    // guest HOME = .../Data/Application/<LCUUID>/Documents/Data/Application/<GUESTUUID>/Documents
-    // 取 .../Data/Application/<GUESTUUID> 这一段
     NSString *marker = @"/Documents/Data/Application/";
     NSRange r = [home rangeOfString:marker options:NSBackwardsSearch];
     if (r.location == NSNotFound) {
@@ -4857,43 +5298,136 @@ static void KwaiInitContainerRoot(void) {
     NSString *rest = [home substringFromIndex:start];
     NSString *uuid = [[rest componentsSeparatedByString:@"/"] firstObject];
     if (!uuid.length) return;
-    NSString *appDir = [home substringToIndex:start + uuid.length];
-    g_myContainerRoot = appDir;
+    g_myContainerRoot = [home substringToIndex:start + uuid.length];
+    g_myGuestUUID = uuid;
+    // ★ v47.7：同时记录 LC 宿主容器根 —— guest 的 tmp 是指向它的 symlink，
+    //   微信 SDK 授权回调要经由它取临时文件，必须放行（v47 误杀它导致授权失败）。
+    g_lcHostRoot = [home substringToIndex:r.location];
     KWLog(@"[iso] my container root: %@", g_myContainerRoot);
+    KWLog(@"[iso] LC host root: %@", g_lcHostRoot);
 }
 
-// 判断 path 是否越出自己容器（兄弟容器 / LC 宿主容器 / 上级目录）
+// ★ v47.7 系统路径白名单：不在容器根下但属正常系统访问，必须放行
+static BOOL kw_isSystemPath(const char *path) {
+    static const char *const ok[] = {
+        "/usr/", "/System/", "/bin/", "/sbin/", "/dev/", "/tmp/", "/cores/",
+        "/private/var/db/", "/private/var/diagnostics/", "/private/var/preferences/",
+        "/private/etc/", "/var/db/", "/var/diagnostics/",
+        NULL
+    };
+    for (int i = 0; ok[i]; i++) {
+        if (strncmp(path, ok[i], strlen(ok[i])) == 0) return YES;
+    }
+    if (strcmp(path, "/") == 0) return YES;
+    return NO;
+}
+
+// ★ v47.7 判断 path 是否指向【兄弟 guest 容器】
+//   正确语义（v47 教训）：只拦 Data/Application/ 下除自己以外的 UUID；
+//   LC 宿主容器根及其 tmp/Library 必须放行，否则微信授权断链。
+//   用纯字符串判定，不做任何真实目录 IO —— 避免触发自身 opendir hook 导致崩溃。
 static BOOL kw_isCrossContainerPath(const char *path) {
     if (!path) return NO;
-    if (path[0] != 47) return NO;                    // 相对路径交由沙盒处理
-    if (!g_myContainerRoot.length) return NO;         // 未初始化则不拦，避免误伤
-    const char *root = g_myContainerRoot.UTF8String;
-    // 快路径：直接以自己容器根开头
-    if (strncmp(path, root, strlen(root)) == 0) return NO;
+    if (path[0] != 47) {
+        // 相对路径：含 ".." 一律拒绝（沙盒不阻止 .. 穿越）
+        return strstr(path, "..") != NULL;
+    }
+    if (!g_myContainerRoot.length || !g_lcHostRoot.length) return NO;  // 未初始化不拦
 
-    // 归一化：解析 ".." / "." / 重复斜杠，再与容器根比对
+    const char *root = g_myContainerRoot.UTF8String;
+    size_t rl = strlen(root);
+    // 快路径：自己容器根（带边界检查，防 <UUID>_x / <UUID>.tmp 混淆）
+    if (strncmp(path, root, rl) == 0) {
+        if (path[rl] == 0 || path[rl] == 47) return NO;
+    }
+    // ★ v47.7.1 LC 宿主容器白名单【收窄】
+    //   v47.7 首次实现时把整个 LC 宿主根放行，结果它的子目录
+    //   <LC根>/Documents/Data/Application/<兄弟UUID>/... 也被一起放行 —— 
+    //   而兄弟容器就在这里！实测 sib=0，隔离形同虚设（自检已抓到）。
+    //   正确做法：只放行 LC 宿主【自己】的 tmp / Library / SystemData，
+    //   其余（尤其 Documents/Data/Application/ 下的所有 guest）都必须继续判定。
+    const char *host = g_lcHostRoot.UTF8String;
+    size_t hl = strlen(host);
+    if (strncmp(path, host, hl) == 0 && (path[hl] == 0 || path[hl] == 47)) {
+        return NO;                      // 宿主根本身
+    }
+    if (strncmp(path, host, hl) == 0 && path[hl] == 47) {
+        const char *rest = path + hl + 1;   // 相对宿主的首段
+        // ★ 只放行宿主自身的这几个目录；Documents 目录不整体放行，
+        //   因为 Documents/Data/Application/ 下就是全部 guest 容器。
+        if (strncmp(rest, "tmp", 3) == 0
+            && (rest[3] == 0 || rest[3] == 47)) return NO;
+        if (strncmp(rest, "Library", 7) == 0
+            && (rest[7] == 0 || rest[7] == 47)) return NO;
+        if (strncmp(rest, "SystemData", 10) == 0
+            && (rest[10] == 0 || rest[10] == 47)) return NO;
+    }
+    // 系统路径白名单
+    if (kw_isSystemPath(path)) return NO;
+
+    // 归一化：解析 ".." / "." / 重复斜杠（★ 补回前导 "/"，否则永远不匹配）
     char stack[1024];
     size_t sl = 0;
+    stack[sl++] = '/';
     const char *seg = path;
-    while (*seg == 47) seg++;                        // 跳过前导 "/"
+    while (*seg == 47) seg++;
     while (*seg) {
         const char *e = strchr(seg, 47);
         size_t len = e ? (size_t)(e - seg) : strlen(seg);
         const char *next = e ? e + 1 : seg + len;
-        if (len == 0 || (len == 1 && seg[0] == 46)) { seg = next; continue; }
-        if (len == 2 && seg[0] == 46 && seg[1] == 46) {
-            while (sl > 0 && stack[sl-1] != 47) sl--;
-            if (sl > 0) sl--;
+        if (len == 0 || (len == 1 && seg[0] == 46)) { seg = next; continue; }        if (len == 2 && seg[0] == 46 && seg[1] == 46) {
+            while (sl > 1 && stack[sl-1] != 47) sl--;
+            if (sl > 1) sl--;
             seg = next; continue;
         }
-        if (sl > 0 && stack[sl-1] != 47) stack[sl++] = 47;
-        if (sl + len >= sizeof(stack)) { seg = next; continue; }   // 超长放行，不误伤
+        if (sl > 1 && stack[sl-1] != 47) stack[sl++] = 47;
+        if (sl + len >= sizeof(stack)) { seg = next; continue; }   // 超长放行
         memcpy(stack + sl, seg, len);
         sl += len;
         seg = next;
     }
     stack[sl] = 0;
-    if (strncmp(stack, root, strlen(root)) == 0) return NO;
+
+    // ★ v47.7.2 关键修复：/private/var 与 /var 是【同一目录】(同 inode，设备实测确认)。
+    //   NSHomeDirectory() 返回 "/var/mobile/..."，但 App 传给 open/statfs 的
+    //   往往是 "/private/var/mobile/..." —— 前缀对不上 → 宿主白名单与
+    //   兄弟判定全部落空（实测 realSib=0，隔离形同虚设）。
+    //   统一剥掉 /private 前缀再比对。
+    const char *sp = stack;
+    if (strncmp(sp, "/private/", 9) == 0) sp += 8;      // "/private/var" → "/var"
+    const char *rp = root, *hp = host;
+    if (strncmp(rp, "/private/", 9) == 0) rp += 8;
+    if (strncmp(hp, "/private/", 9) == 0) hp += 8;
+    size_t rpl = strlen(rp), hpl = strlen(hp);
+
+    // 剥 /private 后重新做自己容器 / 宿主判定
+    if (strncmp(sp, rp, rpl) == 0 && (sp[rpl] == 0 || sp[rpl] == 47)) return NO;
+    if (strncmp(sp, hp, hpl) == 0 && (sp[hpl] == 0 || sp[hpl] == 47)) return NO;
+    if (strncmp(sp, hp, hpl) == 0 && sp[hpl] == 47) {
+        const char *rest = sp + hpl + 1;
+        if (strncmp(rest, "tmp", 3) == 0 && (rest[3] == 0 || rest[3] == 47)) return NO;
+        if (strncmp(rest, "Library", 7) == 0 && (rest[7] == 0 || rest[7] == 47)) return NO;
+        if (strncmp(rest, "SystemData", 10) == 0 && (rest[10] == 0 || rest[10] == 47)) return NO;
+    }
+
+    // ★ 只拦：路径里出现 Data/Application/<其他UUID>
+    const char *marker = "/Documents/Data/Application/";
+    const char *hit = NULL;
+    for (const char *p = strstr(sp, marker); p; p = strstr(p + 1, marker))
+        hit = p;                      // 取最深的一个
+    if (!hit) return NO;              // 不在 guest 目录结构内 → 放行
+    hit += strlen(marker);
+    if (!*hit) return NO;
+
+    char seg2[128];
+    size_t n = 0;
+    while (n + 1 < sizeof(seg2) && hit[n] && hit[n] != 47) { seg2[n] = hit[n]; n++; }
+    seg2[n] = 0;
+    if (n == 0) return NO;
+    // 等于自己 → 放行；其余 UUID → 兄弟容器，拦
+    const char *mine = g_myGuestUUID.UTF8String;
+    if (mine && strcmp(mine, seg2) == 0) return NO;
+    KWLog(@"[iso] blocked sibling: %.40s", seg2);
     return YES;
 }
 
@@ -5058,34 +5592,11 @@ static void *kw_dlopen_v15(const char *path, int mode) {
 // 用静态 set 缓存已判断的指针
 
 // ---------- ④ sysctl KERN_PROCARGS2 拦截（环境变量读取）----------
-static int (*orig_sysctl_args)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static int kw_sysctl_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
-                           void *newp, size_t newlen) {
-    // CTL_KERN=1, KERN_PROCARGS2=49
-    if (name && namelen >= 2 && name[0] == 1 && name[1] == 49) {
-        // 让原函数填充，然后清理其中的敏感变量
-        int r = orig_sysctl_args ? orig_sysctl_args(name, namelen, oldp, oldlenp, newp, newlen) : -1;
-        if (r == 0 && oldp && oldlenp && *oldlenp > 0) {
-            char *p = (char *)oldp;
-            size_t len = *oldlenp;
-            // 清理敏感字符串
-            const char *bad[] = {"LC_GLOBAL_TWEAKS", "LC_DATA_UUID", "DYLD_INSERT_LIBRARIES",
-                                 "LC_DATA_UUID", "JB_ROOT", "DOPAMINE", NULL};
-            const char *good[] = {"", "", "", "", "", "", NULL};
-            for (int i = 0; bad[i]; i++) {
-                size_t bl = strlen(bad[i]);
-                for (size_t j = 0; j + bl < len; j++) {
-                    if (memcmp(p + j, bad[i], bl) == 0) {
-                        // 用空格覆盖（保持长度不变，避免破坏结构）
-                        memset(p + j, ' ', bl);
-                    }
-                }
-            }
-        }
-        return r;
-    }
-    return orig_sysctl_args ? orig_sysctl_args(name, namelen, oldp, oldlenp, newp, newlen) : -1;
-}
+// ★ v47.5 修复 H2：此函数【已删除】，原因同 kw_sysctl_proc：
+//   从未 rebind（只赋值 + 打日志），且 orig_sysctl_args = sysctl 取的是
+//   已被 hооk 的 kw_sysctl_mib 地址，补 rebind 即无限递归。
+//   逻辑已并入 kw_sysctl_mib 的 KERN_PROCARGS2 分支（含 KEY=VALUE 整段抹除
+//   与 memmem 优化），该入口在 KwaiInstallSpoof 中确实 rebind 成功。
 
 // ---------- 安装 ----------
 void KwaiInstallEnvHide(void) {
@@ -5099,10 +5610,7 @@ void KwaiInstallEnvHide(void) {
     // ② procargs 清理（需在 sysctl hook 之后）
     void *sym = dlsym(RTLD_DEFAULT, "sysctl");
     if (sym) {
-        orig_sysctl_args = (int (*)(int *, u_int, void *, size_t *, void *, size_t))sym;
-        @try {
-            KWLog(@"[v15] sysctl KERN_PROCARGS2 OK");
-        } @catch (NSException *e) { KWLog(@"[v15] ex: %@", e); }
+        KWLog(@"[v47.5] procargs filter active via kw_sysctl_mib");
     }
 
 
@@ -5168,20 +5676,46 @@ static kern_return_t kw_task_info_v19(task_name_t target_task, task_flavor_t fla
 }
 
 // ---------- ③ csops（签名校验）----------
+// ★ v47.5 修复 H8：原代码 *flags &= ~0x10000000 想清 CS_DEBUGGED，
+//   但 CS_DEBUGGED 的真实值是 0x00100000，0x10000000 是保留位 ——
+//   清它毫无意义，「被调试」这一位从未被清掉，检测器读 csops 仍看到 debugged。
+//   同时补齐 CS_HARD / CS_SIGNED / CS_RUNTIME，否则风控看组合位会判非官方签名。
+//   sys/codesign.h 在本 SDK 不存在，直接定义并加 SDK 兜底。
+#ifndef CS_DEBUGGED
+#define CS_DEBUGGED  0x00100000
+#endif
+#ifndef CS_RUNTIME
+#define CS_RUNTIME   0x00010000
+#endif
+#ifndef CS_SIGNED
+#define CS_SIGNED    0x00000002
+#endif
+#ifndef CS_VALID
+#define CS_VALID     0x00000001
+#endif
+#ifndef CS_HARD
+#define CS_HARD      0x00000100
+#endif
+
 typedef int (*csops_fn)(pid_t, unsigned int, void *, size_t);
 static csops_fn orig_csops = NULL;
 
 static int kw_csops(pid_t pid, unsigned int ops, void *addr, size_t size) {
     int r = orig_csops ? orig_csops(pid, ops, addr, size) : -1;
-    if (r == 0 && addr && size >= sizeof(uint32_t)) {
+    if (addr && size >= sizeof(uint32_t) && ops == 0) {
         uint32_t *flags = (uint32_t *)addr;
-        // CS_OPS_STATUS = 0 → 返回 flags
-        if (ops == 0) {
-            // 确保「已签名 + 无调试」位
-            // CS_VALID = 0x1, CS_HARD = 0x100, CS_KILL = 0x200
-            *flags |= 0x1;              // CS_VALID
-            *flags &= ~0x10000000;      // 清除 CS_DEBUGGED
-            KWLog(@"[v19] csops status -> 0x%X", *flags);
+        if (r == 0) {
+            *flags &= ~((uint32_t)CS_DEBUGGED);          // ★ 真正的 CS_DEBUGGED
+            *flags |= ((uint32_t)CS_VALID) | ((uint32_t)CS_HARD)
+                    | ((uint32_t)CS_SIGNED) | ((uint32_t)CS_RUNTIME);
+            static int logged = 0;
+            if (logged < 3) { logged++; KWLog(@"[v47.5] csops status -> 0x%X", *flags); }
+        } else {
+            // 原函数失败也要修正，不能放行真值
+            *flags &= ~((uint32_t)CS_DEBUGGED);
+            *flags |= ((uint32_t)CS_VALID) | ((uint32_t)CS_HARD)
+                    | ((uint32_t)CS_SIGNED) | ((uint32_t)CS_RUNTIME);
+            return 0;
         }
     }
     return r;
@@ -5193,10 +5727,13 @@ static csops_audit_fn orig_csops_audit = NULL;
 
 static int kw_csops_audit(pid_t pid, unsigned int ops, void *addr, size_t size, audit_token_t *token) {
     int r = orig_csops_audit ? orig_csops_audit(pid, ops, addr, size, token) : -1;
-    if (r == 0 && addr && size >= sizeof(uint32_t) && ops == 0) {
+    if (addr && size >= sizeof(uint32_t) && ops == 0) {
         uint32_t *flags = (uint32_t *)addr;
-        *flags |= 0x1;              // CS_VALID
-        *flags &= ~0x10000000;      // 清除 CS_DEBUGGED
+        // ★ v47.5 同 H8：修正 CS_DEBUGGED 常量并补齐签名位
+        *flags &= ~((uint32_t)CS_DEBUGGED);
+        *flags |= ((uint32_t)CS_VALID) | ((uint32_t)CS_HARD)
+                | ((uint32_t)CS_SIGNED) | ((uint32_t)CS_RUNTIME);
+        if (r != 0) return 0;
     }
     return r;
 }
