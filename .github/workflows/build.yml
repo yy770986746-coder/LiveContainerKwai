@@ -257,6 +257,10 @@ jobs:
           xcrun --sdk iphoneos nm -gU KwaiFiveOnly.dylib | grep -iE 'Deliver|OrderVC|sendReq|canOpenURL|ShowOrderList|HTTPGet' || echo "(clean)"
           echo "=== five-params symbols must be PRESENT ==="
           xcrun --sdk iphoneos nm -gU KwaiFiveOnly.dylib | grep -iE 'FiveParams|FiveString|FiveBall|FivePanel' || echo "(MISSING!)"
+          echo "=== ad-hoc sign (iOS refuses to dlopen unsigned dylib) ==="
+          codesign --force --sign - KwaiFiveOnly.dylib
+          codesign -dv KwaiFiveOnly.dylib 2>&1 | head -5 || true
+          otool -l KwaiFiveOnly.dylib | grep -c LC_CODE_SIGNATURE || true
           echo "=== __mod_init_func must exist (needed by dyld to run constructor) ==="
           otool -l KwaiFiveOnly.dylib | grep -A3 -E '__mod_init_func|__init_offsets' || echo "(neither found)"
           echo "=== code signature ==="
