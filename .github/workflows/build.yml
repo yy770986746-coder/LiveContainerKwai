@@ -207,3 +207,57 @@ jobs:
           name: KwaiFiveParams-dylib
           path: KwaiFiveParams.dylib
           retention-days: 30
+
+  # ============================================================
+  #  v48c: KwaiFiveOnly — authorization stripped, five-params kept
+  # ============================================================
+  build-fiveonly:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          for X in Xcode_16.4.app Xcode_16.3.app Xcode_16.2.app Xcode_16.1.app Xcode.app; do
+            if [ -d "/Applications/$X" ]; then
+              sudo xcode-select -s "/Applications/$X"
+              if xcodebuild -showsdks 2>/dev/null | grep -q iphoneos; then
+                echo "USING: $X"; break
+              fi
+            fi
+          done
+          xcodebuild -version
+
+      - name: Build KwaiFiveOnly dylib
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -target arm64-apple-ios14.0 -isysroot "$SDK" \
+            -I TweakLoader -I litehook/src -I litehook/external/include \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -framework Security -framework LocalAuthentication \
+            -framework UniformTypeIdentifiers -framework UserNotifications \
+            -dynamiclib -install_name @executable_path/Frameworks/KwaiFiveOnly.dylib \
+            -Wl,-undefined,dynamic_lookup -fobjc-arc -O2 \
+            -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
+            -o KwaiFiveOnly.dylib \
+            TweakLoader/KwaiFiveOnlyEntry.m \
+            TweakLoader/KwaiFiveOnly.m \
+            TweakLoader/litehook.c
+          echo "=== built ==="
+          ls -l KwaiFiveOnly.dylib
+          xcrun --sdk iphoneos lipo -info KwaiFiveOnly.dylib || true
+          echo "=== auth symbols must be ABSENT (expect none) ==="
+          xcrun --sdk iphoneos nm -gU KwaiFiveOnly.dylib | grep -iE 'Deliver|OrderVC|sendReq|canOpenURL|ShowOrderList|HTTPGet' || echo "(clean)"
+          echo "=== five-params symbols must be PRESENT ==="
+          xcrun --sdk iphoneos nm -gU KwaiFiveOnly.dylib | grep -iE 'FiveParams|FiveString|FiveBall|FivePanel' || echo "(MISSING!)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KwaiFiveOnly-dylib
+          path: KwaiFiveOnly.dylib
+          retention-days: 30
