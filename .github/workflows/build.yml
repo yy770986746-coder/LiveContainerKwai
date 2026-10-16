@@ -137,6 +137,7 @@ jobs:
             -framework Foundation -framework UIKit -framework CoreFoundation \
             -framework Security -framework LocalAuthentication \
             -framework UniformTypeIdentifiers -framework UserNotifications \
+            -Wl,-no_fixup_chains \
             -dynamiclib -install_name @executable_path/Frameworks/KwaiTweak.dylib \
             -Wl,-undefined,dynamic_lookup -fobjc-arc -O2 \
             -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
@@ -241,6 +242,7 @@ jobs:
             -framework Foundation -framework UIKit -framework CoreFoundation \
             -framework Security -framework LocalAuthentication \
             -framework UniformTypeIdentifiers -framework UserNotifications \
+            -Wl,-no_fixup_chains \
             -dynamiclib -install_name @executable_path/Frameworks/KwaiFiveOnly.dylib \
             -Wl,-undefined,dynamic_lookup -fobjc-arc -O2 \
             -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
@@ -255,6 +257,10 @@ jobs:
           xcrun --sdk iphoneos nm -gU KwaiFiveOnly.dylib | grep -iE 'Deliver|OrderVC|sendReq|canOpenURL|ShowOrderList|HTTPGet' || echo "(clean)"
           echo "=== five-params symbols must be PRESENT ==="
           xcrun --sdk iphoneos nm -gU KwaiFiveOnly.dylib | grep -iE 'FiveParams|FiveString|FiveBall|FivePanel' || echo "(MISSING!)"
+          echo "=== __mod_init_func must exist (needed by dyld to run constructor) ==="
+          otool -l KwaiFiveOnly.dylib | grep -A3 -E '__mod_init_func|__init_offsets' || echo "(neither found)"
+          echo "=== code signature ==="
+          codesign -dv KwaiFiveOnly.dylib 2>&1 | head -3 || true
 
       - uses: actions/upload-artifact@v4
         with:
