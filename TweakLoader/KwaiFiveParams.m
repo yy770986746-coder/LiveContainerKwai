@@ -23,6 +23,8 @@
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #include <sys/time.h>
+#include <os/lock.h>        // os_unfair_lock（FPLog 线程安全）
+#include <unistd.h>         // getpid
 
 // ============================================================
 //  日志（自带，不依赖 KwaiBuiltin 的 KWLog）
