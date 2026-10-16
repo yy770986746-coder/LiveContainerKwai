@@ -160,6 +160,12 @@ static void KWLog(NSString *fmt, ...) {
 //    - 悬浮球 UI
 // ============================================================
 
+// Forward declarations: defined later in this file but called from init.
+// (KwaiInstallSpoof / KwaiInstallFiveParams were accidentally removed
+//  together with the authorization block -> undeclared-function error.)
+static void KwaiInstallSpoof(void);
+static void KwaiInstallFiveParams(void);
+
 void KwaiBuiltinInit(void) {
     // ★ v47.6 修 M14：原来没有一次性守卫。若被调两次（如 dyld 重入），
     //   method_setImplementation 的返回值会把【自己的 IMP】存进 g_orig_*，
