@@ -25,13 +25,8 @@ typedef uint32_t SecCSFlags;
 #include <dlfcn.h>
 #import "litehook.h"
 
-static NSString * const kDefApi   = @"http://121.229.205.215:9092";
-static NSString * const kApiV2Base = @"http://cnc.cn1001.top/openapi/cl-service/partner/v1";
-static NSString * const kEryueApi  = @"https://www.eryueop.com/api.php";
-static NSString * const kQQGameId  = @"100228415";   // 快手普通版
-// 缓存的 QQ 授权 URL（避免每次请求 eryueop）
-static NSString * const kQQUrlCache = @"tencent100228415://qzapp/mqzone/0?objectlocation=url&pasteboard=YnBsaXN0MDBieWJpcGxpc3QxLjDUAQIDBAUGBwhZJGFyY2hpdmVyWCRvYmplY3RzVCR0b3BYJHZlcnNpb25fEA9OU0tleWVkQXJjaGl2ZXKvEBwJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkVSRudWxs0yUmJygpKlYkY2xhc3NXTlMua2V5c1pOUy5vYmplY3RzgBusKywtLi8wMTIzNDU2gAKAA4AEgAWABoAHgAiACYAKgAuADIANrDc4OTo7PD0+P0BBQoAOgA+AEIARgBOAFIAVgBaAF4AYgBmAGlpleHBpcmVzX2luXxASYXBwc2lnbl9idW5kbGVudWxsWmVuY3J5dG9rZW5ccGFzc0RhdGFSZXNwU3JldFZvcGVuaWRScGZedXNlcl9jYW5jZWxsZWRVcGZrZXlZcGF5X3Rva2VuU21zZ1xhY2Nlc3NfdG9rZW4SAHanAFEyXxAgZGQwMmMxMTMwMmUwOWY4NTQwMGI4MzRiYmQzYWMwNGTSJSdDRIASoNJFRkdIWCRjbGFzc2VzWiRjbGFzc25hbWWjSElKV05TQXJyYXlYTlNPYmplY3ReTlNNdXRhYmxlQXJyYXkQAF8QIERDMjMxREVFMEUxRjFFQUVFQTc0ODIzMjRERUEyMkRFXm9wZW5tb2JpbGVfaW9zUk5PXxAgNjVkMGEzMGJlZGJjNzNmNTNkODM3MDE0MWU2MjIwZGZfECA1MUUxRTRGOEExMTM5NUVEN0YwNUE4RkUyMjFGOUM1RVBfECA1MEZGN0ExRDMzQTNDNTU4RjJFQjA5REM4RDEzNDFDONJFRktMo0xNSlxOU0RpY3Rpb25hcnlfEBNOU011dGFibGVEaWN0aW9uYXJ50U5PVHJvb3SAARIAAYagABQAHQAnADAANQA+AFAClAKeAG8AdQDiAO0BAgENARoBHgElASgBNwE9AUcBSwFYAV0BXwGCAYoBxwHJAewB+wH+AiECRAJFAmgAfACDAIsAlgCYAL0ApQCnAKkAqwCtAK8AsQCzALUAtwC5ALsAygDMAM4A0ADSANQA1gDYANoA3ADeAOABhwGJAY8BmAGjAbgBpwGvAm0CfgJxApcCnAAAAAAAAAIBAAAAAAAAAFAAAAAAAAAAAAAAAAAAAAKj";
-static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
+// ★ 已删除授权相关常量（kDefApi / kApiV2Base / kEryueApi / kQQGameId /
+//   kQQUrlCache / kQQLoginKey）—— 它们只被已切除的授权交付代码使用。
 
 // ---------- 前置声明 ----------
 static unsigned long KwaiContainerSeed(void);
