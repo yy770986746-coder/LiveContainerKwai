@@ -157,3 +157,53 @@ jobs:
           name: KwaiTweak-dylib
           path: KwaiTweak.dylib
           retention-days: 30
+
+  # ============================================================
+  #  v48b: standalone five-params extractor dylib (no LC, no litehook)
+  # ============================================================
+  build-five:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          for X in Xcode_16.4.app Xcode_16.3.app Xcode_16.2.app Xcode_16.1.app Xcode.app; do
+            if [ -d "/Applications/$X" ]; then
+              sudo xcode-select -s "/Applications/$X"
+              if xcodebuild -showsdks 2>/dev/null | grep -q iphoneos; then
+                echo "USING: $X"; break
+              fi
+            fi
+          done
+          xcodebuild -version
+
+      - name: Build KwaiFiveParams dylib
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -target arm64-apple-ios14.0 -isysroot "$SDK" \
+            -I TweakLoader \
+            -framework Foundation -framework UIKit -framework Security \
+            -dynamiclib -install_name @executable_path/Frameworks/KwaiFiveParams.dylib \
+            -Wl,-undefined,dynamic_lookup -fobjc-arc -O2 \
+            -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
+            -o KwaiFiveParams.dylib \
+            TweakLoader/KwaiFiveParams.m
+          echo "=== built ==="
+          ls -l KwaiFiveParams.dylib
+          xcrun --sdk iphoneos lipo -info KwaiFiveParams.dylib || true
+          echo "=== non-system dylib deps (should be empty) ==="
+          otool -L KwaiFiveParams.dylib | tail -n +2 | grep -v '/System/Library' || echo "(none = good)"
+          echo "=== key symbols ==="
+          xcrun --sdk iphoneos nm -gU KwaiFiveParams.dylib | grep -iE 'FiveParams|FiveString' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KwaiFiveParams-dylib
+          path: KwaiFiveParams.dylib
+          retention-days: 30
