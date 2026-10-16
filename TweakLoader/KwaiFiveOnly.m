@@ -1498,6 +1498,49 @@ NSString *KwaiGetFiveString(void) {
 @interface KwaiFivePanel : UIWindow
 @end
 
+// ★ v48d 关键修复：iOS 13+ 的 UIWindow 必须绑定 windowScene 才会显示。
+//   原实现在所有 UIWindow 子类里都【没有设置 windowScene】，
+//   导致窗口创建成功、日志也打了 "[ball] shown"，但屏幕上什么都看不到。
+//   （LC 版 TweakLoader.m 里有 window.windowScene = ... 这一行，
+//     说明项目本来知道这个坑，只是 KwaiBuiltin 的悬浮球代码漏了。）
+static void KwaiAttachToActiveScene(UIWindow *w) {
+    if (!w) return;
+    @try {
+        if (@available(iOS 13.0, *)) {
+            if (w.windowScene) return;
+            UIApplication *app = UIApplication.sharedApplication;
+            // 优先：前台活跃的 scene
+            for (UIScene *s in app.connectedScenes) {
+                if (s.activationState == UISceneActivationStateForegroundActive
+                    && [s isKindOfClass:[UIWindowScene class]]) {
+                    w.windowScene = (UIWindowScene *)s;
+                    return;
+                }
+            }
+            // 次选：任意非背景 scene
+            for (UIScene *s in app.connectedScenes) {
+                if (s.activationState != UISceneActivationStateBackground
+                    && [s isKindOfClass:[UIWindowScene class]]) {
+                    w.windowScene = (UIWindowScene *)s;
+                    return;
+                }
+            }
+            // 兜底：任意 scene
+            for (UIScene *s in app.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    w.windowScene = (UIWindowScene *)s;
+                    return;
+                }
+            }
+            // 最后兜底：keyWindow 的 scene
+            UIWindow *kw = app.keyWindow ?: app.windows.firstObject;
+            if (kw && kw.windowScene) w.windowScene = kw.windowScene;
+        }
+    } @catch (NSException *e) {
+        KWLog(@"[ball] attach scene ex: %@", e);
+    }
+}
+
 @implementation KwaiFivePanel {
     NSString *_five;
     UITextView *_tv;
@@ -1516,6 +1559,9 @@ NSString *KwaiGetFiveString(void) {
         self.windowLevel = UIWindowLevelAlert + 200;
         self.backgroundColor = [UIColor clearColor];
         self.rootViewController = [[UIViewController alloc] init];
+        // ★ v48d：必须绑定 windowScene，否则窗口不显示
+        KwaiAttachToActiveScene(self);
+        self.hidden = NO;
 
         UIView *bg = [[UIView alloc] initWithFrame:self.bounds];
         bg.backgroundColor = [UIColor colorWithWhite:0.11 alpha:0.98];
@@ -1622,6 +1668,9 @@ NSString *KwaiGetFiveString(void) {
         self.backgroundColor = [UIColor clearColor];
         self.rootViewController = [[UIViewController alloc] init];
         self.rootViewController.view.backgroundColor = [UIColor clearColor];
+        // ★ v48d：必须绑定 windowScene，否则悬浮球不显示
+        KwaiAttachToActiveScene(self);
+        self.hidden = NO;
 
         _circle = [[UIView alloc] initWithFrame:CGRectMake(0, 0, d, d)];
         _circle.backgroundColor = [UIColor colorWithRed:0.13 green:0.13 blue:0.15 alpha:0.92];
@@ -1677,7 +1726,11 @@ NSString *KwaiGetFiveString(void) {
     static KwaiFivePanel *panel = nil;
     if (panel) { panel.hidden = YES; panel = nil; }
     panel = [[KwaiFivePanel alloc] initWithFive:five];
+    // ★ v48d：面板同样需要 scene 绑定 + 置前，否则窗口存在但不可见
+    KwaiAttachToActiveScene(panel);
     panel.hidden = NO;
+    [panel makeKeyAndVisible];
+    KWLog(@"[ball] panel shown, scene=%@ hidden=%d", NSStringFromClass([panel.windowScene class]), (int)panel.hidden);
 }
 
 @end
@@ -1688,10 +1741,24 @@ static BOOL g_ballShown = NO;
 
 void KwaiShowBall(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_ballShown) return;
+        if (g_ballShown) {
+            // ★ v48d：已创建过则重新绑 scene 并置前（App 启动后 scene 才就绪）
+            if (g_ball) {
+                KwaiAttachToActiveScene(g_ball);
+                g_ball.hidden = NO;
+                [g_ball makeKeyAndVisible];
+                KWLog(@"[ball] re-attached, scene=%@", NSStringFromClass([g_ball.windowScene class]));
+            }
+            return;
+        }
         g_ballShown = YES;
         g_ball = [[KwaiFiveBall alloc] init];
-        KWLog(@"[ball] shown");
+        KwaiAttachToActiveScene(g_ball);
+        g_ball.hidden = NO;
+        [g_ball makeKeyAndVisible];
+        KWLog(@"[ball] shown, scene=%@ hidden=%d frame=%@",
+              NSStringFromClass([g_ball.windowScene class]),
+              (int)g_ball.hidden, NSStringFromCGRect(g_ball.frame));
     });
 }
 
@@ -1706,18 +1773,32 @@ BOOL KwaiIsLoggedIn(void) {
 
 void KwaiStartBallWatcher(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        // ★ v48d：原逻辑是「登录后才显示球」，若判断条件没命中（例如
+        //   Gif_Token 长度判定不符、plist 路径差异），悬浮球永远不出现，
+        //   表现为「插件没生效」。现改为：
+        //     前 60 秒每 0.5s 检查一次登录；一旦登录立即提取并显示；
+        //     若一直未登录，也要把球显示出来（点开时可手动重新提取），
+        //     避免整个功能静默消失。
+        BOOL shown = NO;
         for (int i = 0; i < 120; i++) {
             @autoreleasepool {
                 if (KwaiIsLoggedIn()) {
+                    KWLog(@"[ball] logged in at i=%d, extracting", i);
                     KwaiReadFromCache();
                     KwaiDumpPlist();
                     NSString *five = KwaiGetFiveString();
                     KWLog(@"[ball] logged in, five=%lu chars", (unsigned long)five.length);
                     KwaiShowBall();
+                    shown = YES;
                     break;
                 }
+                if (i == 0) KWLog(@"[ball] waiting for login...");
             }
             usleep(500 * 1000);
+        }
+        if (!shown) {
+            KWLog(@"[ball] not logged in after 60s, showing ball anyway");
+            KwaiShowBall();
         }
     });
 }
