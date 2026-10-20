@@ -34,6 +34,7 @@ static NSString * const kQQUrlCache = @"tencent100228415://qzapp/mqzone/0?object
 static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
 
 // ---------- 前置声明 ----------
+CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val);
 static unsigned long KwaiContainerSeed(void);
 void KwaiInstallTimeSpoof(void);
 void KwaiInstallStorageSpoof(void);
@@ -1723,8 +1724,18 @@ static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, C
             return CFBridgingRetain([g_fakeUUID copy]);
         }
     }
-    if (orig_IORegistryEntryCreateCFProperty)
-        return orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
+    if (orig_IORegistryEntryCreateCFProperty) {
+        // ★ v49.1：接上电池属性伪造（原先 KwaiProcessBatteryProp 定义了却从未被调用，
+        //   导致 CycleCount / MaxCapacity 等全部上报宿主真值 —— 电池伪装完全失效）。
+        //   所有权：原函数返回 +1；KwaiProcessBatteryProp 返回新值（+1）或原值。
+        //   若返回的不是原值，则由这里释放原值，避免泄漏。
+        CFTypeRef v = orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
+        if (v) {
+            CFTypeRef nv = KwaiProcessBatteryProp(key, v);
+            if (nv && nv != v) { CFRelease(v); return nv; }
+        }
+        return v;
+    }
     return NULL;
 }
 
@@ -3177,13 +3188,12 @@ void KwaiSetupBatterySpoof(void) {
 
 // 处理 IOKit 返回的电池属性（在已有的 CreateCFProperty hook 里调用）
 // 返回替换后的值，或原值
-static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
+CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
     if (!key || g_fakeCycleCount <= 0) return val;
 
     CFStringRef k = key;
     // 循环次数
     if (CFStringCompare(k, CFSTR("CycleCount"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
     }
     // ★ v37 修复：三个容量 key 语义必须不同
@@ -3191,33 +3201,27 @@ static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
     //   但我们上报 health = 91% → 自相矛盾
     //   正确：NominalChargeCapacity = 标称（固定），MaxCapacity = 衰减后
     if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
     }
     if (CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
     }
     if (CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
         CFStringCompare(k, CFSTR("AppleCurrentCapacity"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
     }
     // 健康度百分比
     if (CFStringCompare(k, CFSTR("BatteryHealth"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         int h = g_fakeBatteryHealth;
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &h);
     }
     // 电池序列号
     if (CFStringCompare(k, CFSTR("BatterySerialNumber"), 0) == kCFCompareEqualTo ||
         CFStringCompare(k, CFSTR("Serial"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         return (CFTypeRef)CFRetain(g_fakeBatterySerial);
     }
     // 温度（长期使用会稍高）
     if (CFStringCompare(k, CFSTR("Temperature"), 0) == kCFCompareEqualTo) {
-        if (val) CFRelease(val);
         int t = 2900 + (int)(KwaiContainerSeed() % 200);   // 29.00~31.00 ℃
         return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &t);
     }
@@ -5925,38 +5929,56 @@ void KwaiInstallSigBypass(void) {
 // ---------- 判断地址是否属于我们的 dylib ----------
 // 用于 vm_protect / vm_region 的精确处理
 BOOL kw_isOurAddress(vm_address_t addr) {
-    // ★ 线程安全 + 避免递归：只在首次初始化时用 _dyld_* 
     static vm_address_t ourBase = 0;
     static vm_size_t ourSize = 0;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        // ★ v49.1 修复递归死锁（高危）
+        //   本函数原来用 dladdr() 反查镜像路径，但 dladdr 已被本文件 hook 成
+        //   kw_dladdr_wh，而 kw_dladdr_wh 内部又调用 kw_isOurAddress。
+        //   于是形成 dispatch_once 内的递归重入（未定义行为，实测 trap/挂起）。
+        //   现在改用 dlsym 取的【原始 dladdr】，绕开自己的 hook；
+        //   拿不到原始指针时退回 _dyld_get_image_name（该 hook 不回调本函数）。
+        static int (*raw_dladdr)(const void *, Dl_info *) = NULL;
+        if (!raw_dladdr) {
+            raw_dladdr = (int (*)(const void *, Dl_info *))dlsym(RTLD_DEFAULT, "dladdr");
+            if (raw_dladdr && (void *)raw_dladdr == (void *)kw_dladdr_wh) {
+                raw_dladdr = NULL;
+            }
+        }
         int count = _dyld_image_count();
         for (int i = 0; i < count; i++) {
             const struct mach_header *hdr = _dyld_get_image_header(i);
             if (!hdr) continue;
-            // 用 dladdr 反查路径（比 _dyld_get_image_name 安全，不会触发我们的 hook）
+
+            const char *fname = NULL;
             Dl_info info;
             memset(&info, 0, sizeof(info));
-            if (dladdr((const void *)hdr, &info) && info.dli_fname) {
-                if (strstr(info.dli_fname, "TweakLoader") || strstr(info.dli_fname, "KwaiBuiltin")) {
-                    ourBase = (vm_address_t)hdr;
-                    const struct load_command *cmd = (const struct load_command *)((const char *)hdr + sizeof(struct mach_header_64));
-                    for (uint32_t j = 0; j < hdr->ncmds && cmd; j++) {
-                        if (cmd->cmd == LC_SEGMENT_64) {
-                            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
-                            if (strcmp(seg->segname, "__TEXT") == 0) {
-                                ourSize = seg->vmsize;
-                                break;
-                            }
-                        }
-                        cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize);
-                    }
-                    if (ourSize == 0) ourSize = 0x100000;
-                    KWLog(@"[addr] our range: 0x%llx - 0x%llx",
-                          (unsigned long long)ourBase, (unsigned long long)(ourBase + ourSize));
-                    break;
-                }
+            if (raw_dladdr && raw_dladdr((const void *)hdr, &info) && info.dli_fname) {
+                fname = info.dli_fname;
+            } else {
+                fname = _dyld_get_image_name((uint32_t)i);
             }
+            if (!fname) continue;
+            if (!strstr(fname, "TweakLoader") && !strstr(fname, "KwaiBuiltin")) continue;
+
+            ourBase = (vm_address_t)hdr;
+            const struct load_command *cmd = (const struct load_command *)
+                ((const char *)hdr + sizeof(struct mach_header_64));
+            for (uint32_t j = 0; j < hdr->ncmds && cmd; j++) {
+                if (cmd->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                    if (strcmp(seg->segname, "__TEXT") == 0) {
+                        ourSize = (vm_size_t)seg->vmsize;
+                        break;
+                    }
+                }
+                cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize);
+            }
+            if (ourSize == 0) ourSize = 0x100000;
+            KWLog(@"[addr] our range: 0x%llx - 0x%llx",
+                  (unsigned long long)ourBase, (unsigned long long)(ourBase + ourSize));
+            break;
         }
     });
     if (ourBase == 0) return NO;
