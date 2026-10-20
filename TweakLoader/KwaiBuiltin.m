@@ -1713,6 +1713,35 @@ static BOOL g_spoofInstalled = NO;
 
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
 
+// ★ v49.2：判断 entry 是否真的属于电池（AppleSmartBattery）。
+//   背景见下方调用处的注释：v49.1 无差别处理所有 entry，把其它硬件
+//   属性的 "Serial"/"Temperature" 也替换掉了，导致不活号。
+//   实现要点：
+//     1) 用 IOObjectConformsTo 判类名，比字符串比较可靠；
+//     2) 结果按 entry 缓存（entry 是 mach port，同一电池对象稳定），
+//        但用固定小表避免无限增长；entry 释放后端口号可能复用，
+//        所以缓存只用来"记住命中过的"，未命中的每次重算（成本低）。
+__attribute__((unused)) static BOOL kw_isBatteryEntry(io_registry_entry_t entry) {
+    if (!entry) return NO;
+    static io_registry_entry_t hitEntry = 0;
+    static BOOL hitVal = NO;
+    if (entry == hitEntry) return hitVal;
+
+    BOOL isBat = NO;
+    @try {
+        if (IOObjectConformsTo(entry, "AppleSmartBattery")) {
+            isBat = YES;
+        }
+        // 兜底：部分机型/系统走 IOPMPowerSource
+        if (!isBat && IOObjectConformsTo(entry, "IOPMPowerSource")) {
+            isBat = YES;
+        }
+    } @catch (NSException *e) {}
+
+    if (isBat) { hitEntry = entry; hitVal = YES; }
+    return isBat;
+}
+
 static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
                                                      CFAllocatorRef alloc, IOOptionBits opts) {
     if (key) {
@@ -1725,16 +1754,28 @@ static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, C
         }
     }
     if (orig_IORegistryEntryCreateCFProperty) {
-        // ★ v49.1：接上电池属性伪造（原先 KwaiProcessBatteryProp 定义了却从未被调用，
-        //   导致 CycleCount / MaxCapacity 等全部上报宿主真值 —— 电池伪装完全失效）。
-        //   所有权：原函数返回 +1；KwaiProcessBatteryProp 返回新值（+1）或原值。
-        //   若返回的不是原值，则由这里释放原值，避免泄漏。
-        CFTypeRef v = orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
-        if (v) {
-            CFTypeRef nv = KwaiProcessBatteryProp(key, v);
-            if (nv && nv != v) { CFRelease(v); return nv; }
-        }
-        return v;
+        // ★ v49.2 回退决策：不接入电池属性伪造。
+        //
+        //   历史教训（重要，别再改回去）：
+        //     v49   —— KwaiProcessBatteryProp 从未被调用，电池走宿主真值。
+        //               用户实测【活号率很高】。
+        //     v49.1 —— 我把该函数接在此处，想让"电池伪装生效"。
+        //               结果【不活号了】。
+        //
+        //   根因：IORegistryEntryCreateCFProperty 是 IOKit 通用入口，快手用它
+        //   读 WiFi / 蓝牙 / 屏幕 / 基带 等大量非电池属性。而
+        //   KwaiProcessBatteryProp 按 key 名精确匹配，其中
+        //     "Serial"      → 被换成电池序列号
+        //     "Temperature" → 被换成 2900~3100
+        //     "MaxCapacity" / "CycleCount" / "BatteryHealth" ...
+        //   这些 key 名在其它 entry 上也存在 → 快手读到的其它硬件数据被污染
+        //   → 风控判定设备异常 → 不活号。
+        //
+        //   结论：真值电池数据反而是"真实设备"的一部分，伪造它收益为负。
+        //   保持该函数存在（供需要时手动启用），但此处不做全局接入。
+        //   如需启用，必须先经 kw_isBatteryEntry() 限定 entry（该函数已实现），
+        //   且要实机验证活号率不下降。
+        return orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
     }
     return NULL;
 }
@@ -5939,13 +5980,6 @@ BOOL kw_isOurAddress(vm_address_t addr) {
         //   于是形成 dispatch_once 内的递归重入（未定义行为，实测 trap/挂起）。
         //   现在改用 dlsym 取的【原始 dladdr】，绕开自己的 hook；
         //   拿不到原始指针时退回 _dyld_get_image_name（该 hook 不回调本函数）。
-        static int (*raw_dladdr)(const void *, Dl_info *) = NULL;
-        if (!raw_dladdr) {
-            raw_dladdr = (int (*)(const void *, Dl_info *))dlsym(RTLD_DEFAULT, "dladdr");
-            if (raw_dladdr && (void *)raw_dladdr == (void *)kw_dladdr_wh) {
-                raw_dladdr = NULL;
-            }
-        }
         int count = _dyld_image_count();
         for (int i = 0; i < count; i++) {
             const struct mach_header *hdr = _dyld_get_image_header(i);
@@ -5954,7 +5988,7 @@ BOOL kw_isOurAddress(vm_address_t addr) {
             const char *fname = NULL;
             Dl_info info;
             memset(&info, 0, sizeof(info));
-            if (raw_dladdr && raw_dladdr((const void *)hdr, &info) && info.dli_fname) {
+            if (dladdr((const void *)hdr, &info) && info.dli_fname) {
                 fname = info.dli_fname;
             } else {
                 fname = _dyld_get_image_name((uint32_t)i);
