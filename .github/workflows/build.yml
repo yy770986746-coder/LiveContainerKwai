@@ -307,6 +307,7 @@ jobs:
             -framework Foundation -framework UIKit -framework CoreFoundation \
             -framework Security -framework LocalAuthentication \
             -framework UniformTypeIdentifiers -framework UserNotifications \
+            -fmodules -fmodules-cache-path=./modcache \
             -Wl,-no_fixup_chains \
             -dynamiclib -install_name /usr/local/lib/TweakLoader.dylib \
             -Wl,-undefined,dynamic_lookup -fobjc-arc -O2 \
