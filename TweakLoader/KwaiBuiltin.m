@@ -34,7 +34,6 @@ static NSString * const kQQUrlCache = @"tencent100228415://qzapp/mqzone/0?object
 static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
 
 // ---------- 前置声明 ----------
-CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val);
 static unsigned long KwaiContainerSeed(void);
 void KwaiInstallTimeSpoof(void);
 void KwaiInstallStorageSpoof(void);
@@ -1713,34 +1712,6 @@ static BOOL g_spoofInstalled = NO;
 
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
 
-// ★ v49.2：判断 entry 是否真的属于电池（AppleSmartBattery）。
-//   背景见下方调用处的注释：v49.1 无差别处理所有 entry，把其它硬件
-//   属性的 "Serial"/"Temperature" 也替换掉了，导致不活号。
-//   实现要点：
-//     1) 用 IOObjectConformsTo 判类名，比字符串比较可靠；
-//     2) 结果按 entry 缓存（entry 是 mach port，同一电池对象稳定），
-//        但用固定小表避免无限增长；entry 释放后端口号可能复用，
-//        所以缓存只用来"记住命中过的"，未命中的每次重算（成本低）。
-__attribute__((unused)) static BOOL kw_isBatteryEntry(io_registry_entry_t entry) {
-    if (!entry) return NO;
-    static io_registry_entry_t hitEntry = 0;
-    static BOOL hitVal = NO;
-    if (entry == hitEntry) return hitVal;
-
-    BOOL isBat = NO;
-    @try {
-        if (IOObjectConformsTo(entry, "AppleSmartBattery")) {
-            isBat = YES;
-        }
-        // 兜底：部分机型/系统走 IOPMPowerSource
-        if (!isBat && IOObjectConformsTo(entry, "IOPMPowerSource")) {
-            isBat = YES;
-        }
-    } @catch (NSException *e) {}
-
-    if (isBat) { hitEntry = entry; hitVal = YES; }
-    return isBat;
-}
 
 static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
                                                      CFAllocatorRef alloc, IOOptionBits opts) {
@@ -3227,47 +3198,6 @@ void KwaiSetupBatterySpoof(void) {
           g_fakeCycleCount, g_fakeBatteryHealth, g_fakeBatteryCapacity, nominal);
 }
 
-// 处理 IOKit 返回的电池属性（在已有的 CreateCFProperty hook 里调用）
-// 返回替换后的值，或原值
-CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
-    if (!key || g_fakeCycleCount <= 0) return val;
-
-    CFStringRef k = key;
-    // 循环次数
-    if (CFStringCompare(k, CFSTR("CycleCount"), 0) == kCFCompareEqualTo) {
-        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
-    }
-    // ★ v37 修复：三个容量 key 语义必须不同
-    //   原来三个都返回 g_fakeBatteryCapacity → 快手算出 health = 2816/2816 = 100%
-    //   但我们上报 health = 91% → 自相矛盾
-    //   正确：NominalChargeCapacity = 标称（固定），MaxCapacity = 衰减后
-    if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo) {
-        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
-    }
-    if (CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
-        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
-    }
-    if (CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
-        CFStringCompare(k, CFSTR("AppleCurrentCapacity"), 0) == kCFCompareEqualTo) {
-        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
-    }
-    // 健康度百分比
-    if (CFStringCompare(k, CFSTR("BatteryHealth"), 0) == kCFCompareEqualTo) {
-        int h = g_fakeBatteryHealth;
-        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &h);
-    }
-    // 电池序列号
-    if (CFStringCompare(k, CFSTR("BatterySerialNumber"), 0) == kCFCompareEqualTo ||
-        CFStringCompare(k, CFSTR("Serial"), 0) == kCFCompareEqualTo) {
-        return (CFTypeRef)CFRetain(g_fakeBatterySerial);
-    }
-    // 温度（长期使用会稍高）
-    if (CFStringCompare(k, CFSTR("Temperature"), 0) == kCFCompareEqualTo) {
-        int t = 2900 + (int)(KwaiContainerSeed() % 200);   // 29.00~31.00 ℃
-        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &t);
-    }
-    return val;
-}
 
 void KwaiInstallBatterySpoof(void) {
     static BOOL done = NO;
