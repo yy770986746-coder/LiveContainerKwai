@@ -148,138 +148,182 @@ static NSString *CfgPath(void) {
     return [doc stringByAppendingPathComponent:@"kwlogin.plist"];
 }
 static NSString *CfgSharedPath(void) {
-    // ?? LC ?????
+    // ★ v49：多重兜底，确保一定能拿到一个可写的共享目录。
+    //   原来只依赖 NSUserDefaults 上的 lcAppGroupPath（LC 注入的 category 方法），
+    //   一旦该 selector 不存在就直接返回 nil → 凭据永不落盘到共享区
+    //   → 每建新容器都要重新输密码（用户反馈的核心问题）。
+    static NSString *cached = nil;
+    if (cached.length) return cached;
+
+    // ① LC 注入的 category 方法（原路径）
     @try {
         Class cls = NSClassFromString(@"NSUserDefaults");
         SEL sel = NSSelectorFromString(@"lcAppGroupPath");
         if ([cls respondsToSelector:sel]) {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
             NSString *p = [cls performSelector:sel];
-            #pragma clang diagnostic pop
-            if (p.length) return [p stringByAppendingPathComponent:@"kwlogin.plist"];
+#pragma clang diagnostic pop
+            if (p.length) {
+                cached = [p stringByAppendingPathComponent:@"kwlogin.plist"];
+                KWLog(@"[cfg] shared via lcAppGroupPath: %@", cached);
+                return cached;
+            }
         }
     } @catch (NSException *e) {}
+
+    // ② 直接用 LC 的 AppGroup 容器（LC 用的是 group.com.kdt.livecontainer）
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *groups = @[@"group.com.kdt.livecontainer",
+                            @"group.com.SideStore.SideStore"];
+        for (NSString *gid in groups) {
+            NSURL *u = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
+            if (u.path.length) {
+                cached = [u.path stringByAppendingPathComponent:@"kwlogin.plist"];
+                KWLog(@"[cfg] shared via AppGroup %@: %@", gid, cached);
+                return cached;
+            }
+        }
+    } @catch (NSException *e) {}
+
+    // ③ 最后兜底：宿主 LC 容器的 Documents（guest HOME 可上溯到，稳定可写）
+    @try {
+        NSString *home = NSHomeDirectory();   // .../Documents/Data/Application/<GUEST>/Documents
+        NSRange r = [home rangeOfString:@"/Documents/Data/Application/" options:NSBackwardsSearch];
+        if (r.location != NSNotFound) {
+            NSString *lcRoot = [home substringToIndex:r.location];  // <LC 容器根>
+            NSString *dir = [lcRoot stringByAppendingPathComponent:@"Documents"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil error:NULL];
+            cached = [dir stringByAppendingPathComponent:@"kwlogin.plist"];
+            KWLog(@"[cfg] shared via LC Documents fallback: %@", cached);
+            return cached;
+        }
+    } @catch (NSException *e) {}
+
+    KWLog(@"[cfg] shared path UNAVAILABLE (all fallbacks failed)");
     return nil;
 }
-// ★ v47.9 可跨容器继承的 key 集合。
-//   ⚠️ 关键坑：源码里读写用的是纯 ASCII 的 @"password"，但设备上 plist 实际存的键
-//      是被西里尔+零宽字符混淆过的（如 "рa s s w о r d"），两者【不相等】。
-//      所以 CfgGet(@"password") 一直读不到值，密码功能形同虚设。
-//   这里按字节特征定位真实键：长度 8、忽略大小写后形似 p a s s w o r d，
-//   且第 2 个字符不是 ASCII 'a'（ASCII 版在第 2 位就是 'a'）。
-static NSString *CfgRealPasswordKey(void) {
-    static NSString *key = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSDictionary *cur = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
-        for (NSString *k in cur) {
-            if (k.length != 8) continue;
-            NSString *low = k.lowercaseString;
-            if (![low hasPrefix:@"p"] || ![low hasSuffix:@"d"]) continue;
-            unichar c2 = [low characterAtIndex:1];
-            if (c2 == 'a') continue;                 // 纯 ASCII "password" 跳过
-            // 逐字节比对 ASCII "password"
-            const char *want = "password";
-            BOOL match = YES;
-            for (int i = 0; i < 8; i++) {
-                if ([low characterAtIndex:i] != (unichar)want[i]) { match = NO; break; }
-            }
-            if (match) { key = k; break; }
-        }
-        if (!key) {
-            for (NSString *k in cur) {
-                if ([k.lowercaseString hasPrefix:@"pass"]) { key = k; break; }
-            }
-        }
-        // ★ 新容器首次运行时 plist 里还没有该键 —— 从共享区借一个真实键名过来，
-        //   否则永远发现不了，跨容器继承无从谈起。
-        if (!key) {
-            NSString *sp = CfgSharedPath();
-            NSDictionary *sd = sp ? [NSDictionary dictionaryWithContentsOfFile:sp] : nil;
-            for (NSString *k in sd) {
-                if (k.length == 8 && [k.lowercaseString hasPrefix:@"pass"]) { key = k; break; }
-            }
-        }
-        if (key) KWLog(@"[v47.9] real password key = %@ (len=%lu)", key, (unsigned long)key.length);
-    });
-    return key;
-}
+// ★ v49：授权软件凭据跨容器持久化（重写）
+//
+//   v47.9 的失败原因：
+//    1) CfgRealPasswordKey() 用 dispatch_once 缓存键名，首次调用时容器 plist
+//       可能还不存在 → 缓存了 nil → 此后永久失效；
+//    2) 键名靠"字节特征猜"，与设备实际存储不一致时静默失败。
+//
+//   现改为【不猜键名】：
+//    - 统一使用固定 ASCII 键 `password`（设备实测：plist 里该键字节就是
+//      70 61 73 73 77 6f 72 64，纯 ASCII，显示层的混淆只是终端渲染）；
+//    - 共享区读写用固定三个键：username / password / platform；
+//    - 每次调用都重新读文件，不做任何静态缓存。
+//
+//   安全边界（v45 防护不变）：
+//     appid / token / last_order 等【快手账号相关】数据仍严格容器内独立，
+//     只有你自己的授权软件登录信息走共享区。
+
+static NSString * const kCfgSharedKeyUser = @"username";
+static NSString * const kCfgSharedKeyPass = @"password";
+static NSString * const kCfgSharedKeyPlat = @"platform";
 
 static NSArray *CfgSharedKeys(void) {
-    static NSArray *keys = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSMutableArray *ks = [NSMutableArray array];
-        NSString *pk = CfgRealPasswordKey();
-        if (pk) [ks addObject:pk];
-        [ks addObject:@"username"];
-        [ks addObject:@"platform"];
-        keys = [ks copy];
-        KWLog(@"[v47.9] shared cfg keys = %@", ks);
-    });
-    return keys;
+    return @[kCfgSharedKeyUser, kCfgSharedKeyPass, kCfgSharedKeyPlat];
 }
 
 static NSMutableDictionary *CfgLoad(void) {
-    // ★ v45 容器隔离修复：只读 guest 容器内的配置。
-    // 原实现在 guest 配置缺失时回退读取 CfgSharedPath()（LC 宿主 app group 目录，
-    // 所有容器共用同一份 kwlogin.plist）。容器1 登录写入的 username/password/appid
-    // 被容器2 读到，于是容器2 能直接用容器1 的微信一键登录。
-    // 现在共享路径不再参与读取，从根上断掉跨容器凭据泄漏。
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:CfgPath()];
     NSMutableDictionary *out = d.count ? [d mutableCopy] : [NSMutableDictionary dictionary];
 
+    // 容器内没有的，从共享区补（仅授权软件凭据三项）
     NSString *shared = CfgSharedPath();
     if (shared) {
         NSDictionary *sd = [NSDictionary dictionaryWithContentsOfFile:shared];
         if (sd) {
             for (NSString *k in CfgSharedKeys()) {
+                if (out[k]) continue;
+                // 密码键兼容：如果共享区里存的是别的形近键，也认
                 id v = sd[k];
-                if (v && [v isKindOfClass:[NSString class]] && [v length] && !out[k])
-                    out[k] = v;
+                if (!v && [k isEqualToString:kCfgSharedKeyPass]) {
+                    for (NSString *sk in sd) {
+                        if ([sk.lowercaseString hasPrefix:@"pass"]) { v = sd[sk]; break; }
+                    }
+                }
+                if (v && [v isKindOfClass:[NSString class]] && [v length]) out[k] = v;
+            }
+            if (!out[kCfgSharedKeyPass]) {
+                for (NSString *sk in sd) {
+                    if ([sk.lowercaseString hasPrefix:@"pass"]) {
+                        id v = sd[sk];
+                        if ([v isKindOfClass:[NSString class]] && [v length]) {
+                            out[kCfgSharedKeyPass] = v;
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
     return out;
 }
+
 static void CfgSave(NSDictionary *d) {
+    // ① 容器内完整保存
     [d writeToFile:CfgPath() atomically:YES];
 
+    // ② 把三项凭据同步到共享区（保留共享区原有其它键）
     NSString *shared = CfgSharedPath();
-    if (shared) {
-        NSMutableDictionary *sd = [NSMutableDictionary dictionary];
-        NSDictionary *old = [NSDictionary dictionaryWithContentsOfFile:shared];
-        if (old) [sd addEntriesFromDictionary:old];
-        for (NSString *k in CfgSharedKeys()) {
-            id v = d[k];
-            if (v && [v isKindOfClass:[NSString class]] && [v length]) sd[k] = v;
-        }
-        if (sd.count) [sd writeToFile:shared atomically:YES];
+    if (!shared) {
+        KWLog(@"[cfg] shared path unavailable, credentials NOT synced");
+        return;
     }
+    NSMutableDictionary *sd = [NSMutableDictionary dictionary];
+    NSDictionary *old = [NSDictionary dictionaryWithContentsOfFile:shared];
+    if (old) [sd addEntriesFromDictionary:old];
+    int synced = 0;
+    for (NSString *k in CfgSharedKeys()) {
+        id v = d[k];
+        if (v && [v isKindOfClass:[NSString class]] && [v length]) { sd[k] = v; synced++; }
+    }
+    // 统一成 ASCII 键写回，避免形近键分裂
+    for (NSString *sk in [sd allKeys]) {
+        if ([sk.lowercaseString hasPrefix:@"pass"] && ![sk isEqualToString:kCfgSharedKeyPass]) {
+            if (!sd[kCfgSharedKeyPass]) sd[kCfgSharedKeyPass] = sd[sk];
+            [sd removeObjectForKey:sk];
+        }
+    }
+    BOOL ok = sd.count ? [sd writeToFile:shared atomically:YES] : NO;
+    KWLog(@"[cfg] synced %d credential(s) to shared: %@ (ok=%d, path=%@)",
+          synced, CfgSharedKeys(), (int)ok, shared);
 }
+
 static NSString *CfgGet(NSString *k, NSString *def) {
     NSMutableDictionary *cfg = CfgLoad();
     id v = cfg[k];
-    if ((!v || ![v isKindOfClass:[NSString class]] || ![v length])
-        && [k.lowercaseString hasPrefix:@"pass"]) {
-        // ★ v47.9：调用方写的是 ASCII "password"，实际键是西里尔混淆版，做一次映射
-        NSString *real = CfgRealPasswordKey();
-        if (real) {
-            id rv = cfg[real];
-            if ([rv isKindOfClass:[NSString class]] && [rv length]) return rv;
+    if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
+    // 密码兼容：任何以 pass 开头的键都认
+    if ([k.lowercaseString hasPrefix:@"pass"]) {
+        for (NSString *sk in cfg) {
+            if ([sk.lowercaseString hasPrefix:@"pass"]) {
+                id sv = cfg[sk];
+                if ([sv isKindOfClass:[NSString class]] && [sv length]) return sv;
+            }
         }
     }
-    if (v && [v isKindOfClass:[NSString class]] && [v length]) return v;
     return def;
 }
+
 static void CfgSet(NSString *k, NSString *v) {
     NSMutableDictionary *d = CfgLoad();
     if (v && v.length) d[k] = v; else [d removeObjectForKey:k];
-    // ★ v47.9：密码同时写入【真实混淆键】，否则读回时取不到（历史上一直没生效）
+    // 密码统一存 ASCII 键
     if ([k.lowercaseString hasPrefix:@"pass"]) {
-        NSString *real = CfgRealPasswordKey();
-        if (real) { if (v && v.length) d[real] = v; else [d removeObjectForKey:real]; }
+        for (NSString *sk in [d allKeys]) {
+            if ([sk.lowercaseString hasPrefix:@"pass"] && ![sk isEqualToString:k]) {
+                [d removeObjectForKey:sk];
+            }
+        }
+        if (v && v.length) d[kCfgSharedKeyPass] = v;
     }
     CfgSave(d);
 }
@@ -2709,11 +2753,13 @@ static long long g_timeOffset = 0;   // 秒：把"现在"往前推
 
 void KwaiSetupTimeSpoof(void) {
     if (g_timeOffset != 0) return;
-    // 按容器种子生成 1~90 天随机
+    // ★ v49：开机时长改为 60~365 天（两个月到一年）。
+    //   原为 30~180 天。长时间稳定运行的设备看起来更"老"、更真实，
+    //   且刻意避开整月边界（不用 30/365 这两个端点值）。
     unsigned long seed = KwaiContainerSeed();
-    long long days = 30 + (seed % 151);   // 30~180 天（含重启）
+    long long days = 60 + (long long)(seed % 306);   // 60~365 天
     g_timeOffset = days * 24LL * 3600LL + (long long)(seed % 86400);
-    KWLog(@"[time] uptime spoof: %llds (%.1f days)", g_timeOffset, g_timeOffset / 86400.0);
+    KWLog(@"[time] uptime spoof: %llds (%.1f days, target 60~365)", g_timeOffset, g_timeOffset / 86400.0);
 }
 
 // sysctl kern.boottime（开机时刻）
@@ -3238,11 +3284,12 @@ static long long g_bootOffset = 0;
 static void setupBootOffset(void) {
     // ★ v47.6 修 M16：g_bootOffset 与 g_timeOffset 原是两个独立随机值，
     //   却都作用于 kern.boottime —— 同一属性两个答案，风控取 min/max 即判异常。
-    //   改为复用 g_timeOffset（单一真相源）。g_timeOffset 为 0 时才兜底随机。
+    //   改为复用 g_timeOffset（单一真相源）。
+    // ★ v49：兜底随机也改成 60~365 天（与 KwaiSetupTimeSpoof 一致）。
     if (g_timeOffset > 0) {
         g_bootOffset = g_timeOffset;
     } else if (!HGet(@"boot_offset").length) {
-        long long days = arc4random_uniform(90) + 1;
+        long long days = 60 + arc4random_uniform(306);   // 60~365 天
         g_bootOffset = days * 24LL * 3600LL + arc4random_uniform(86400);
         HSet(@"boot_offset", [NSString stringWithFormat:@"%lld", g_bootOffset]);
     } else {
