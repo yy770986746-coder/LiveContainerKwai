@@ -3587,8 +3587,6 @@ void KwaiHideInstall(void) {
     // ① 开机时长（sysctlbyname 是最可靠的入口）
     orig_sysctlbyname3 = sysctlbyname;
 
-    // ② mach_absolute_time
-    orig_mat = mach_absolute_time;
 
     // ③ getenv
     orig_getenv = getenv;
