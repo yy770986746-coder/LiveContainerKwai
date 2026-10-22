@@ -1232,6 +1232,46 @@ static long long g_fakeBootOffset = 0;
 static long long g_fakeDiskTotal = 0;      // 总容量（字节）
 static long long g_fakeDiskFree  = 0;      // 可用容量（字节）
 
+// ★★ v49.3 关键修复：种子位复用导致参数成组重复 ★★
+//
+//   原实现里各参数都直接对 seed 取低位：
+//      机型   = cand[seed % 26]
+//      时长   = 60 + seed % 306
+//      已用%  = 70 + seed % 23
+//      剩余%  = 20 + seed % 26
+//      健康%  = 78 + (seed >> 7) % 15
+//      电量%  = 20 + (seed >> 11) % 66
+//   seed 低位只有 2^N 种取值，于是：
+//      - 机型/已用%/剩余% 全部由 seed 低位决定 → 三者强相关
+//      - 实测 60 个容器：机型只有 23 种 / 已用% 只有 22 种 / 健康% 只有 15 种
+//      - 表现为「每台设备参数看起来都差不多」「有重复的组合」
+//
+//   修法：给每个【参数名】分配独立的混合盐（salt），
+//   用 splitmix64 终混器打散，使各参数互不相关、且分布均匀。
+//   splitmix64 是标准算法，散列质量足够，成本极低（几条位运算）。
+static inline unsigned long KwaiSeedMix(unsigned long seed, unsigned long salt) {
+    unsigned long z = seed + salt * 0x9E3779B97F4A7C15UL + 0x165667B19E3779F9UL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+    z = z ^ (z >> 31);
+    return z;
+}
+
+// 各参数的固定盐值（任意互不相同的常量即可，这里用可读的名字哈希）
+#define KW_SALT_MODEL    0x4D4F44454CUL   // "MODEL"
+#define KW_SALT_TIME     0x54494D45UL     // "TIME"
+#define KW_SALT_DISKUSED 0x44555345UL     // "DUSE"
+#define KW_SALT_DISKFREE 0x44465245UL     // "DFRE"
+#define KW_SALT_CYCLE    0x4359434CUL     // "CYCL"
+#define KW_SALT_HEALTH   0x4845414CUL     // "HEAL"
+#define KW_SALT_LEVEL    0x4C455645UL     // "LEVE"
+#define KW_SALT_BRIGHT   0x42524947UL     // "BRIG"
+#define KW_SALT_APP      0x41505044UL     // "APPD"
+#define KW_SALT_FILES    0x46494C45UL     // "FILE"
+#define KW_SALT_MAC      0x4D414341UL     // "MACA"
+#define KW_SALT_UPGRADE  0x55504752UL     // "UPGR"
+#define KW_SALT_SERIAL   0x53455249UL     // "SERI"
+
 // ??? HOME ?????????????
 static unsigned long KwaiContainerSeed(void) {
     static unsigned long seed = 0;
@@ -1365,7 +1405,33 @@ static void KwaiSetupSpoof(void) {
     }
     KWLog(@"[spoof] candidates=%d", candCount);
 
-    int pick = cand[seed % (unsigned long)candCount];
+    // ★ v49.3：机型池加权。
+    //   原来 26 款等概率，导致「新注册设备抽到 iPhone XS」这种不合理组合。
+    //   真实存量分布：近三代占大头，老机少量。按 minIOS 做档位权重：
+    //       hostMajor - minIOS <= 1  → 权重 4（新机）
+    //       == 2                     → 权重 3
+    //       == 3                     → 权重 2
+    //       >= 4                     → 权重 1（老机）
+    //   用累加权重做加权随机，结果仍由 seed 决定（同一容器恒定）。
+    int pick = 0;
+    {
+        int w[64];
+        int total = 0;
+        for (int i = 0; i < candCount; i++) {
+            int age = hostMajor - kDeviceModels[cand[i]].minIOS;
+            int wt = (age <= 1) ? 4 : (age == 2) ? 3 : (age == 3) ? 2 : 1;
+            w[i] = wt;
+            total += wt;
+        }
+        unsigned long r = KwaiSeedMix(seed, KW_SALT_MODEL) % (unsigned long)(total > 0 ? total : 1);
+        int acc = 0;
+        int idx = candCount - 1;
+        for (int i = 0; i < candCount; i++) {
+            acc += w[i];
+            if (r < (unsigned long)acc) { idx = i; break; }
+        }
+        pick = cand[idx];
+    }
     const KwaiDeviceModel *m = &kDeviceModels[pick];
 
     g_fakeMachine = [NSString stringWithUTF8String:m->machine];
@@ -2780,8 +2846,8 @@ void KwaiSetupTimeSpoof(void) {
     //   原为 30~180 天。长时间稳定运行的设备看起来更"老"、更真实，
     //   且刻意避开整月边界（不用 30/365 这两个端点值）。
     unsigned long seed = KwaiContainerSeed();
-    long long days = 60 + (long long)(seed % 306);   // 60~365 天
-    g_timeOffset = days * 24LL * 3600LL + (long long)(seed % 86400);
+    long long days = 60 + (long long)(KwaiSeedMix(seed, KW_SALT_TIME) % 306);   // 60~365 天
+    g_timeOffset = days * 24LL * 3600LL + (long long)(KwaiSeedMix(seed, KW_SALT_TIME) % 86400);
     KWLog(@"[time] uptime spoof: %llds (%.1f days, target 60~365)", g_timeOffset, g_timeOffset / 86400.0);
 }
 
@@ -3010,7 +3076,7 @@ static long long KwaiDiskTotalForMachine(const char *machine) {
         }
         // 其余（标准版 / mini / SE / XS / XR / 11 系列）→ 128 或 256
         else {
-            tier = (seed & 1) ? 128 : 256;
+            tier = (KwaiSeedMix(seed, KW_SALT_DISKUSED) & 1) ? 128 : 256;
         }
     }
     if (tier == 128) return 127700000000LL;   // ≈127.7GB
@@ -3026,7 +3092,7 @@ void KwaiSetupStorageSpoof(void) {
 
     // ② 再由总容量算可用（长期使用：已用 70%~92%）
     unsigned long seed = KwaiContainerSeed();
-    int usedPct = 70 + (int)(seed % 23);
+    int usedPct = 55 + (int)(KwaiSeedMix(seed, KW_SALT_DISKUSED) % 39);   // 55~93%
     g_fakeDiskFree = g_fakeDiskTotal * (100 - usedPct) / 100;
 
     KWLog(@"[disk] total=%.1fGB free=%.1fGB used=%d%%",
@@ -3180,8 +3246,8 @@ static CFStringRef g_fakeBatterySerial = NULL;
 void KwaiSetupBatterySpoof(void) {
     if (g_fakeCycleCount > 0) return;
     unsigned long seed = KwaiContainerSeed();
-    g_fakeCycleCount = 400 + (int)((seed >> 3) % 501);        // 400~900
-    g_fakeBatteryHealth = 78 + (int)((seed >> 7) % 15);       // 78%~92%
+    g_fakeCycleCount = 120 + (int)(KwaiSeedMix(seed, KW_SALT_CYCLE) % 861);        // 120~980
+    g_fakeBatteryHealth = 72 + (int)(KwaiSeedMix(seed, KW_SALT_HEALTH) % 28);       // 72%~99%
     // ★ v37 修复：三个容量 key 的语义必须不同，否则快手能算出矛盾的健康度
     //   NominalChargeCapacity = 出厂标称（固定，不随健康衰减）
     //   MaxCapacity            = 当前最大容量（衰减后）
@@ -3192,7 +3258,8 @@ void KwaiSetupBatterySpoof(void) {
     g_fakeBatteryCapacity = nominal * g_fakeBatteryHealth / 100;   // 当前容量
     // 电池序列号（假）
     char bs[24];
-    snprintf(bs, sizeof(bs), "%08X%04X", (unsigned)(seed & 0xFFFFFFFF), (unsigned)((seed >> 32) & 0xFFFF));
+    unsigned long bs2 = KwaiSeedMix(seed, KW_SALT_SERIAL);
+    snprintf(bs, sizeof(bs), "%08X%04X", (unsigned)(bs2 & 0xFFFFFFFF), (unsigned)((bs2 >> 32) & 0xFFFF));
     g_fakeBatterySerial = CFStringCreateWithCString(NULL, bs, kCFStringEncodingUTF8);
     KWLog(@"[battery] cycles=%d health=%d%% capacity=%lld/%lld",
           g_fakeCycleCount, g_fakeBatteryHealth, g_fakeBatteryCapacity, nominal);
@@ -4094,7 +4161,7 @@ static int kw_host_stat(host_t host, host_flavor_t flavor, host_info64_t info,
             vm_statistics64_data_t *vs = (vm_statistics64_data_t *)info;
             // 长期使用：可用内存约为总量的 20%~45%
             unsigned long seed = KwaiContainerSeed();
-            long long freePct = 20 + (seed % 26);
+            long long freePct = 12 + (KwaiSeedMix(seed, KW_SALT_DISKFREE) % 41);   // 12~52%
             long long wantFree = g_fakeMemSize * freePct / 100;
             // 通过调整 free_count（页数）实现
             vm_size_t pageSize = 16384;
@@ -4191,11 +4258,11 @@ void KwaiSetupDeepSpoof(void) {
     if (g_fakeBatteryLevel > 0) return;
     unsigned long seed = KwaiContainerSeed();
     // 电量：长期使用常见 20%~85%
-    g_fakeBatteryLevel = 0.20f + (float)((seed >> 11) % 66) / 100.0f;
+    g_fakeBatteryLevel = 0.15f + (float)(KwaiSeedMix(seed, KW_SALT_LEVEL) % 81) / 100.0f;
     // 充电状态：不充电
     g_fakeBatteryState = 1;
     // 亮度：0.3~0.9
-    g_fakeBrightness = 0.30f + (float)((seed >> 17) % 61) / 100.0f;
+    g_fakeBrightness = 0.12f + (float)(KwaiSeedMix(seed, KW_SALT_BRIGHT) % 86) / 100.0f;
     KWLog(@"[deep] battery=%.0f%% state=%d brightness=%.2f",
           g_fakeBatteryLevel * 100, g_fakeBatteryState, g_fakeBrightness);
 }
@@ -4340,7 +4407,7 @@ static float (*orig_outputVolume)(id, SEL) = NULL;
 static float kw_outputVolume(id self, SEL _cmd) {
     // 长期使用：音量 0.3~0.8
     unsigned long seed = KwaiContainerSeed();
-    return 0.30f + (float)((seed >> 23) % 51) / 100.0f;
+    return 0.12f + (float)(KwaiSeedMix(seed, KW_SALT_BRIGHT) % 86) / 100.0f;
 }
 
 // ---------- ⑦ IDFA 完整 ----------
@@ -4592,13 +4659,13 @@ void KwaiSetupDataSpoof(void) {
     if (g_fakeAppDataSize > 0) return;
     unsigned long seed = KwaiContainerSeed();
     // 长期使用：数据 300MB~2.5GB
-    g_fakeAppDataSize = (long long)(300000000LL + (seed % 2200000000ULL));
+    g_fakeAppDataSize = (long long)(200000000LL + (KwaiSeedMix(seed, KW_SALT_APP) % 4800000000ULL));
     // 缓存：数据的 30%~70%
-    g_fakeCacheSize = g_fakeAppDataSize * (30 + (seed >> 5) % 41) / 100;
+    g_fakeCacheSize = g_fakeAppDataSize * (30 + (int)(KwaiSeedMix(seed, KW_SALT_APP) % 41)) / 100;
     // 文件数：800~6000
-    g_fakeFileCount = 800 + (int)((seed >> 9) % 5201);
+    g_fakeFileCount = 300 + (int)(KwaiSeedMix(seed, KW_SALT_FILES) % 9701);
     // 首次安装：30~400 天前
-    double daysAgo = 30 + ((seed >> 13) % 371);
+    double daysAgo = 30 + (double)(KwaiSeedMix(seed, KW_SALT_FILES) % 371);
     g_fakeInstallTime = [[NSDate date] timeIntervalSince1970] - daysAgo * 86400;
     KWLog(@"[data] size=%.1fMB cache=%.1fMB files=%d installAgo=%.0fd",
           g_fakeAppDataSize/1e6, g_fakeCacheSize/1e6, g_fakeFileCount, daysAgo);
@@ -4644,7 +4711,7 @@ void KwaiCreateUsageTraces(void) {
 
     unsigned long seed = KwaiContainerSeed();
     NSArray *exts = @[@"dat", @"db", @"bin", @"tmp", @"cache", @"json", @"log"];
-    int fileCount = 12 + (int)(seed % 25);   // 12~37 个文件
+    int fileCount = 12 + (int)(KwaiSeedMix(seed, KW_SALT_FILES) % 25);   // 12~37 个文件
 
     for (int i = 0; i < fileCount; i++) {
         unsigned long s = seed + i * 7919;
@@ -4755,7 +4822,7 @@ void KwaiFakeVersionHistory(void) {
     unsigned long seed = KwaiContainerSeed();
 
     // 模拟从 v12.x 升级到 v14.x（4~12 次升级）
-    int upgrades = 4 + (int)(seed % 9);
+    int upgrades = 2 + (int)(KwaiSeedMix(seed, KW_SALT_UPGRADE) % 17);
     NSMutableArray *history = [NSMutableArray array];
     double t = g_fakeInstallTime;
     for (int i = 0; i < upgrades; i++) {
@@ -4860,9 +4927,11 @@ void KwaiSetupKernelSpoof(void) {
     unsigned long seed = KwaiContainerSeed();
     // Apple OUI 前缀
     const char *ouis[] = {"F0:18:98", "A4:83:E7", "8C:85:90", "DC:A9:04", "F0:99:BF"};
-    const char *oui = ouis[seed % 5];
+    const char *oui = ouis[KwaiSeedMix(seed, KW_SALT_MAC) % 5];
     snprintf(g_fakeMacAddr, sizeof(g_fakeMacAddr), "%s:%02lX:%02lX:%02lX",
-             oui, (seed >> 8) & 0xFF, (seed >> 16) & 0xFF, (seed >> 24) & 0xFF);
+             oui, (int)(KwaiSeedMix(seed, KW_SALT_MAC) >> 8) & 0xFF,
+              (int)(KwaiSeedMix(seed, KW_SALT_MAC) >> 16) & 0xFF,
+              (int)(KwaiSeedMix(seed, KW_SALT_MAC) >> 24) & 0xFF);
     KWLog(@"[net] fake MAC=%s kernel=%s", g_fakeMacAddr, g_fakeKernelVersion);
 }
 
