@@ -34,6 +34,15 @@ static NSString * const kQQUrlCache = @"tencent100228415://qzapp/mqzone/0?object
 static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
 
 // ---------- 前置声明 ----------
+// ★ v49.4：时间族 hook（定义在文件末尾，安装点在中间，需前置声明）
+static uint64_t (*orig_mach_cont_time)(void);
+static uint64_t (*orig_mach_approx_time)(void);
+static uint64_t (*orig_clock_nsec_np)(clockid_t);
+static uint64_t kw_clock_nsec_np(clockid_t);
+static uint64_t kw_mach_cont_time(void);
+static uint64_t kw_mach_approx_time(void);
+static uint64_t kw_time_offset_in_ticks(void);
+
 static unsigned long KwaiContainerSeed(void);
 void KwaiInstallTimeSpoof(void);
 void KwaiInstallStorageSpoof(void);
@@ -1152,11 +1161,11 @@ static const KwaiDeviceModel kDeviceModels[] = {
     { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP", 0x8001, 2650, 414, 896, 2.00f, 3110, 1 },
     { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP", 0x8001, 2650, 375, 812, 3.00f, 3046, 1 },
     { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP", 0x8001, 2650, 414, 896, 3.00f, 3969, 1 },
-    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 2.88f, 2227, 1 },
+    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 3.00f, 2227, 1 },
     { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP", 0x8101, 3000, 390, 844, 3.00f, 2815, 1 },
     { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP", 0x8101, 3000, 390, 844, 3.00f, 2815, 1 },
     { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP", 0x8101, 3000, 428, 926, 3.00f, 3687, 1 },
-    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3230, 375, 812, 2.88f, 2406, 1 },
+    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3230, 375, 812, 3.00f, 2406, 1 },
     { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP",  0x8110, 3230, 390, 844, 3.00f, 3240, 1 },
     { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP",  0x8110, 3230, 390, 844, 3.00f, 3095, 1 },
     { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP",  0x8110, 3230, 428, 926, 3.00f, 4352, 1 },
@@ -1228,7 +1237,6 @@ static int       g_fakeArmE = 1;
 static int       g_fakeMinIOS = 15;
 static NSString *g_fakeBundlePath = nil;
 static NSString *g_fakeExecPath = nil;
-static long long g_fakeBootOffset = 0;
 static long long g_fakeDiskTotal = 0;      // 总容量（字节）
 static long long g_fakeDiskFree  = 0;      // 可用容量（字节）
 
@@ -3000,6 +3008,36 @@ void KwaiInstallTimeSpoof(void) {
     orig_mach_abs_time = mach_absolute_time;
     @try {
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)mach_absolute_time, (void *)kw_mach_abs_time, NULL);
+
+    // ②b mach_continuous_time / mach_approximate_time（v49.4 新增）
+    @try {
+        void *pc = dlsym(RTLD_DEFAULT, "mach_continuous_time");
+        if (pc) {
+            orig_mach_cont_time = (uint64_t (*)(void))pc;
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pc, (void *)kw_mach_cont_time, NULL);
+            KWLog(@"[time] mach_continuous_time OK");
+        } else { KWLog(@"[time] mach_continuous_time NOT FOUND"); }
+    } @catch (NSException *e) { KWLog(@"[time] cont ex: %@", e); }
+
+    @try {
+        void *pa = dlsym(RTLD_DEFAULT, "mach_approximate_time");
+        if (pa) {
+            orig_mach_approx_time = (uint64_t (*)(void))pa;
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pa, (void *)kw_mach_approx_time, NULL);
+            KWLog(@"[time] mach_approximate_time OK");
+        } else { KWLog(@"[time] mach_approximate_time NOT FOUND"); }
+    } @catch (NSException *e) { KWLog(@"[time] approx ex: %@", e); }
+
+    // v49.4: clock_gettime_nsec_np
+    @try {
+        void *pn = dlsym(RTLD_DEFAULT, "clock_gettime_nsec_np");
+        if (pn) {
+            orig_clock_nsec_np = (uint64_t (*)(clockid_t))pn;
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pn, (void *)kw_clock_nsec_np, NULL);
+            KWLog(@"[time] clock_gettime_nsec_np OK");
+        } else { KWLog(@"[time] clock_gettime_nsec_np NOT FOUND"); }
+    } @catch (NSException *ex) { KWLog(@"[time] nsec_np ex: %@", ex); }
+
         KWLog(@"[time] mach_absolute_time OK");
     } @catch (NSException *e) { KWLog(@"[time] mat ex: %@", e); }
 
@@ -3100,37 +3138,95 @@ void KwaiSetupStorageSpoof(void) {
 }
 
 // ---- ① statfs ----
+// ★★ v49.4：磁盘容量 hook 全覆盖 ★★
+//
+//   原来只 hook 了 statfs / NSFileManager，快手换 API 就能读真实磁盘：
+//     fstatfs(fd)               —— 拿已打开目录的 fd 直接问
+//     statfs64(path)            —— 部分调用方走 64 位符号
+//     getmntinfo(&buf, flags)   —— 一次拿到全部挂载点
+//   现在统一：抽出 kw_patch_statfs_buf()，四个入口都走它。
+
+// 判断是否「数据卷」（真机 / 与 /var 是同一个 APFS 数据卷）
+static BOOL kw_isDataVolumePath(const char *path) {
+    if (!path) return NO;
+    if (strcmp(path, "/") == 0) return YES;
+    if (strncmp(path, "/private/var/", 13) == 0) return YES;
+    if (strncmp(path, "/var/", 5) == 0) return YES;
+    if (strstr(path, "/private/var/mobile/Containers/Data/Application")) return YES;
+    if (strstr(path, "/Containers/Data/Application")) return YES;
+    return NO;
+}
+
+// 统一补丁：把一个 struct statfs 改成伪造容量（保留 2% 预留 + inode 自洽）
+void kw_patch_statfs_buf(struct statfs *buf) {
+    if (!buf || g_fakeDiskTotal <= 0) return;
+    uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
+
+    buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
+    buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
+
+    // 2% 预留：真机 bavail < bfree
+    uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
+    buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
+
+    // inode：APFS 约 4KB 块 / 每 12 块 1 个 inode（≈256GB -> 5.2M，接近真机）
+    uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 4096.0 / 12.0);
+    if (inodes < 1000) inodes = 1000;
+    buf->f_files  = inodes;
+    buf->f_ffree  = (uint64_t)((double)inodes * 0.93);
+
+    // 卷名保持真值（真机就是 /dev/disk1s1 + apfs），不改
+}
+
+// ---- ① statfs ----
 static int (*orig_statfs_d)(const char *, struct statfs *) = NULL;
 static int kw_statfs_d(const char *path, struct statfs *buf) {
     int r = orig_statfs_d ? orig_statfs_d(path, buf) : -1;
-    if (r == 0 && buf && g_fakeDiskTotal > 0) {
-        // ★ v47.6 修 M2：strncmp(path,"/var",4) 会误命中 /variant、/var-tmp
-        BOOL dataVol = NO;
-        if (path) {
-            if (strcmp(path, "/") == 0) dataVol = YES;
-            else if (strncmp(path, "/private/var/", 13) == 0) dataVol = YES;
-            else if (strncmp(path, "/var/", 5) == 0) dataVol = YES;
-            else if (strstr(path, "/private/var/mobile/Containers/Data/Application")) dataVol = YES;
-        }
-        if (dataVol) {
-            // ★ 修 M11：补 2% 保留块（真机 bavail < bfree）与 inode 数，
-            //   否则风控用 f_files 或 bavail==bfree 即可判定非真机文件系统。
-            //   注意：Darwin 的 struct statfs 既没有 f_bused 也没有 f_frsize 字段。
-            uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
-            buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
-            buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
-            uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
-            buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
-            uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 128.0 / 64.0);
-            buf->f_files = inodes;
-            buf->f_ffree = (uint64_t)((double)inodes * 0.88);
-        }
+    if (r == 0 && buf && g_fakeDiskTotal > 0 && kw_isDataVolumePath(path)) {
+        kw_patch_statfs_buf(buf);
     }
     return r;
 }
 
 // ---- ② statfs64 ----
 static int (*orig_statfs64_d)(const char *, struct statfs *) = NULL;
+static int kw_statfs64_d(const char *path, struct statfs *buf) {
+    int r = orig_statfs64_d ? orig_statfs64_d(path, buf) : -1;
+    if (r == 0 && buf && g_fakeDiskTotal > 0 && kw_isDataVolumePath(path)) {
+        kw_patch_statfs_buf(buf);
+    }
+    return r;
+}
+
+// ---- ②b fstatfs（v49.4 新增）----
+static int (*orig_fstatfs_d)(int, struct statfs *) = NULL;
+static int kw_fstatfs_d(int fd, struct statfs *buf) {
+    int r = orig_fstatfs_d ? orig_fstatfs_d(fd, buf) : -1;
+    if (r == 0 && buf && g_fakeDiskTotal > 0) {
+        // fd 无法直接取路径，保守策略：只在结果明显是数据卷时改。
+        // 判据：容量 > 4GB（真机系统卷通常 < 4GB 可用），避免污染系统卷。
+        if (buf->f_blocks && buf->f_bsize) {
+            uint64_t total = buf->f_blocks * (uint64_t)buf->f_bsize;
+            if (total > 4ULL * 1024 * 1024 * 1024) kw_patch_statfs_buf(buf);
+        }
+    }
+    return r;
+}
+
+// ---- ②c getmntinfo（v49.4 新增）----
+static int (*orig_getmntinfo_d)(struct statfs **, int) = NULL;
+static int kw_getmntinfo_d(struct statfs **mntbufp, int flags) {
+    int n = orig_getmntinfo_d ? orig_getmntinfo_d(mntbufp, flags) : -1;
+    if (n > 0 && mntbufp && *mntbufp && g_fakeDiskTotal > 0) {
+        for (int i = 0; i < n; i++) {
+            const char *mn = (*mntbufp)[i].f_mntonname;
+            if (mn && kw_isDataVolumePath(mn)) {
+                kw_patch_statfs_buf(&(*mntbufp)[i]);
+            }
+        }
+    }
+    return n;
+}
 
 // ---- ③ NSFileManager attributesOfFileSystemForPath ----
 static NSDictionary *(*orig_attrs_fs)(id, SEL, NSString *, NSError **) = NULL;
@@ -3205,6 +3301,42 @@ void KwaiInstallStorageSpoof(void) {
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)statfs, (void *)kw_statfs_d, NULL);
         KWLog(@"[disk] statfs OK");
     } @catch (NSException *e) { KWLog(@"[disk] statfs ex: %@", e); }
+
+    // ★ v49.4：statfs64 / fstatfs / getmntinfo 也要 rebind ——
+    //   之前这几个函数写好了却从未安装（等于死代码），
+    //   快手换个 API 就能读到真实磁盘容量。
+    @try {
+        void *p64 = dlsym(RTLD_DEFAULT, "statfs64");
+        if (p64) {
+            orig_statfs64_d = (int (*)(const char *, struct statfs *))p64;
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, p64, (void *)kw_statfs64_d, NULL);
+            KWLog(@"[disk] statfs64 OK");
+        } else {
+            KWLog(@"[disk] statfs64 NOT FOUND");
+        }
+    } @catch (NSException *e) { KWLog(@"[disk] statfs64 ex: %@", e); }
+
+    @try {
+        void *pf = dlsym(RTLD_DEFAULT, "fstatfs");
+        if (pf) {
+            orig_fstatfs_d = (int (*)(int, struct statfs *))pf;
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pf, (void *)kw_fstatfs_d, NULL);
+            KWLog(@"[disk] fstatfs OK");
+        } else {
+            KWLog(@"[disk] fstatfs NOT FOUND");
+        }
+    } @catch (NSException *e) { KWLog(@"[disk] fstatfs ex: %@", e); }
+
+    @try {
+        void *pm = dlsym(RTLD_DEFAULT, "getmntinfo");
+        if (pm) {
+            orig_getmntinfo_d = (int (*)(struct statfs **, int))pm;
+            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pm, (void *)kw_getmntinfo_d, NULL);
+            KWLog(@"[disk] getmntinfo OK");
+        } else {
+            KWLog(@"[disk] getmntinfo NOT FOUND");
+        }
+    } @catch (NSException *e) { KWLog(@"[disk] getmntinfo ex: %@", e); }
 
     // NSFileManager
     Method m1 = class_getInstanceMethod([NSFileManager class], @selector(attributesOfFileSystemForPath:error:));
@@ -3359,8 +3491,6 @@ static int kw_sysctlbyname3(const char *name, void *oldp, size_t *oldlenp,
 }
 
 // --- mach_absolute_time ---
-static uint64_t (*orig_mat)(void) = NULL;
-
 // ============================================================
 //  ② 环境隐藏
 // ============================================================
@@ -4303,6 +4433,10 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
             if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
         }
         // CPU 子类型（arm64e = 2, arm64 = 0）
+        // ★ v49.4：hw.optional.arm64 未覆盖会泄漏宿主机真实能力位
+        if (strcmp(name, "hw.optional.arm64") == 0 && oldp && oldlenp && *oldlenp >= sizeof(int)) {
+            int v = 1; memcpy(oldp, &v, sizeof(v)); *oldlenp = sizeof(v); return 0;
+        }
         if (strcmp(name, "hw.cpusubtype") == 0) {
             int t = g_fakeArmE ? 2 : 0;
             if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
@@ -5260,13 +5394,28 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
 // ---------- ① clock_gettime ----------
 static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int kw_clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    // ★ 修复：不改 CLOCK_MONOTONIC / CLOCK_UPTIME
-    //   原因：
-    //     ① CLOCK_MONOTONIC 是「系统启动至今」，不是「开机时长」
-    //     ② 改它 → 快手的定时器/超时/dispatch 调度全部错乱 → 崩溃
-    //     ③ 快手的开机时长检测用 kern.boottime，已单独 hook
-    //   所以：直接透传，不做任何修改
-    return orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
+    int r = orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
+
+    // v49.4: 只处理 CLOCK_UPTIME_RAW —— 它才是「开机时长」，与
+    //   mach_absolute_time 同源（真机上两者读同一段计数）。
+    //   原来一律透传 -> 快手用 clock_gettime(CLOCK_UPTIME_RAW) 就能读到
+    //   宿主机真实开机时长，与伪造的 systemUptime / kern.boottime 矛盾。
+    //
+    //   CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW / CLOCK_UPTIME 仍然透传：
+    //   它们支撑 dispatch 定时器与超时逻辑，改了会让快手
+    //   定时器/超时/dispatch 调度全部错乱 -> 崩溃。
+    if (r == 0 && tp && g_timeOffset > 0) {
+#if defined(CLOCK_UPTIME_RAW)
+        if (clk_id == CLOCK_UPTIME_RAW) {
+            tp->tv_sec += (time_t)g_timeOffset;
+        }
+#else
+        if ((int)clk_id == 8) {   // Darwin CLOCK_UPTIME_RAW == 8
+            tp->tv_sec += (time_t)g_timeOffset;
+        }
+#endif
+    }
+    return r;
 }
 
 // ---------- ② NSURL volumeTotalCapacity ----------
@@ -6080,3 +6229,55 @@ static int (*orig_open_v25)(const char *, int, ...) = NULL;
 // ---------- 安装 ----------
 
 // ============================================================
+
+
+// ★★ v49.4：时间族补齐 ★★
+//   原来只 hook 了 mach_absolute_time / systemUptime / kern.boottime，
+//   但 mach_continuous_time / mach_approximate_time / clock_gettime_nsec_np
+//   与它们【同源】—— 真机上这几个读到的是同一段时间。
+//   只 hook 一部分 → 快手交叉比对就发现「同一设备三个答案」。
+//   这里统一用与 kw_mach_abs_time 相同的口径（加 g_timeOffset 换算成 tick）。
+
+// 把 g_timeOffset（秒）换算成 mach tick
+static uint64_t kw_time_offset_in_ticks(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    if (g_timeOffset <= 0 || tb.numer == 0 || tb.denom == 0) return 0;
+    // ticks = 秒 * 1e9 * denom / numer
+    long double t = (long double)g_timeOffset * 1e9L * (long double)tb.denom
+                    / (long double)tb.numer;
+    if (t < 0 || t > 1.8e19L) return 0;
+    return (uint64_t)t;
+}
+
+// mach_continuous_time：与 absolute 同口径
+static uint64_t (*orig_mach_cont_time)(void) = NULL;
+static uint64_t kw_mach_cont_time(void) {
+    uint64_t r = orig_mach_cont_time ? orig_mach_cont_time() : 0;
+    return r + kw_time_offset_in_ticks();
+}
+
+// mach_approximate_time：与 absolute 同口径
+static uint64_t (*orig_mach_approx_time)(void) = NULL;
+static uint64_t kw_mach_approx_time(void) {
+    uint64_t r = orig_mach_approx_time ? orig_mach_approx_time() : 0;
+    return r + kw_time_offset_in_ticks();
+}
+
+
+// v49.4: clock_gettime_nsec_np —— clock_gettime 的纳秒便捷版。
+//   快手可能用它读 CLOCK_UPTIME_RAW，与 systemUptime 交叉比对。
+static uint64_t (*orig_clock_nsec_np)(clockid_t) = NULL;
+static uint64_t kw_clock_nsec_np(clockid_t clk_id) {
+    uint64_t r = orig_clock_nsec_np ? orig_clock_nsec_np(clk_id) : 0;
+#if defined(CLOCK_UPTIME_RAW)
+    const int isUptimeRaw = (clk_id == CLOCK_UPTIME_RAW);
+#else
+    const int isUptimeRaw = ((int)clk_id == 8);
+#endif
+    if (isUptimeRaw && g_timeOffset > 0) {
+        r += (uint64_t)g_timeOffset * 1000000000ULL;
+    }
+    return r;
+}
