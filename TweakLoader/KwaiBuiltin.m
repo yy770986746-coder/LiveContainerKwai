@@ -8,6 +8,9 @@
 #include <sys/sysctl.h>
 #include <sys/mount.h>
 #include <ifaddrs.h>
+#include <dirent.h>   // DIR / opendir / scandir
+#include <fcntl.h>    // fcntl F_GETPATH
+#include <limits.h>   // PATH_MAX
 // Sec* 类型的简化定义（SDK 无 SecCode.h）
 typedef struct __SecCode *SecCodeRef;
 typedef struct __SecStaticCode *SecStaticCodeRef;
@@ -4007,9 +4010,6 @@ typedef uint32_t SecCSFlags;
 #include <net/if_dl.h>
 #include <sys/socket.h>
 #include <sys/param.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <limits.h>
 #include <errno.h>
 #include "litehook.h"
 
