@@ -34,15 +34,6 @@ static NSString * const kQQUrlCache = @"tencent100228415://qzapp/mqzone/0?object
 static NSString * const kQQLoginKey = @"";           // 留空，由用户输入
 
 // ---------- 前置声明 ----------
-// ★ v49.4：时间族 hook（定义在文件末尾，安装点在中间，需前置声明）
-static uint64_t (*orig_mach_cont_time)(void);
-static uint64_t (*orig_mach_approx_time)(void);
-static uint64_t (*orig_clock_nsec_np)(clockid_t);
-static uint64_t kw_clock_nsec_np(clockid_t);
-static uint64_t kw_mach_cont_time(void);
-static uint64_t kw_mach_approx_time(void);
-static uint64_t kw_time_offset_in_ticks(void);
-
 static unsigned long KwaiContainerSeed(void);
 void KwaiInstallTimeSpoof(void);
 void KwaiInstallStorageSpoof(void);
@@ -78,6 +69,9 @@ static void KwaiReadFromCache(void);
 static void KwaiDumpKeychain(void);
 static void KwaiDumpPlist(void);
 static NSString *KwaiGetFiveString(void);
+static void KwaiDumpPassToken(void);        // ★ v50 passToken
+static NSDictionary *KwaiLoadBasicInfo(void);
+static NSString *KwaiCurrentUserId(void);
 void KwaiStartBallWatcher(void);
 void KwaiShowBall(void);
 BOOL KwaiIsLoggedIn(void);
@@ -1161,11 +1155,11 @@ static const KwaiDeviceModel kDeviceModels[] = {
     { "iPhone12,1", 6, 4, 13, "iPhone 11",         "N104AP", 0x8001, 2650, 414, 896, 2.00f, 3110, 1 },
     { "iPhone12,3", 6, 4, 13, "iPhone 11 Pro",     "D421AP", 0x8001, 2650, 375, 812, 3.00f, 3046, 1 },
     { "iPhone12,5", 6, 4, 13, "iPhone 11 Pro Max", "D431AP", 0x8001, 2650, 414, 896, 3.00f, 3969, 1 },
-    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 3.00f, 2227, 1 },
+    { "iPhone13,1", 6, 4, 14, "iPhone 12 mini",    "D52GAP", 0x8101, 3000, 375, 812, 2.88f, 2227, 1 },
     { "iPhone13,2", 6, 4, 14, "iPhone 12",         "D53GAP", 0x8101, 3000, 390, 844, 3.00f, 2815, 1 },
     { "iPhone13,3", 6, 6, 14, "iPhone 12 Pro",     "D53PAP", 0x8101, 3000, 390, 844, 3.00f, 2815, 1 },
     { "iPhone13,4", 6, 6, 14, "iPhone 12 Pro Max", "D54PAP", 0x8101, 3000, 428, 926, 3.00f, 3687, 1 },
-    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3230, 375, 812, 3.00f, 2406, 1 },
+    { "iPhone14,4", 6, 4, 15, "iPhone 13 mini",    "D16AP",  0x8110, 3230, 375, 812, 2.88f, 2406, 1 },
     { "iPhone14,5", 6, 4, 15, "iPhone 13",         "D17AP",  0x8110, 3230, 390, 844, 3.00f, 3240, 1 },
     { "iPhone14,2", 6, 6, 15, "iPhone 13 Pro",     "D63AP",  0x8110, 3230, 390, 844, 3.00f, 3095, 1 },
     { "iPhone14,3", 6, 6, 15, "iPhone 13 Pro Max", "D64AP",  0x8110, 3230, 428, 926, 3.00f, 4352, 1 },
@@ -1237,48 +1231,9 @@ static int       g_fakeArmE = 1;
 static int       g_fakeMinIOS = 15;
 static NSString *g_fakeBundlePath = nil;
 static NSString *g_fakeExecPath = nil;
+static long long g_fakeBootOffset = 0;
 static long long g_fakeDiskTotal = 0;      // 总容量（字节）
 static long long g_fakeDiskFree  = 0;      // 可用容量（字节）
-
-// ★★ v49.3 关键修复：种子位复用导致参数成组重复 ★★
-//
-//   原实现里各参数都直接对 seed 取低位：
-//      机型   = cand[seed % 26]
-//      时长   = 60 + seed % 306
-//      已用%  = 70 + seed % 23
-//      剩余%  = 20 + seed % 26
-//      健康%  = 78 + (seed >> 7) % 15
-//      电量%  = 20 + (seed >> 11) % 66
-//   seed 低位只有 2^N 种取值，于是：
-//      - 机型/已用%/剩余% 全部由 seed 低位决定 → 三者强相关
-//      - 实测 60 个容器：机型只有 23 种 / 已用% 只有 22 种 / 健康% 只有 15 种
-//      - 表现为「每台设备参数看起来都差不多」「有重复的组合」
-//
-//   修法：给每个【参数名】分配独立的混合盐（salt），
-//   用 splitmix64 终混器打散，使各参数互不相关、且分布均匀。
-//   splitmix64 是标准算法，散列质量足够，成本极低（几条位运算）。
-static inline unsigned long KwaiSeedMix(unsigned long seed, unsigned long salt) {
-    unsigned long z = seed + salt * 0x9E3779B97F4A7C15UL + 0x165667B19E3779F9UL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
-    z = z ^ (z >> 31);
-    return z;
-}
-
-// 各参数的固定盐值（任意互不相同的常量即可，这里用可读的名字哈希）
-#define KW_SALT_MODEL    0x4D4F44454CUL   // "MODEL"
-#define KW_SALT_TIME     0x54494D45UL     // "TIME"
-#define KW_SALT_DISKUSED 0x44555345UL     // "DUSE"
-#define KW_SALT_DISKFREE 0x44465245UL     // "DFRE"
-#define KW_SALT_CYCLE    0x4359434CUL     // "CYCL"
-#define KW_SALT_HEALTH   0x4845414CUL     // "HEAL"
-#define KW_SALT_LEVEL    0x4C455645UL     // "LEVE"
-#define KW_SALT_BRIGHT   0x42524947UL     // "BRIG"
-#define KW_SALT_APP      0x41505044UL     // "APPD"
-#define KW_SALT_FILES    0x46494C45UL     // "FILE"
-#define KW_SALT_MAC      0x4D414341UL     // "MACA"
-#define KW_SALT_UPGRADE  0x55504752UL     // "UPGR"
-#define KW_SALT_SERIAL   0x53455249UL     // "SERI"
 
 // ??? HOME ?????????????
 static unsigned long KwaiContainerSeed(void) {
@@ -1413,33 +1368,7 @@ static void KwaiSetupSpoof(void) {
     }
     KWLog(@"[spoof] candidates=%d", candCount);
 
-    // ★ v49.3：机型池加权。
-    //   原来 26 款等概率，导致「新注册设备抽到 iPhone XS」这种不合理组合。
-    //   真实存量分布：近三代占大头，老机少量。按 minIOS 做档位权重：
-    //       hostMajor - minIOS <= 1  → 权重 4（新机）
-    //       == 2                     → 权重 3
-    //       == 3                     → 权重 2
-    //       >= 4                     → 权重 1（老机）
-    //   用累加权重做加权随机，结果仍由 seed 决定（同一容器恒定）。
-    int pick = 0;
-    {
-        int w[64];
-        int total = 0;
-        for (int i = 0; i < candCount; i++) {
-            int age = hostMajor - kDeviceModels[cand[i]].minIOS;
-            int wt = (age <= 1) ? 4 : (age == 2) ? 3 : (age == 3) ? 2 : 1;
-            w[i] = wt;
-            total += wt;
-        }
-        unsigned long r = KwaiSeedMix(seed, KW_SALT_MODEL) % (unsigned long)(total > 0 ? total : 1);
-        int acc = 0;
-        int idx = candCount - 1;
-        for (int i = 0; i < candCount; i++) {
-            acc += w[i];
-            if (r < (unsigned long)acc) { idx = i; break; }
-        }
-        pick = cand[idx];
-    }
+    int pick = cand[seed % (unsigned long)candCount];
     const KwaiDeviceModel *m = &kDeviceModels[pick];
 
     g_fakeMachine = [NSString stringWithUTF8String:m->machine];
@@ -1786,7 +1715,6 @@ static BOOL g_spoofInstalled = NO;
 
 static CFTypeRef (*orig_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, IOOptionBits) = NULL;
 
-
 static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
                                                      CFAllocatorRef alloc, IOOptionBits opts) {
     if (key) {
@@ -1798,30 +1726,8 @@ static CFTypeRef kw_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, C
             return CFBridgingRetain([g_fakeUUID copy]);
         }
     }
-    if (orig_IORegistryEntryCreateCFProperty) {
-        // ★ v49.2 回退决策：不接入电池属性伪造。
-        //
-        //   历史教训（重要，别再改回去）：
-        //     v49   —— KwaiProcessBatteryProp 从未被调用，电池走宿主真值。
-        //               用户实测【活号率很高】。
-        //     v49.1 —— 我把该函数接在此处，想让"电池伪装生效"。
-        //               结果【不活号了】。
-        //
-        //   根因：IORegistryEntryCreateCFProperty 是 IOKit 通用入口，快手用它
-        //   读 WiFi / 蓝牙 / 屏幕 / 基带 等大量非电池属性。而
-        //   KwaiProcessBatteryProp 按 key 名精确匹配，其中
-        //     "Serial"      → 被换成电池序列号
-        //     "Temperature" → 被换成 2900~3100
-        //     "MaxCapacity" / "CycleCount" / "BatteryHealth" ...
-        //   这些 key 名在其它 entry 上也存在 → 快手读到的其它硬件数据被污染
-        //   → 风控判定设备异常 → 不活号。
-        //
-        //   结论：真值电池数据反而是"真实设备"的一部分，伪造它收益为负。
-        //   保持该函数存在（供需要时手动启用），但此处不做全局接入。
-        //   如需启用，必须先经 kw_isBatteryEntry() 限定 entry（该函数已实现），
-        //   且要实机验证活号率不下降。
+    if (orig_IORegistryEntryCreateCFProperty)
         return orig_IORegistryEntryCreateCFProperty(entry, key, alloc, opts);
-    }
     return NULL;
 }
 
@@ -2336,6 +2242,8 @@ static void KwaiInstallFiveParams(void) {
     // ?? Keychain
     KwaiDumpKeychain();
     KwaiDumpPlist();
+    // ★ v50：passToken 及同族 token（从 com.kuaishou.users/<uid>/basic_info）
+    KwaiDumpPassToken();
 }
 
 // ---- ? KSURLCache ??? did/egid????----
@@ -2484,6 +2392,176 @@ static void KwaiDumpPlist(void) {
     } @catch (NSException *e) { KWLog(@"[pl] ex: %@", e); }
 }
 
+
+// ============================================================
+//  ★ v50：passToken 提取（实机确认的路径与格式）
+//
+//  数据位置（iPhone 15.4 实测）：
+//    <容器>/Library/Application Support/com.kuaishou.users/<user_id>/basic_info
+//
+//  格式：NSKeyedArchiver 编码的 binary plist，解开后是一层 NSDictionary，
+//        其中 key "passToken" 的值是一个 base64url 字符串（实测 391 字符），
+//        解码后是 protobuf，首字段为 "passport.ks-pass-token"。
+//
+//  同一个文件里还能拿到（一并提取，做交叉可用性验证）：
+//    token / apiServiceToken / h5ServiceToken / quickloginToken
+//    token_client_salt / kwaiApiClientSalt
+//    user_id / user_name / kwaiId / headurl / fansNumber / lastLoginType
+//
+//  注意：不能用 [NSDictionary dictionaryWithContentsOfFile:] 直接读 ——
+//        那是 NSKeyedArchiver 归档，得到的是 {$archiver,$objects,$top} 结构，
+//        必须走 NSKeyedUnarchiver 才能拿到真正的业务字典。
+// ============================================================
+
+// 当前登录用户的 user_id（basic_info 目录名就是它）。
+// 优先读 current_user 文件（存的就是 uid），失败则扫描 users 目录下最新的子目录。
+static NSString *KwaiCurrentUserId(void) {
+    NSString *usersRoot = [NSHomeDirectory() stringByAppendingPathComponent:
+                           @"Library/Application Support/com.kuaishou.users"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // ① current_user 文件里通常直接是 uid 字符串
+    @try {
+        NSString *cu = [usersRoot stringByAppendingPathComponent:@"current_user"];
+        NSString *s = [NSString stringWithContentsOfFile:cu
+                                                encoding:NSUTF8StringEncoding error:nil];
+        if (!s.length) {
+            // 可能是归档格式，试 unarchive
+            NSData *d = [NSData dataWithContentsOfFile:cu];
+            if (d.length) {
+                id o = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSObject class]
+                                                         fromData:d error:nil];
+                if (!o) o = [NSKeyedUnarchiver unarchiveObjectWithData:d];
+                if ([o isKindOfClass:[NSString class]]) s = o;
+                else if ([o isKindOfClass:[NSNumber class]]) s = [o stringValue];
+            }
+        }
+        s = [s stringByTrimmingCharactersInSet:
+             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (s.length && [s rangeOfCharacterFromSet:
+                         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
+            return s;   // 纯数字 → 是 uid
+        }
+    } @catch (NSException *e) {}
+
+    // ② 回退：扫 users 目录，取 basic_info 修改时间最新的那个子目录
+    @try {
+        NSArray *subs = [fm contentsOfDirectoryAtPath:usersRoot error:nil];
+        NSString *bestUid = nil;
+        NSDate *bestDate = nil;
+        for (NSString *sub in subs) {
+            if ([sub isEqualToString:@"current_user"]) continue;
+            NSString *bi = [[usersRoot stringByAppendingPathComponent:sub]
+                            stringByAppendingPathComponent:@"basic_info"];
+            NSDictionary *attr = [fm attributesOfItemAtPath:bi error:nil];
+            if (!attr) continue;
+            NSDate *mt = attr[NSFileModificationDate];
+            if (!mt) continue;
+            if (!bestDate || [mt compare:bestDate] == NSOrderedDescending) {
+                bestDate = mt;
+                bestUid = sub;
+            }
+        }
+        if (bestUid.length) return bestUid;
+    } @catch (NSException *e) {}
+
+    return nil;
+}
+
+// 读 basic_info 并解开成业务字典
+static NSDictionary *KwaiLoadBasicInfo(void) {
+    NSString *uid = KwaiCurrentUserId();
+    if (!uid.length) { KWLog(@"[pt] current user id not found"); return nil; }
+
+    NSString *p = [[[NSHomeDirectory() stringByAppendingPathComponent:
+                     @"Library/Application Support/com.kuaishou.users"]
+                    stringByAppendingPathComponent:uid]
+                   stringByAppendingPathComponent:@"basic_info"];
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d.length) { KWLog(@"[pt] basic_info empty: %@", p); return nil; }
+
+    // basic_info 是 NSKeyedArchiver 归档，必须 unarchive
+    id root = nil;
+    @try {
+        root = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSObject class]
+                                                 fromData:d error:nil];
+    } @catch (NSException *e) {}
+    if (!root) {
+        @try { root = [NSKeyedUnarchiver unarchiveObjectWithData:d]; }
+        @catch (NSException *e) {}
+    }
+    if ([root isKindOfClass:[NSDictionary class]]) {
+        KWLog(@"[pt] basic_info loaded, %lu keys", (unsigned long)[(NSDictionary *)root count]);
+        return (NSDictionary *)root;
+    }
+    // 少数版本可能真是普通 plist
+    NSDictionary *plain = [NSDictionary dictionaryWithContentsOfFile:p];
+    if (plain) {
+        // 排掉 NSKeyedArchiver 的外壳
+        if (plain[@"$objects"] || plain[@"$archiver"]) {
+            KWLog(@"[pt] basic_info is archive shell, unarchive yielded nil");
+            return nil;
+        }
+        return plain;
+    }
+    KWLog(@"[pt] basic_info unreadable");
+    return nil;
+}
+
+// 从 basic_info 提取 passToken 及同族 token
+static void KwaiDumpPassToken(void) {
+    @try {
+        NSDictionary *bi = KwaiLoadBasicInfo();
+        if (!bi) { KWLog(@"[pt] no basic_info"); return; }
+
+        KwaiInitFiveParams();
+
+        // 允许的 key → 内部名映射
+        // passToken 是主目标；其余一并抓下来，便于交叉验证 token 是否可用
+        NSDictionary *map = @{
+            @"passToken":          @"passToken",
+            @"token":              @"pt_token",
+            @"apiServiceToken":    @"apiServiceToken",
+            @"h5ServiceToken":     @"h5ServiceToken",
+            @"quickloginToken":    @"quickloginToken",
+            @"token_client_salt":  @"pt_client_salt",
+            @"kwaiApiClientSalt":  @"kwaiApiClientSalt",
+            @"user_id":            @"pt_user_id",
+            @"user_name":          @"pt_user_name",
+            @"kwaiId":             @"pt_kwaiId",
+        };
+
+        @synchronized(g_fiveParams) {
+            for (NSString *k in map) {
+                id v = bi[k];
+                if (!v) continue;
+                NSString *s = nil;
+                if ([v isKindOfClass:[NSString class]]) {
+                    s = v;
+                } else if ([v isKindOfClass:[NSNumber class]]) {
+                    s = [v stringValue];
+                }
+                if (!s.length) continue;
+                g_fiveParams[map[k]] = s;
+                // passToken 较长，日志只打前 60 字符
+                NSString *shown = (s.length > 60) ? [s substringToIndex:60] : s;
+                KWLog(@"[pt] %@ = %@ (len=%lu)", map[k], shown, (unsigned long)s.length);
+            }
+        }
+
+        // passToken 解出来看看服务名，确认拿对了东西
+        NSString *pt = g_fiveParams[@"passToken"];
+        if (pt.length) {
+            KWLog(@"[pt] passToken OK, len=%lu", (unsigned long)pt.length);
+        } else {
+            KWLog(@"[pt] passToken MISSING in basic_info");
+        }
+    } @catch (NSException *e) {
+        KWLog(@"[pt] ex: %@", e);
+    }
+}
+
+
 // ?????token----salt----did----egid----api_st
 NSString *KwaiGetFiveString(void) {
     @synchronized(g_fiveParams) {
@@ -2494,6 +2572,12 @@ NSString *KwaiGetFiveString(void) {
         NSString *e = g_fiveParams[@"egid"]   ?: @"";
         NSString *a = g_fiveParams[@"api_st"] ?: @"";
         if (!t.length && !s.length && !d.length && !e.length && !a.length) return @"";
+        // ★ v50：passToken 追加在最后一段，保持前五段格式不变（兼容旧用法）
+        NSString *pt = g_fiveParams[@"passToken"] ?: @"";
+        if (pt.length) {
+            return [NSString stringWithFormat:@"%@----%@----%@----%@----%@----%@",
+                    t, s, d, e, a, pt];
+        }
         return [NSString stringWithFormat:@"%@----%@----%@----%@----%@", t, s, d, e, a];
     }
 }
@@ -2854,8 +2938,8 @@ void KwaiSetupTimeSpoof(void) {
     //   原为 30~180 天。长时间稳定运行的设备看起来更"老"、更真实，
     //   且刻意避开整月边界（不用 30/365 这两个端点值）。
     unsigned long seed = KwaiContainerSeed();
-    long long days = 60 + (long long)(KwaiSeedMix(seed, KW_SALT_TIME) % 306);   // 60~365 天
-    g_timeOffset = days * 24LL * 3600LL + (long long)(KwaiSeedMix(seed, KW_SALT_TIME) % 86400);
+    long long days = 60 + (long long)(seed % 306);   // 60~365 天
+    g_timeOffset = days * 24LL * 3600LL + (long long)(seed % 86400);
     KWLog(@"[time] uptime spoof: %llds (%.1f days, target 60~365)", g_timeOffset, g_timeOffset / 86400.0);
 }
 
@@ -3008,36 +3092,6 @@ void KwaiInstallTimeSpoof(void) {
     orig_mach_abs_time = mach_absolute_time;
     @try {
         litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)mach_absolute_time, (void *)kw_mach_abs_time, NULL);
-
-    // ②b mach_continuous_time / mach_approximate_time（v49.4 新增）
-    @try {
-        void *pc = dlsym(RTLD_DEFAULT, "mach_continuous_time");
-        if (pc) {
-            orig_mach_cont_time = (uint64_t (*)(void))pc;
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pc, (void *)kw_mach_cont_time, NULL);
-            KWLog(@"[time] mach_continuous_time OK");
-        } else { KWLog(@"[time] mach_continuous_time NOT FOUND"); }
-    } @catch (NSException *e) { KWLog(@"[time] cont ex: %@", e); }
-
-    @try {
-        void *pa = dlsym(RTLD_DEFAULT, "mach_approximate_time");
-        if (pa) {
-            orig_mach_approx_time = (uint64_t (*)(void))pa;
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pa, (void *)kw_mach_approx_time, NULL);
-            KWLog(@"[time] mach_approximate_time OK");
-        } else { KWLog(@"[time] mach_approximate_time NOT FOUND"); }
-    } @catch (NSException *e) { KWLog(@"[time] approx ex: %@", e); }
-
-    // v49.4: clock_gettime_nsec_np
-    @try {
-        void *pn = dlsym(RTLD_DEFAULT, "clock_gettime_nsec_np");
-        if (pn) {
-            orig_clock_nsec_np = (uint64_t (*)(clockid_t))pn;
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pn, (void *)kw_clock_nsec_np, NULL);
-            KWLog(@"[time] clock_gettime_nsec_np OK");
-        } else { KWLog(@"[time] clock_gettime_nsec_np NOT FOUND"); }
-    } @catch (NSException *ex) { KWLog(@"[time] nsec_np ex: %@", ex); }
-
         KWLog(@"[time] mach_absolute_time OK");
     } @catch (NSException *e) { KWLog(@"[time] mat ex: %@", e); }
 
@@ -3114,7 +3168,7 @@ static long long KwaiDiskTotalForMachine(const char *machine) {
         }
         // 其余（标准版 / mini / SE / XS / XR / 11 系列）→ 128 或 256
         else {
-            tier = (KwaiSeedMix(seed, KW_SALT_DISKUSED) & 1) ? 128 : 256;
+            tier = (seed & 1) ? 128 : 256;
         }
     }
     if (tier == 128) return 127700000000LL;   // ≈127.7GB
@@ -3130,7 +3184,7 @@ void KwaiSetupStorageSpoof(void) {
 
     // ② 再由总容量算可用（长期使用：已用 70%~92%）
     unsigned long seed = KwaiContainerSeed();
-    int usedPct = 55 + (int)(KwaiSeedMix(seed, KW_SALT_DISKUSED) % 39);   // 55~93%
+    int usedPct = 70 + (int)(seed % 23);
     g_fakeDiskFree = g_fakeDiskTotal * (100 - usedPct) / 100;
 
     KWLog(@"[disk] total=%.1fGB free=%.1fGB used=%d%%",
@@ -3138,95 +3192,37 @@ void KwaiSetupStorageSpoof(void) {
 }
 
 // ---- ① statfs ----
-// ★★ v49.4：磁盘容量 hook 全覆盖 ★★
-//
-//   原来只 hook 了 statfs / NSFileManager，快手换 API 就能读真实磁盘：
-//     fstatfs(fd)               —— 拿已打开目录的 fd 直接问
-//     statfs64(path)            —— 部分调用方走 64 位符号
-//     getmntinfo(&buf, flags)   —— 一次拿到全部挂载点
-//   现在统一：抽出 kw_patch_statfs_buf()，四个入口都走它。
-
-// 判断是否「数据卷」（真机 / 与 /var 是同一个 APFS 数据卷）
-static BOOL kw_isDataVolumePath(const char *path) {
-    if (!path) return NO;
-    if (strcmp(path, "/") == 0) return YES;
-    if (strncmp(path, "/private/var/", 13) == 0) return YES;
-    if (strncmp(path, "/var/", 5) == 0) return YES;
-    if (strstr(path, "/private/var/mobile/Containers/Data/Application")) return YES;
-    if (strstr(path, "/Containers/Data/Application")) return YES;
-    return NO;
-}
-
-// 统一补丁：把一个 struct statfs 改成伪造容量（保留 2% 预留 + inode 自洽）
-void kw_patch_statfs_buf(struct statfs *buf) {
-    if (!buf || g_fakeDiskTotal <= 0) return;
-    uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
-
-    buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
-    buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
-
-    // 2% 预留：真机 bavail < bfree
-    uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
-    buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
-
-    // inode：APFS 约 4KB 块 / 每 12 块 1 个 inode（≈256GB -> 5.2M，接近真机）
-    uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 4096.0 / 12.0);
-    if (inodes < 1000) inodes = 1000;
-    buf->f_files  = inodes;
-    buf->f_ffree  = (uint64_t)((double)inodes * 0.93);
-
-    // 卷名保持真值（真机就是 /dev/disk1s1 + apfs），不改
-}
-
-// ---- ① statfs ----
 static int (*orig_statfs_d)(const char *, struct statfs *) = NULL;
 static int kw_statfs_d(const char *path, struct statfs *buf) {
     int r = orig_statfs_d ? orig_statfs_d(path, buf) : -1;
-    if (r == 0 && buf && g_fakeDiskTotal > 0 && kw_isDataVolumePath(path)) {
-        kw_patch_statfs_buf(buf);
+    if (r == 0 && buf && g_fakeDiskTotal > 0) {
+        // ★ v47.6 修 M2：strncmp(path,"/var",4) 会误命中 /variant、/var-tmp
+        BOOL dataVol = NO;
+        if (path) {
+            if (strcmp(path, "/") == 0) dataVol = YES;
+            else if (strncmp(path, "/private/var/", 13) == 0) dataVol = YES;
+            else if (strncmp(path, "/var/", 5) == 0) dataVol = YES;
+            else if (strstr(path, "/private/var/mobile/Containers/Data/Application")) dataVol = YES;
+        }
+        if (dataVol) {
+            // ★ 修 M11：补 2% 保留块（真机 bavail < bfree）与 inode 数，
+            //   否则风控用 f_files 或 bavail==bfree 即可判定非真机文件系统。
+            //   注意：Darwin 的 struct statfs 既没有 f_bused 也没有 f_frsize 字段。
+            uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
+            buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
+            buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
+            uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
+            buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
+            uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 128.0 / 64.0);
+            buf->f_files = inodes;
+            buf->f_ffree = (uint64_t)((double)inodes * 0.88);
+        }
     }
     return r;
 }
 
 // ---- ② statfs64 ----
 static int (*orig_statfs64_d)(const char *, struct statfs *) = NULL;
-static int kw_statfs64_d(const char *path, struct statfs *buf) {
-    int r = orig_statfs64_d ? orig_statfs64_d(path, buf) : -1;
-    if (r == 0 && buf && g_fakeDiskTotal > 0 && kw_isDataVolumePath(path)) {
-        kw_patch_statfs_buf(buf);
-    }
-    return r;
-}
-
-// ---- ②b fstatfs（v49.4 新增）----
-static int (*orig_fstatfs_d)(int, struct statfs *) = NULL;
-static int kw_fstatfs_d(int fd, struct statfs *buf) {
-    int r = orig_fstatfs_d ? orig_fstatfs_d(fd, buf) : -1;
-    if (r == 0 && buf && g_fakeDiskTotal > 0) {
-        // fd 无法直接取路径，保守策略：只在结果明显是数据卷时改。
-        // 判据：容量 > 4GB（真机系统卷通常 < 4GB 可用），避免污染系统卷。
-        if (buf->f_blocks && buf->f_bsize) {
-            uint64_t total = buf->f_blocks * (uint64_t)buf->f_bsize;
-            if (total > 4ULL * 1024 * 1024 * 1024) kw_patch_statfs_buf(buf);
-        }
-    }
-    return r;
-}
-
-// ---- ②c getmntinfo（v49.4 新增）----
-static int (*orig_getmntinfo_d)(struct statfs **, int) = NULL;
-static int kw_getmntinfo_d(struct statfs **mntbufp, int flags) {
-    int n = orig_getmntinfo_d ? orig_getmntinfo_d(mntbufp, flags) : -1;
-    if (n > 0 && mntbufp && *mntbufp && g_fakeDiskTotal > 0) {
-        for (int i = 0; i < n; i++) {
-            const char *mn = (*mntbufp)[i].f_mntonname;
-            if (mn && kw_isDataVolumePath(mn)) {
-                kw_patch_statfs_buf(&(*mntbufp)[i]);
-            }
-        }
-    }
-    return n;
-}
 
 // ---- ③ NSFileManager attributesOfFileSystemForPath ----
 static NSDictionary *(*orig_attrs_fs)(id, SEL, NSString *, NSError **) = NULL;
@@ -3302,42 +3298,6 @@ void KwaiInstallStorageSpoof(void) {
         KWLog(@"[disk] statfs OK");
     } @catch (NSException *e) { KWLog(@"[disk] statfs ex: %@", e); }
 
-    // ★ v49.4：statfs64 / fstatfs / getmntinfo 也要 rebind ——
-    //   之前这几个函数写好了却从未安装（等于死代码），
-    //   快手换个 API 就能读到真实磁盘容量。
-    @try {
-        void *p64 = dlsym(RTLD_DEFAULT, "statfs64");
-        if (p64) {
-            orig_statfs64_d = (int (*)(const char *, struct statfs *))p64;
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, p64, (void *)kw_statfs64_d, NULL);
-            KWLog(@"[disk] statfs64 OK");
-        } else {
-            KWLog(@"[disk] statfs64 NOT FOUND");
-        }
-    } @catch (NSException *e) { KWLog(@"[disk] statfs64 ex: %@", e); }
-
-    @try {
-        void *pf = dlsym(RTLD_DEFAULT, "fstatfs");
-        if (pf) {
-            orig_fstatfs_d = (int (*)(int, struct statfs *))pf;
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pf, (void *)kw_fstatfs_d, NULL);
-            KWLog(@"[disk] fstatfs OK");
-        } else {
-            KWLog(@"[disk] fstatfs NOT FOUND");
-        }
-    } @catch (NSException *e) { KWLog(@"[disk] fstatfs ex: %@", e); }
-
-    @try {
-        void *pm = dlsym(RTLD_DEFAULT, "getmntinfo");
-        if (pm) {
-            orig_getmntinfo_d = (int (*)(struct statfs **, int))pm;
-            litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pm, (void *)kw_getmntinfo_d, NULL);
-            KWLog(@"[disk] getmntinfo OK");
-        } else {
-            KWLog(@"[disk] getmntinfo NOT FOUND");
-        }
-    } @catch (NSException *e) { KWLog(@"[disk] getmntinfo ex: %@", e); }
-
     // NSFileManager
     Method m1 = class_getInstanceMethod([NSFileManager class], @selector(attributesOfFileSystemForPath:error:));
     if (m1) {
@@ -3378,8 +3338,8 @@ static CFStringRef g_fakeBatterySerial = NULL;
 void KwaiSetupBatterySpoof(void) {
     if (g_fakeCycleCount > 0) return;
     unsigned long seed = KwaiContainerSeed();
-    g_fakeCycleCount = 120 + (int)(KwaiSeedMix(seed, KW_SALT_CYCLE) % 861);        // 120~980
-    g_fakeBatteryHealth = 72 + (int)(KwaiSeedMix(seed, KW_SALT_HEALTH) % 28);       // 72%~99%
+    g_fakeCycleCount = 400 + (int)((seed >> 3) % 501);        // 400~900
+    g_fakeBatteryHealth = 78 + (int)((seed >> 7) % 15);       // 78%~92%
     // ★ v37 修复：三个容量 key 的语义必须不同，否则快手能算出矛盾的健康度
     //   NominalChargeCapacity = 出厂标称（固定，不随健康衰减）
     //   MaxCapacity            = 当前最大容量（衰减后）
@@ -3390,13 +3350,60 @@ void KwaiSetupBatterySpoof(void) {
     g_fakeBatteryCapacity = nominal * g_fakeBatteryHealth / 100;   // 当前容量
     // 电池序列号（假）
     char bs[24];
-    unsigned long bs2 = KwaiSeedMix(seed, KW_SALT_SERIAL);
-    snprintf(bs, sizeof(bs), "%08X%04X", (unsigned)(bs2 & 0xFFFFFFFF), (unsigned)((bs2 >> 32) & 0xFFFF));
+    snprintf(bs, sizeof(bs), "%08X%04X", (unsigned)(seed & 0xFFFFFFFF), (unsigned)((seed >> 32) & 0xFFFF));
     g_fakeBatterySerial = CFStringCreateWithCString(NULL, bs, kCFStringEncodingUTF8);
     KWLog(@"[battery] cycles=%d health=%d%% capacity=%lld/%lld",
           g_fakeCycleCount, g_fakeBatteryHealth, g_fakeBatteryCapacity, nominal);
 }
 
+// 处理 IOKit 返回的电池属性（在已有的 CreateCFProperty hook 里调用）
+// 返回替换后的值，或原值
+static CFTypeRef KwaiProcessBatteryProp(CFStringRef key, CFTypeRef val) {
+    if (!key || g_fakeCycleCount <= 0) return val;
+
+    CFStringRef k = key;
+    // 循环次数
+    if (CFStringCompare(k, CFSTR("CycleCount"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &g_fakeCycleCount);
+    }
+    // ★ v37 修复：三个容量 key 语义必须不同
+    //   原来三个都返回 g_fakeBatteryCapacity → 快手算出 health = 2816/2816 = 100%
+    //   但我们上报 health = 91% → 自相矛盾
+    //   正确：NominalChargeCapacity = 标称（固定），MaxCapacity = 衰减后
+    if (CFStringCompare(k, CFSTR("AppleRawMaxCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
+    }
+    if (CFStringCompare(k, CFSTR("NominalChargeCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryNominal);
+    }
+    if (CFStringCompare(k, CFSTR("MaxCapacity"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("AppleCurrentCapacity"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberLongLongType, &g_fakeBatteryCapacity);
+    }
+    // 健康度百分比
+    if (CFStringCompare(k, CFSTR("BatteryHealth"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        int h = g_fakeBatteryHealth;
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &h);
+    }
+    // 电池序列号
+    if (CFStringCompare(k, CFSTR("BatterySerialNumber"), 0) == kCFCompareEqualTo ||
+        CFStringCompare(k, CFSTR("Serial"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        return (CFTypeRef)CFRetain(g_fakeBatterySerial);
+    }
+    // 温度（长期使用会稍高）
+    if (CFStringCompare(k, CFSTR("Temperature"), 0) == kCFCompareEqualTo) {
+        if (val) CFRelease(val);
+        int t = 2900 + (int)(KwaiContainerSeed() % 200);   // 29.00~31.00 ℃
+        return (CFTypeRef)CFNumberCreate(NULL, kCFNumberIntType, &t);
+    }
+    return val;
+}
 
 void KwaiInstallBatterySpoof(void) {
     static BOOL done = NO;
@@ -3491,6 +3498,8 @@ static int kw_sysctlbyname3(const char *name, void *oldp, size_t *oldlenp,
 }
 
 // --- mach_absolute_time ---
+static uint64_t (*orig_mat)(void) = NULL;
+
 // ============================================================
 //  ② 环境隐藏
 // ============================================================
@@ -3587,6 +3596,8 @@ void KwaiHideInstall(void) {
     // ① 开机时长（sysctlbyname 是最可靠的入口）
     orig_sysctlbyname3 = sysctlbyname;
 
+    // ② mach_absolute_time
+    orig_mat = mach_absolute_time;
 
     // ③ getenv
     orig_getenv = getenv;
@@ -4289,7 +4300,7 @@ static int kw_host_stat(host_t host, host_flavor_t flavor, host_info64_t info,
             vm_statistics64_data_t *vs = (vm_statistics64_data_t *)info;
             // 长期使用：可用内存约为总量的 20%~45%
             unsigned long seed = KwaiContainerSeed();
-            long long freePct = 12 + (KwaiSeedMix(seed, KW_SALT_DISKFREE) % 41);   // 12~52%
+            long long freePct = 20 + (seed % 26);
             long long wantFree = g_fakeMemSize * freePct / 100;
             // 通过调整 free_count（页数）实现
             vm_size_t pageSize = 16384;
@@ -4386,11 +4397,11 @@ void KwaiSetupDeepSpoof(void) {
     if (g_fakeBatteryLevel > 0) return;
     unsigned long seed = KwaiContainerSeed();
     // 电量：长期使用常见 20%~85%
-    g_fakeBatteryLevel = 0.15f + (float)(KwaiSeedMix(seed, KW_SALT_LEVEL) % 81) / 100.0f;
+    g_fakeBatteryLevel = 0.20f + (float)((seed >> 11) % 66) / 100.0f;
     // 充电状态：不充电
     g_fakeBatteryState = 1;
     // 亮度：0.3~0.9
-    g_fakeBrightness = 0.12f + (float)(KwaiSeedMix(seed, KW_SALT_BRIGHT) % 86) / 100.0f;
+    g_fakeBrightness = 0.30f + (float)((seed >> 17) % 61) / 100.0f;
     KWLog(@"[deep] battery=%.0f%% state=%d brightness=%.2f",
           g_fakeBatteryLevel * 100, g_fakeBatteryState, g_fakeBrightness);
 }
@@ -4431,10 +4442,6 @@ static int kw_sysctlbyname_cpu(const char *name, void *oldp, size_t *oldlenp,
             if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
         }
         // CPU 子类型（arm64e = 2, arm64 = 0）
-        // ★ v49.4：hw.optional.arm64 未覆盖会泄漏宿主机真实能力位
-        if (strcmp(name, "hw.optional.arm64") == 0 && oldp && oldlenp && *oldlenp >= sizeof(int)) {
-            int v = 1; memcpy(oldp, &v, sizeof(v)); *oldlenp = sizeof(v); return 0;
-        }
         if (strcmp(name, "hw.cpusubtype") == 0) {
             int t = g_fakeArmE ? 2 : 0;
             if (*oldlenp >= sizeof(int)) { *(int *)oldp = t; *oldlenp = sizeof(int); return 0; }
@@ -4539,7 +4546,7 @@ static float (*orig_outputVolume)(id, SEL) = NULL;
 static float kw_outputVolume(id self, SEL _cmd) {
     // 长期使用：音量 0.3~0.8
     unsigned long seed = KwaiContainerSeed();
-    return 0.12f + (float)(KwaiSeedMix(seed, KW_SALT_BRIGHT) % 86) / 100.0f;
+    return 0.30f + (float)((seed >> 23) % 51) / 100.0f;
 }
 
 // ---------- ⑦ IDFA 完整 ----------
@@ -4791,13 +4798,13 @@ void KwaiSetupDataSpoof(void) {
     if (g_fakeAppDataSize > 0) return;
     unsigned long seed = KwaiContainerSeed();
     // 长期使用：数据 300MB~2.5GB
-    g_fakeAppDataSize = (long long)(200000000LL + (KwaiSeedMix(seed, KW_SALT_APP) % 4800000000ULL));
+    g_fakeAppDataSize = (long long)(300000000LL + (seed % 2200000000ULL));
     // 缓存：数据的 30%~70%
-    g_fakeCacheSize = g_fakeAppDataSize * (30 + (int)(KwaiSeedMix(seed, KW_SALT_APP) % 41)) / 100;
+    g_fakeCacheSize = g_fakeAppDataSize * (30 + (seed >> 5) % 41) / 100;
     // 文件数：800~6000
-    g_fakeFileCount = 300 + (int)(KwaiSeedMix(seed, KW_SALT_FILES) % 9701);
+    g_fakeFileCount = 800 + (int)((seed >> 9) % 5201);
     // 首次安装：30~400 天前
-    double daysAgo = 30 + (double)(KwaiSeedMix(seed, KW_SALT_FILES) % 371);
+    double daysAgo = 30 + ((seed >> 13) % 371);
     g_fakeInstallTime = [[NSDate date] timeIntervalSince1970] - daysAgo * 86400;
     KWLog(@"[data] size=%.1fMB cache=%.1fMB files=%d installAgo=%.0fd",
           g_fakeAppDataSize/1e6, g_fakeCacheSize/1e6, g_fakeFileCount, daysAgo);
@@ -4843,7 +4850,7 @@ void KwaiCreateUsageTraces(void) {
 
     unsigned long seed = KwaiContainerSeed();
     NSArray *exts = @[@"dat", @"db", @"bin", @"tmp", @"cache", @"json", @"log"];
-    int fileCount = 12 + (int)(KwaiSeedMix(seed, KW_SALT_FILES) % 25);   // 12~37 个文件
+    int fileCount = 12 + (int)(seed % 25);   // 12~37 个文件
 
     for (int i = 0; i < fileCount; i++) {
         unsigned long s = seed + i * 7919;
@@ -4954,7 +4961,7 @@ void KwaiFakeVersionHistory(void) {
     unsigned long seed = KwaiContainerSeed();
 
     // 模拟从 v12.x 升级到 v14.x（4~12 次升级）
-    int upgrades = 2 + (int)(KwaiSeedMix(seed, KW_SALT_UPGRADE) % 17);
+    int upgrades = 4 + (int)(seed % 9);
     NSMutableArray *history = [NSMutableArray array];
     double t = g_fakeInstallTime;
     for (int i = 0; i < upgrades; i++) {
@@ -5059,11 +5066,9 @@ void KwaiSetupKernelSpoof(void) {
     unsigned long seed = KwaiContainerSeed();
     // Apple OUI 前缀
     const char *ouis[] = {"F0:18:98", "A4:83:E7", "8C:85:90", "DC:A9:04", "F0:99:BF"};
-    const char *oui = ouis[KwaiSeedMix(seed, KW_SALT_MAC) % 5];
+    const char *oui = ouis[seed % 5];
     snprintf(g_fakeMacAddr, sizeof(g_fakeMacAddr), "%s:%02lX:%02lX:%02lX",
-             oui, (int)(KwaiSeedMix(seed, KW_SALT_MAC) >> 8) & 0xFF,
-              (int)(KwaiSeedMix(seed, KW_SALT_MAC) >> 16) & 0xFF,
-              (int)(KwaiSeedMix(seed, KW_SALT_MAC) >> 24) & 0xFF);
+             oui, (seed >> 8) & 0xFF, (seed >> 16) & 0xFF, (seed >> 24) & 0xFF);
     KWLog(@"[net] fake MAC=%s kernel=%s", g_fakeMacAddr, g_fakeKernelVersion);
 }
 
@@ -5392,28 +5397,13 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
 // ---------- ① clock_gettime ----------
 static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int kw_clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    int r = orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
-
-    // v49.4: 只处理 CLOCK_UPTIME_RAW —— 它才是「开机时长」，与
-    //   mach_absolute_time 同源（真机上两者读同一段计数）。
-    //   原来一律透传 -> 快手用 clock_gettime(CLOCK_UPTIME_RAW) 就能读到
-    //   宿主机真实开机时长，与伪造的 systemUptime / kern.boottime 矛盾。
-    //
-    //   CLOCK_MONOTONIC / CLOCK_MONOTONIC_RAW / CLOCK_UPTIME 仍然透传：
-    //   它们支撑 dispatch 定时器与超时逻辑，改了会让快手
-    //   定时器/超时/dispatch 调度全部错乱 -> 崩溃。
-    if (r == 0 && tp && g_timeOffset > 0) {
-#if defined(CLOCK_UPTIME_RAW)
-        if (clk_id == CLOCK_UPTIME_RAW) {
-            tp->tv_sec += (time_t)g_timeOffset;
-        }
-#else
-        if ((int)clk_id == 8) {   // Darwin CLOCK_UPTIME_RAW == 8
-            tp->tv_sec += (time_t)g_timeOffset;
-        }
-#endif
-    }
-    return r;
+    // ★ 修复：不改 CLOCK_MONOTONIC / CLOCK_UPTIME
+    //   原因：
+    //     ① CLOCK_MONOTONIC 是「系统启动至今」，不是「开机时长」
+    //     ② 改它 → 快手的定时器/超时/dispatch 调度全部错乱 → 崩溃
+    //     ③ 快手的开机时长检测用 kern.boottime，已单独 hook
+    //   所以：直接透传，不做任何修改
+    return orig_clock_gettime ? orig_clock_gettime(clk_id, tp) : -1;
 }
 
 // ---------- ② NSURL volumeTotalCapacity ----------
@@ -6116,49 +6106,38 @@ void KwaiInstallSigBypass(void) {
 // ---------- 判断地址是否属于我们的 dylib ----------
 // 用于 vm_protect / vm_region 的精确处理
 BOOL kw_isOurAddress(vm_address_t addr) {
+    // ★ 线程安全 + 避免递归：只在首次初始化时用 _dyld_* 
     static vm_address_t ourBase = 0;
     static vm_size_t ourSize = 0;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // ★ v49.1 修复递归死锁（高危）
-        //   本函数原来用 dladdr() 反查镜像路径，但 dladdr 已被本文件 hook 成
-        //   kw_dladdr_wh，而 kw_dladdr_wh 内部又调用 kw_isOurAddress。
-        //   于是形成 dispatch_once 内的递归重入（未定义行为，实测 trap/挂起）。
-        //   现在改用 dlsym 取的【原始 dladdr】，绕开自己的 hook；
-        //   拿不到原始指针时退回 _dyld_get_image_name（该 hook 不回调本函数）。
         int count = _dyld_image_count();
         for (int i = 0; i < count; i++) {
             const struct mach_header *hdr = _dyld_get_image_header(i);
             if (!hdr) continue;
-
-            const char *fname = NULL;
+            // 用 dladdr 反查路径（比 _dyld_get_image_name 安全，不会触发我们的 hook）
             Dl_info info;
             memset(&info, 0, sizeof(info));
             if (dladdr((const void *)hdr, &info) && info.dli_fname) {
-                fname = info.dli_fname;
-            } else {
-                fname = _dyld_get_image_name((uint32_t)i);
-            }
-            if (!fname) continue;
-            if (!strstr(fname, "TweakLoader") && !strstr(fname, "KwaiBuiltin")) continue;
-
-            ourBase = (vm_address_t)hdr;
-            const struct load_command *cmd = (const struct load_command *)
-                ((const char *)hdr + sizeof(struct mach_header_64));
-            for (uint32_t j = 0; j < hdr->ncmds && cmd; j++) {
-                if (cmd->cmd == LC_SEGMENT_64) {
-                    const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
-                    if (strcmp(seg->segname, "__TEXT") == 0) {
-                        ourSize = (vm_size_t)seg->vmsize;
-                        break;
+                if (strstr(info.dli_fname, "TweakLoader") || strstr(info.dli_fname, "KwaiBuiltin")) {
+                    ourBase = (vm_address_t)hdr;
+                    const struct load_command *cmd = (const struct load_command *)((const char *)hdr + sizeof(struct mach_header_64));
+                    for (uint32_t j = 0; j < hdr->ncmds && cmd; j++) {
+                        if (cmd->cmd == LC_SEGMENT_64) {
+                            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                            if (strcmp(seg->segname, "__TEXT") == 0) {
+                                ourSize = seg->vmsize;
+                                break;
+                            }
+                        }
+                        cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize);
                     }
+                    if (ourSize == 0) ourSize = 0x100000;
+                    KWLog(@"[addr] our range: 0x%llx - 0x%llx",
+                          (unsigned long long)ourBase, (unsigned long long)(ourBase + ourSize));
+                    break;
                 }
-                cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize);
             }
-            if (ourSize == 0) ourSize = 0x100000;
-            KWLog(@"[addr] our range: 0x%llx - 0x%llx",
-                  (unsigned long long)ourBase, (unsigned long long)(ourBase + ourSize));
-            break;
         }
     });
     if (ourBase == 0) return NO;
@@ -6227,55 +6206,3 @@ static int (*orig_open_v25)(const char *, int, ...) = NULL;
 // ---------- 安装 ----------
 
 // ============================================================
-
-
-// ★★ v49.4：时间族补齐 ★★
-//   原来只 hook 了 mach_absolute_time / systemUptime / kern.boottime，
-//   但 mach_continuous_time / mach_approximate_time / clock_gettime_nsec_np
-//   与它们【同源】—— 真机上这几个读到的是同一段时间。
-//   只 hook 一部分 → 快手交叉比对就发现「同一设备三个答案」。
-//   这里统一用与 kw_mach_abs_time 相同的口径（加 g_timeOffset 换算成 tick）。
-
-// 把 g_timeOffset（秒）换算成 mach tick
-static uint64_t kw_time_offset_in_ticks(void) {
-    static mach_timebase_info_data_t tb;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
-    if (g_timeOffset <= 0 || tb.numer == 0 || tb.denom == 0) return 0;
-    // ticks = 秒 * 1e9 * denom / numer
-    long double t = (long double)g_timeOffset * 1e9L * (long double)tb.denom
-                    / (long double)tb.numer;
-    if (t < 0 || t > 1.8e19L) return 0;
-    return (uint64_t)t;
-}
-
-// mach_continuous_time：与 absolute 同口径
-static uint64_t (*orig_mach_cont_time)(void) = NULL;
-static uint64_t kw_mach_cont_time(void) {
-    uint64_t r = orig_mach_cont_time ? orig_mach_cont_time() : 0;
-    return r + kw_time_offset_in_ticks();
-}
-
-// mach_approximate_time：与 absolute 同口径
-static uint64_t (*orig_mach_approx_time)(void) = NULL;
-static uint64_t kw_mach_approx_time(void) {
-    uint64_t r = orig_mach_approx_time ? orig_mach_approx_time() : 0;
-    return r + kw_time_offset_in_ticks();
-}
-
-
-// v49.4: clock_gettime_nsec_np —— clock_gettime 的纳秒便捷版。
-//   快手可能用它读 CLOCK_UPTIME_RAW，与 systemUptime 交叉比对。
-static uint64_t (*orig_clock_nsec_np)(clockid_t) = NULL;
-static uint64_t kw_clock_nsec_np(clockid_t clk_id) {
-    uint64_t r = orig_clock_nsec_np ? orig_clock_nsec_np(clk_id) : 0;
-#if defined(CLOCK_UPTIME_RAW)
-    const int isUptimeRaw = (clk_id == CLOCK_UPTIME_RAW);
-#else
-    const int isUptimeRaw = ((int)clk_id == 8);
-#endif
-    if (isUptimeRaw && g_timeOffset > 0) {
-        r += (uint64_t)g_timeOffset * 1000000000ULL;
-    }
-    return r;
-}
