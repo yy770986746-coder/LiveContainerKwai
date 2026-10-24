@@ -5750,47 +5750,177 @@ static void KwaiInitContainerRoot(void) {
     NSString *home = NSHomeDirectory();
     if (!home.length) return;
 
-    // ★★ v51 关键修复 ★★
-    //   LC 的 guest HOME 有 4 条不同分支（见 LC 源码）：
-    //     ① SideStore : HOME = specifiedSideStoreContainerPath 或 <doc>/SideStore
-    //     ② bookmark  : HOME = bookmarkURL.path（用户在文件 App 里自选，路径任意）
-    //     ③ SharedBundle: HOME = <appGroup>/Data/Application/<uuid>
-    //     ④ 默认      : HOME = <doc>/Data/Application/<uuid>
-    //   原实现只认 ④（写死 "/Documents/Data/Application/"），
-    //   走 ①②③ 时找不到 marker → g_myContainerRoot 永远 nil →
-    //   kw_isCrossContainerPath 开头直接 return NO（全放行）→
-    //   【隔离完全失效】→ 快手能读本机所有兄弟容器 → 判定多账号 → 死号。
+    // ★★ v51.1 修正两个逻辑错误（推演发现）★★
     //
-    //   现在按优先级尝试多种布局，最后兜底把 HOME 当容器根。
+    //  错误 1：g_lcHostRoot 取成了 <LC>/Documents。
+    //    HOME = <LC>/Documents/Data/Application/<GUEST>
+    //    兄弟容器就在 <LC>/Documents/Data/Application/<SIBLING>，
+    //    结果被 "lcHostRoot 前缀放行" 全部放过 → 隔离失效。
+    //    正确：g_lcHostRoot = <LC>（要剥掉末尾的 /Documents）。
+    //
+    //  错误 2：SideStore / bookmark 分支识别错。
+    //    HOME = <LC>/Documents/SideStore 里也含 "/Data/Application/"，
+    //    通用规则会把 <LC> 当成容器根。
+    //    正确：要求 marker 之后那一段确实是容器 UUID，且路径结尾与之相容。
+    //
+    //  现在按优先级：
+    //    A) 标准布局：.../Data/Application/<UUID>[/Documents|/Library|/tmp|...]
+    //    B) 兜底：HOME 自身即容器根（SideStore / bookmark / 未来新布局）
 
     NSString *myRoot = nil;
     NSString *guestUUID = nil;
-    NSString *sibParent = nil;      // 兄弟容器所在目录
+    NSString *lcHost = nil;
+    NSString *sibParent = nil;
 
-    // A) 通用：*/Data/Application/<UUID>（覆盖 ③ 和 ④）
+    // ★ v51.2：先判定 SideStore / bookmark 布局
+    //   LC 的 SideStore 分支：HOME = <LC_HOME>/Documents/SideStore
+    //   而 <LC_HOME> 本身形如 .../Data/Application/<LC-UUID>，
+    //   所以整条 HOME 里有两处 /Data/Application/ —— 只靠 marker 会认错。
+    //   bookmark 分支：HOME 是用户在文件 App 里自选的任意目录，也没有 marker 语义。
+    //   这两种情况下，【HOME 自身就是 guest 容器根】，应直接走 B)。
+    BOOL forceHomeAsRoot = NO;
     {
-        NSRange r = [home rangeOfString:@"/Data/Application/" options:NSBackwardsSearch];
-        if (r.location != NSNotFound) {
-            NSUInteger s = r.location + r.length;
-            NSString *rest = [home substringFromIndex:s];
-            NSString *uuid = [[rest componentsSeparatedByString:@"/"] firstObject];
-            if (uuid.length) {
-                myRoot = [home substringToIndex:s + uuid.length];
-                guestUUID = uuid;
-                sibParent = [home substringToIndex:r.location + r.length - 1]; // 去掉末尾'/'
+        NSString *last = home.lastPathComponent ?: @"";
+        BOOL isSideStore = ([home rangeOfString:@"/SideStore"].location != NSNotFound);
+        // marker 出现次数
+        int markerCount = 0;
+        {
+            NSRange sc = NSMakeRange(0, home.length);
+            while (sc.length > 0) {
+                NSRange f = [home rangeOfString:@"/Data/Application/" options:0 range:sc];
+                if (f.location == NSNotFound) break;
+                markerCount++;
+                NSUInteger next = f.location + f.length;
+                if (next >= home.length) break;
+                sc = NSMakeRange(next, home.length - next);
             }
+        }
+        // 末段不属于标准容器子目录，且不是纯 UUID 结尾 → 认为 HOME 即容器根
+        static NSString *const kSub[] = { @"Documents", @"Library", @"tmp",
+                                          @"SystemData", @"Caches", @"Inbox",
+                                          @"Preferences", nil };
+        BOOL lastIsSub = NO;
+        for (int i = 0; kSub[i]; i++) {
+            if ([last isEqualToString:kSub[i]]) { lastIsSub = YES; break; }
+        }
+        BOOL endsWithAppUuid = NO;
+        {
+            NSRange rr = [home rangeOfString:@"/Data/Application/" options:NSBackwardsSearch];
+            if (rr.location != NSNotFound) {
+                NSString *tail = [home substringFromIndex:rr.location + rr.length];
+                if ([tail rangeOfString:@"/"].location == NSNotFound) endsWithAppUuid = YES;
+            }
+        }
+        // ★ v51.2：判断 HOME 是否是「标准 guest 容器布局」：
+        //   .../Data/Application/<UUID>[/子目录...]
+        //   做法：去掉末段后，剩余部分是否以 /Data/Application/ 结尾
+        BOOL isStandardLayout = NO;
+        {
+            NSString *parent = [home stringByDeletingLastPathComponent];
+            if ([parent hasSuffix:@"/Data/Application"]) isStandardLayout = YES;
+        }
+
+        // ① SideStore 分支：HOME = <LC_HOME>/Documents/SideStore
+        if (isSideStore) forceHomeAsRoot = YES;
+
+        // ② 完全没有任何 marker → 只能是 bookmark 之类的自定义目录
+        if (markerCount == 0) forceHomeAsRoot = YES;
+
+        // ③ 非标准布局，且末段不是容器子目录 → HOME 本身即容器根
+        if (!isStandardLayout && !lastIsSub && last.length > 0) {
+            forceHomeAsRoot = YES;
+        }
+
+        if (forceHomeAsRoot) {
+            KWLog(@"[iso] non-standard layout (markers=%d last=%@) -> HOME is container root",
+                  markerCount, last);
         }
     }
 
-    // B) SideStore / bookmark 兜底：HOME 本身就是容器根
-    //    判据：末段不是 Application，且路径看起来像一个"容器根"
-    //    （含 Library 或 Documents 子目录，或末段像 UUID/标识符）
+    // ---- A) 标准布局 ----
+    //  ★ v51.2：不能只取最后一个 "/Data/Application/" ——
+    //    SideStore 分支的 HOME 形如
+    //      <LC>/Documents/Data/Application/<LC-UUID>/Documents/SideStore
+    //    里面有两处 /Data/Application/，必须挑【能构成合法容器布局】的那一处。
+    //    做法：收集所有出现位置，从右到左逐个验证，取第一个成立的。
+    NSUInteger searchEnd = forceHomeAsRoot ? 0 : home.length;
+    NSRange r = NSMakeRange(NSNotFound, 0);
+    while (searchEnd > 0) {
+        NSRange probe = [home rangeOfString:@"/Data/Application/"
+                                    options:NSBackwardsSearch
+                                      range:NSMakeRange(0, searchEnd)];
+        if (probe.location == NSNotFound) break;
+        NSUInteger afterM = probe.location + probe.length;
+        NSString *tail = [home substringFromIndex:afterM];
+        NSArray *tp = [tail componentsSeparatedByString:@"/"];
+        NSString *cand = tp.count ? tp[0] : nil;
+        BOOL good = NO;
+        if (cand.length) {
+            if (tp.count == 1) {
+                good = YES;
+            } else {
+                static NSString *const okD[] = { @"Documents", @"Library", @"tmp",
+                                                 @"SystemData", @"Caches", @"Inbox",
+                                                 @"Preferences", nil };
+                for (int i = 0; okD[i]; i++) {
+                    if ([tp[1] isEqualToString:okD[i]]) { good = YES; break; }
+                }
+            }
+        }
+        if (good) { r = probe; break; }
+        if (probe.location == 0) break;
+        searchEnd = probe.location;
+    }
+    if (r.location != NSNotFound) {
+        NSUInteger afterMarker = r.location + r.length;
+        NSString *rest = [home substringFromIndex:afterMarker];
+        NSArray *parts = [rest componentsSeparatedByString:@"/"];
+        NSString *candUUID = parts.count ? parts[0] : nil;
+
+        // 校验：candUUID 非空，且路径的后续段名都是容器标准子目录
+        BOOL looksLikeContainer = NO;
+        if (candUUID.length) {
+            if (parts.count == 1) {
+                looksLikeContainer = YES;         // 正好以 UUID 结尾
+            } else {
+                static NSString *const okDirs[] = {
+                    @"Documents", @"Library", @"tmp", @"SystemData", @"Caches",
+                    @"Inbox", @"Preferences", nil
+                };
+                NSString *next = parts[1];
+                for (int i = 0; okDirs[i]; i++) {
+                    if ([next isEqualToString:okDirs[i]]) { looksLikeContainer = YES; break; }
+                }
+            }
+        }
+
+        if (looksLikeContainer) {
+            myRoot = [home substringToIndex:afterMarker + candUUID.length];
+            guestUUID = candUUID;
+
+            // LC 宿主根 = marker 之前，并剥掉末尾的 "/Documents"
+            NSString *before = [home substringToIndex:r.location];
+            if ([before hasSuffix:@"/Documents"]) {
+                before = [before substringToIndex:before.length - 10];   // 去掉 "/Documents"
+            }
+            lcHost = before;
+            sibParent = [before stringByAppendingPathComponent:@"Documents/Data/Application"];
+        }
+    }
+
+    // ---- B) 兜底：HOME 自身即容器根 ----
     if (!myRoot) {
         NSArray *comps = [home pathComponents];
-        if (comps.count >= 2) {
+        // pathComponents 对 "/a/b" 返回 ["/", "a", "b"]
+        if (comps.count >= 3) {                       // 至少有 "/" + 两级
             myRoot = home;
-            guestUUID = home.lastPathComponent;
+            guestUUID = [comps lastObject];
             sibParent = [home stringByDeletingLastPathComponent];
+            // ★ v51.2：宿主根取兄弟目录的父目录（两层上）。
+            //   注意 stringByDeletingLastPathComponent 对 "/a/b" 得 "/a"，
+            //   不会丢前导斜杠；此处保留原值即可。
+            lcHost = [sibParent stringByDeletingLastPathComponent];
+            if (!lcHost.length) lcHost = sibParent;
             KWLog(@"[iso] fallback: HOME treated as container root (%@)", myRoot);
         }
     }
@@ -5800,24 +5930,14 @@ static void KwaiInitContainerRoot(void) {
         return;
     }
 
-    g_myContainerRoot = myRoot;
-    g_myGuestUUID = guestUUID;
-
-    // LC 宿主根：对有 Data/Application/ 布局的，取 marker 之前；
-    // 否则用兄弟容器的父目录（这样 tmp/Library 白名单判断仍成立）
-    {
-        NSRange r = [home rangeOfString:@"/Data/Application/" options:NSBackwardsSearch];
-        if (r.location != NSNotFound) {
-            g_lcHostRoot = [home substringToIndex:r.location];
-        } else {
-            g_lcHostRoot = sibParent ?: [home stringByDeletingLastPathComponent];
-        }
-    }
-    g_siblingParentDir = sibParent;
+    g_myContainerRoot   = myRoot;
+    g_myGuestUUID       = guestUUID;
+    g_lcHostRoot        = lcHost;
+    g_siblingParentDir  = sibParent;
 
     KWLog(@"[iso] my container root: %@", g_myContainerRoot);
     KWLog(@"[iso] guest UUID: %@", g_myGuestUUID ?: @"(none)");
-    KWLog(@"[iso] LC host root: %@", g_lcHostRoot);
+    KWLog(@"[iso] LC host root: %@", g_lcHostRoot ?: @"(none)");
     KWLog(@"[iso] sibling parent: %@", g_siblingParentDir ?: @"(none)");
 }
 
@@ -5874,9 +5994,10 @@ static BOOL kw_isCrossContainerPath(const char *path) {
     //   其余（尤其 Documents/Data/Application/ 下的所有 guest）都必须继续判定。
     const char *host = g_lcHostRoot.UTF8String;
     size_t hl = strlen(host);
-    if (strncmp(path, host, hl) == 0 && (path[hl] == 0 || path[hl] == 47)) {
-        return NO;                      // 宿主根本身
-    }
+    // ★ v51.1 关键修正：删掉「宿主根本身直接放行」。
+    //   因为宿主根（如 <LC>）下就有 Documents/Data/Application/<兄弟UUID>，
+    //   放行前缀等于把全部兄弟容器放过 —— 这正是死号的直接原因。
+    //   只放行宿主自身的 tmp / Library / SystemData，其余一律继续判定。
     if (strncmp(path, host, hl) == 0 && path[hl] == 47) {
         const char *rest = path + hl + 1;   // 相对宿主的首段
         // ★ 只放行宿主自身的这几个目录；Documents 目录不整体放行，
