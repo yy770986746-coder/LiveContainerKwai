@@ -96,6 +96,14 @@ static os_unfair_lock g_logLock = OS_UNFAIR_LOCK_INIT;   // ★ v45：KWLog 会�
 //   os_unfair_lock 直接 trap（EXC_BAD_ACCESS），异线程则永久挂起。
 //   修复原则：锁只保护状态位，所有 IO 与对象构造一律在锁外。
 static void KWLog(NSString *fmt, ...) {
+    // ★ v51.3：KWLog 内部会走 NSFileManager（fileExistsAtPath /
+    //   fileHandleForWritingAtPath），而 stat/open/access 都被本文件 hook，
+    //   hook 里又会 KWLog —— 形成无限递归（栈溢出）。
+    //   这里用线程局部标志彻底断掉任何递归链。
+    static __thread int t_inLog = 0;
+    if (t_inLog) return;          // 已在日志中，丢弃（不要 printf 也不要 NSLog）
+    t_inLog = 1;
+
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -120,7 +128,7 @@ static void KWLog(NSString *fmt, ...) {
     fh = over ? nil : g_logHandle;
     os_unfair_lock_unlock(&g_logLock);
 
-    if (over || !path.length) return;
+    if (over || !path.length) { t_inLog = 0; return; }
 
     // ★ 打开/创建文件在锁外；失败时不缓存空句柄，下次会重试
     if (!fh) {
@@ -134,7 +142,7 @@ static void KWLog(NSString *fmt, ...) {
         os_unfair_lock_lock(&g_logLock);
         g_logHandle = fh;
         os_unfair_lock_unlock(&g_logLock);
-        if (!fh) return;
+        if (!fh) { t_inLog = 0; return; }
     }
 
     @try {
@@ -147,6 +155,7 @@ static void KWLog(NSString *fmt, ...) {
         os_unfair_lock_unlock(&g_logLock);
     }
     NSLog(@"[KwaiWeChatLogin] %@", m);
+    t_inLog = 0;
 }
 
 // ----------  ----------
@@ -5973,18 +5982,27 @@ static BOOL kw_isCrossContainerPath(const char *path) {
         const char *hit2 = NULL;
         for (const char *q = strstr(path, mk); q; q = strstr(q + 1, mk))
             hit2 = q;
-        if (hit2) {
-            KWLog(@"[iso] WARN: roots uninitialised but path hits %s, blocking", path);
-            return YES;
-        }
+        // ★ v51.3：原来这里打 KWLog 并 return YES。
+        //   两个问题：
+        //     ① KWLog 走 NSFileManager → 命中自己 hook 的 stat → 递归；
+        //     ② 「命中 /Data/Application/ 就拦」会把自己容器的路径也拦掉
+        //        （自己容器同样含这个串）→ 根识别一旦失败，App 直接崩。
+        //   现在：不记日志、一律放行。隔离是增强，崩溃是致命的。
+        (void)hit2;
         return NO;
     }
 
     const char *root = g_myContainerRoot.UTF8String;
     size_t rl = strlen(root);
+    size_t pl_now = strlen(path);
     // 快路径：自己容器根（带边界检查，防 <UUID>_x / <UUID>.tmp 混淆）
-    if (strncmp(path, root, rl) == 0) {
-        if (path[rl] == 0 || path[rl] == 47) return NO;
+    //  ★ v51.3：① 先比长度再 strncmp，避免 path[rl] 越界读；
+    //            ② 命中后仍要检查是否含 ".."，否则
+    //               <自己根>/Documents/../../<兄弟UUID> 会被直接放行。
+    if (pl_now >= rl && strncmp(path, root, rl) == 0) {
+        if (pl_now == rl || path[rl] == 47) {
+            if (!strstr(path, "..")) return NO;
+        }
     }
     // ★ v47.7.1 LC 宿主容器白名单【收窄】
     //   v47.7 首次实现时把整个 LC 宿主根放行，结果它的子目录
@@ -6047,9 +6065,17 @@ static BOOL kw_isCrossContainerPath(const char *path) {
     if (strncmp(hp, "/private/", 9) == 0) hp += 8;
     size_t rpl = strlen(rp), hpl = strlen(hp);
 
-    // 剥 /private 后重新做自己容器 / 宿主判定
+    // 剥 /private 后重新做自己容器判定
     if (strncmp(sp, rp, rpl) == 0 && (sp[rpl] == 0 || sp[rpl] == 47)) return NO;
-    if (strncmp(sp, hp, hpl) == 0 && (sp[hpl] == 0 || sp[hpl] == 47)) return NO;
+
+    // ★★ v51.4 致命修复：删掉「宿主根无条件放行」★★
+    //   原来是：
+    //     if (strncmp(sp, hp, hpl) == 0 && (sp[hpl]==0||sp[hpl]==47)) return NO;
+    //   hp = <LC-HOST>，而兄弟容器就在
+    //     <LC-HOST>/Documents/Data/Application/<SIB>
+    //   前缀必然命中 → 直接放行，根本走不到下面的 marker 判定
+    //   → 隔离形同虚设（这就是「注册死号」复发的直接原因）。
+    //   只保留宿主自身 tmp / Library / SystemData 白名单。
     if (strncmp(sp, hp, hpl) == 0 && sp[hpl] == 47) {
         const char *rest = sp + hpl + 1;
         if (strncmp(rest, "tmp", 3) == 0 && (rest[3] == 0 || rest[3] == 47)) return NO;
@@ -6058,12 +6084,28 @@ static BOOL kw_isCrossContainerPath(const char *path) {
     }
 
     // ★ 只拦：路径里出现 Data/Application/<其他UUID>
-    const char *marker = "/Documents/Data/Application/";
+    //   ★ v51.4：两种布局都要认 ——
+    //     默认布局  <LC>/Documents/Data/Application/<UUID>
+    //     AppGroup  <appGroup>/Data/Application/<UUID>
+    //   原来只认前者，后者（isSharedBundle 分支）永远不中 → 全放行。
+    static const char *const kMarkers[] = {
+        "/Documents/Data/Application/",
+        "/Data/Application/",
+        NULL
+    };
     const char *hit = NULL;
-    for (const char *p = strstr(sp, marker); p; p = strstr(p + 1, marker))
-        hit = p;                      // 取最深的一个
+    for (int mi = 0; kMarkers[mi]; mi++) {
+        const char *mk = kMarkers[mi];
+        size_t ml = strlen(mk);
+        for (const char *p = strstr(sp, mk); p; p = strstr(p + 1, mk)) {
+            if (!hit || p > hit) hit = p;
+        }
+        if (hit) {
+            hit += ml;
+            break;                    // 用更长的 marker（/Documents/... 优先）
+        }
+    }
     if (!hit) return NO;              // 不在 guest 目录结构内 → 放行
-    hit += strlen(marker);
     if (!*hit) return NO;
 
     char seg2[128];
@@ -6074,7 +6116,7 @@ static BOOL kw_isCrossContainerPath(const char *path) {
     // 等于自己 → 放行；其余 UUID → 兄弟容器，拦
     const char *mine = g_myGuestUUID.UTF8String;
     if (mine && strcmp(mine, seg2) == 0) return NO;
-    KWLog(@"[iso] blocked sibling: %.40s", seg2);
+            // ★ v51.3：删除此处的 KWLog —— 热路径递归源
     return YES;
 }
 
