@@ -71,7 +71,9 @@ static void KwaiDumpPlist(void);
 static NSString *KwaiGetFiveString(void);
 static void KwaiDumpPassToken(void);        // ★ v50 passToken
 static NSDictionary *KwaiLoadBasicInfo(void);
-static NSString *KwaiCurrentUserId(void);
+static NSString *KwaiCurrentUserIdFromFile(void);
+static NSString *KwaiFindBasicInfoPath(void);
+static NSDictionary *KwaiUnarchiveBasicInfo(NSData *d);
 void KwaiStartBallWatcher(void);
 void KwaiShowBall(void);
 BOOL KwaiIsLoggedIn(void);
@@ -2413,74 +2415,45 @@ static void KwaiDumpPlist(void) {
 //        必须走 NSKeyedUnarchiver 才能拿到真正的业务字典。
 // ============================================================
 
-// 当前登录用户的 user_id（basic_info 目录名就是它）。
-// 优先读 current_user 文件（存的就是 uid），失败则扫描 users 目录下最新的子目录。
-static NSString *KwaiCurrentUserId(void) {
+// 找出「当前登录用户」的 basic_info 路径。
+//
+// ★ 实机踩坑（iPhone13,2 / iOS15.4）：
+//   com.kuaishou.users/current_user 存的是 NSKeyedArchiver(NSNumber)，
+//   值是 user_id（如 2933379443）；
+//   但用户【目录名是 MD5 哈希】（如 9c8e3cd6f35f17d84394ac12eb836db9），
+//   两者完全不同 —— 不能把 current_user 的值直接当目录名用。
+//
+//   正确做法：遍历所有子目录，挑 basic_info 存在且能解出 passToken 的、
+//   修改时间最新的那个。current_user 的 user_id 只用于最后校验。
+
+// current_user 里记录的 user_id（可能为 nil）
+static NSString *KwaiCurrentUserIdFromFile(void) {
     NSString *usersRoot = [NSHomeDirectory() stringByAppendingPathComponent:
                            @"Library/Application Support/com.kuaishou.users"];
-    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *cu = [usersRoot stringByAppendingPathComponent:@"current_user"];
+    NSData *d = [NSData dataWithContentsOfFile:cu];
+    if (!d.length) return nil;
 
-    // ① current_user 文件里通常直接是 uid 字符串
+    id o = nil;
     @try {
-        NSString *cu = [usersRoot stringByAppendingPathComponent:@"current_user"];
-        NSString *s = [NSString stringWithContentsOfFile:cu
-                                                encoding:NSUTF8StringEncoding error:nil];
-        if (!s.length) {
-            // 可能是归档格式，试 unarchive
-            NSData *d = [NSData dataWithContentsOfFile:cu];
-            if (d.length) {
-                id o = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSObject class]
-                                                         fromData:d error:nil];
-                if (!o) o = [NSKeyedUnarchiver unarchiveObjectWithData:d];
-                if ([o isKindOfClass:[NSString class]]) s = o;
-                else if ([o isKindOfClass:[NSNumber class]]) s = [o stringValue];
-            }
-        }
-        s = [s stringByTrimmingCharactersInSet:
-             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (s.length && [s rangeOfCharacterFromSet:
-                         [[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
-            return s;   // 纯数字 → 是 uid
-        }
+        o = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSObject class]
+                                              fromData:d error:nil];
     } @catch (NSException *e) {}
-
-    // ② 回退：扫 users 目录，取 basic_info 修改时间最新的那个子目录
-    @try {
-        NSArray *subs = [fm contentsOfDirectoryAtPath:usersRoot error:nil];
-        NSString *bestUid = nil;
-        NSDate *bestDate = nil;
-        for (NSString *sub in subs) {
-            if ([sub isEqualToString:@"current_user"]) continue;
-            NSString *bi = [[usersRoot stringByAppendingPathComponent:sub]
-                            stringByAppendingPathComponent:@"basic_info"];
-            NSDictionary *attr = [fm attributesOfItemAtPath:bi error:nil];
-            if (!attr) continue;
-            NSDate *mt = attr[NSFileModificationDate];
-            if (!mt) continue;
-            if (!bestDate || [mt compare:bestDate] == NSOrderedDescending) {
-                bestDate = mt;
-                bestUid = sub;
-            }
-        }
-        if (bestUid.length) return bestUid;
-    } @catch (NSException *e) {}
-
+    if (!o) {
+        @try { o = [NSKeyedUnarchiver unarchiveObjectWithData:d]; }
+        @catch (NSException *e) {}
+    }
+    if ([o isKindOfClass:[NSNumber class]]) return [(NSNumber *)o stringValue];
+    if ([o isKindOfClass:[NSString class]]) {
+        return [(NSString *)o stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
     return nil;
 }
 
-// 读 basic_info 并解开成业务字典
-static NSDictionary *KwaiLoadBasicInfo(void) {
-    NSString *uid = KwaiCurrentUserId();
-    if (!uid.length) { KWLog(@"[pt] current user id not found"); return nil; }
-
-    NSString *p = [[[NSHomeDirectory() stringByAppendingPathComponent:
-                     @"Library/Application Support/com.kuaishou.users"]
-                    stringByAppendingPathComponent:uid]
-                   stringByAppendingPathComponent:@"basic_info"];
-    NSData *d = [NSData dataWithContentsOfFile:p];
-    if (!d.length) { KWLog(@"[pt] basic_info empty: %@", p); return nil; }
-
-    // basic_info 是 NSKeyedArchiver 归档，必须 unarchive
+// 把 basic_info 的原始数据解成业务字典（NSKeyedArchiver 归档）
+static NSDictionary *KwaiUnarchiveBasicInfo(NSData *d) {
+    if (!d.length) return nil;
     id root = nil;
     @try {
         root = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSObject class]
@@ -2490,22 +2463,83 @@ static NSDictionary *KwaiLoadBasicInfo(void) {
         @try { root = [NSKeyedUnarchiver unarchiveObjectWithData:d]; }
         @catch (NSException *e) {}
     }
-    if ([root isKindOfClass:[NSDictionary class]]) {
-        KWLog(@"[pt] basic_info loaded, %lu keys", (unsigned long)[(NSDictionary *)root count]);
-        return (NSDictionary *)root;
+    if ([root isKindOfClass:[NSDictionary class]]) return (NSDictionary *)root;
+
+    // 少数版本可能真是普通 plist（但要排掉 NSKeyedArchiver 外壳）
+    id plain = nil;
+    @try { plain = [NSPropertyListSerialization propertyListWithData:d
+                                                            options:0
+                                                             format:NULL
+                                                              error:NULL]; }
+    @catch (NSException *e) {}
+    if ([plain isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *pd = (NSDictionary *)plain;
+        if (!pd[@"$objects"] && !pd[@"$archiver"]) return pd;
     }
-    // 少数版本可能真是普通 plist
-    NSDictionary *plain = [NSDictionary dictionaryWithContentsOfFile:p];
-    if (plain) {
-        // 排掉 NSKeyedArchiver 的外壳
-        if (plain[@"$objects"] || plain[@"$archiver"]) {
-            KWLog(@"[pt] basic_info is archive shell, unarchive yielded nil");
-            return nil;
-        }
-        return plain;
-    }
-    KWLog(@"[pt] basic_info unreadable");
     return nil;
+}
+
+// 扫描所有用户目录，返回 basic_info 的完整路径（优先含 passToken、其次最新）
+static NSString *KwaiFindBasicInfoPath(void) {
+    NSString *usersRoot = [NSHomeDirectory() stringByAppendingPathComponent:
+                           @"Library/Application Support/com.kuaishou.users"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *subs = [fm contentsOfDirectoryAtPath:usersRoot error:nil];
+    if (!subs.count) { KWLog(@"[pt] users dir empty: %@", usersRoot); return nil; }
+
+    NSString *bestPath = nil;
+    NSDate *bestDate = nil;
+    NSString *withTokenPath = nil;
+    NSDate *withTokenDate = nil;
+
+    for (NSString *sub in subs) {
+        if ([sub isEqualToString:@"current_user"]) continue;
+        NSString *dir = [usersRoot stringByAppendingPathComponent:sub];
+        NSString *bi = [dir stringByAppendingPathComponent:@"basic_info"];
+        NSDictionary *attr = [fm attributesOfItemAtPath:bi error:nil];
+        if (!attr) continue;
+        NSDate *mt = attr[NSFileModificationDate] ?: [NSDate distantPast];
+
+        // 记录最新的（兜底）
+        if (!bestDate || [mt compare:bestDate] == NSOrderedDescending) {
+            bestDate = mt;
+            bestPath = bi;
+        }
+        // 记录"含 passToken"里最新的（优先）
+        NSData *d = [NSData dataWithContentsOfFile:bi];
+        if (d.length) {
+            NSDictionary *dd = KwaiUnarchiveBasicInfo(d);
+            id pt = dd[@"passToken"];
+            if ([pt isKindOfClass:[NSString class]] && [pt length] > 20) {
+                if (!withTokenDate || [mt compare:withTokenDate] == NSOrderedDescending) {
+                    withTokenDate = mt;
+                    withTokenPath = bi;
+                }
+            }
+        }
+    }
+
+    NSString *curId = KwaiCurrentUserIdFromFile();
+    KWLog(@"[pt] current_user id = %@, picked = %@",
+          curId ?: @"(nil)", withTokenPath ?: bestPath);
+    if (withTokenPath) return withTokenPath;
+    return bestPath;
+}
+
+// 读 basic_info 并解开成业务字典
+static NSDictionary *KwaiLoadBasicInfo(void) {
+    NSString *p = KwaiFindBasicInfoPath();
+    if (!p.length) { KWLog(@"[pt] basic_info not found"); return nil; }
+
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d.length) { KWLog(@"[pt] basic_info empty: %@", p); return nil; }
+
+    NSDictionary *bi = KwaiUnarchiveBasicInfo(d);
+    if (!bi) { KWLog(@"[pt] basic_info unreadable: %@", p); return nil; }
+
+    KWLog(@"[pt] basic_info loaded from %@, %lu keys",
+          [p lastPathComponent], (unsigned long)bi.count);
+    return bi;
 }
 
 // 从 basic_info 提取 passToken 及同族 token
