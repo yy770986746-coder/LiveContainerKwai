@@ -3226,31 +3226,195 @@ void KwaiSetupStorageSpoof(void) {
 }
 
 // ---- ① statfs ----
+
+// ============================================================
+//  ★ v51：补全跨容器隔离的路径 API 覆盖
+//
+//  背景：原实现只 hook 了 stat/lstat/open/openat/fopen/access/opendir/statfs/statfs64 中的一部分。
+//  快手只要换一个等价 API 就能读到兄弟容器 —— 一旦读到，
+//  风控即可确认「同设备多账号」→ 死号。
+//
+//  补上的入口：
+//    stat64 / lstat64      —— 部分 SDK 走 64 位符号
+//    fstatat / faccessat   —— openat 家族，dirfd 相对路径可绕过
+//    readlink / realpath   —— 解析容器路径用
+//    scandir / fdopendir   —— 列目录
+//    statfs64 / fstatfs / getmntinfo —— 磁盘信息（顺带同步 v50 的容量伪造）
+// ============================================================
+
+// ★ v51：以下函数定义在本段之后，先前置声明
+static BOOL kw_isDataVolumePath(const char *path);
+void kw_patch_statfs_buf(struct statfs *buf);
+static BOOL kw_isCrossContainerPath(const char *path);
+static BOOL JIsJailbreakPath(const char *path);
+
+// ---- stat64 / lstat64 ----
+static int (*orig_stat64_d)(const char *, struct stat *) = NULL;
+static int (*orig_lstat64_d)(const char *, struct stat *) = NULL;
+static int kw_stat64_d(const char *p, struct stat *buf) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    return orig_stat64_d ? orig_stat64_d(p, buf) : -1;
+}
+static int kw_lstat64_d(const char *p, struct stat *buf) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    return orig_lstat64_d ? orig_lstat64_d(p, buf) : -1;
+}
+
+// ---- fstatat / faccessat ----
+//   dirfd 相对路径：若 path 是相对路径，先拼上 dirfd 的绝对路径再判定；
+//   拿不到就不拦（宁可放过正常访问，也不误杀 —— 但相对路径含 ".." 一定拦）。
+static int (*orig_fstatat_d)(int, const char *, struct stat *, int) = NULL;
+static int (*orig_faccessat_d)(int, const char *, int, int) = NULL;
+
+// 把 (dirfd, path) 拼成绝对路径；失败返回 nil
+static NSString *kw_composeDirfdPath(int dirfd, const char *path) {
+    if (!path) return nil;
+    if (path[0] == '/') return [NSString stringWithUTF8String:path];
+    if (dirfd == AT_FDCWD) return nil;      // 相对 cwd，无法可靠还原
+    char buf[PATH_MAX];
+    // fcntl F_GETPATH 拿 fd 对应路径（Darwin 支持）
+    if (fcntl(dirfd, F_GETPATH, buf) == 0 && buf[0]) {
+        NSString *base = [NSString stringWithUTF8String:buf];
+        return [base stringByAppendingPathComponent:[NSString stringWithUTF8String:path]];
+    }
+    return nil;
+}
+
+static int kw_fstatat_d(int dirfd, const char *path, struct stat *buf, int flag) {
+    NSString *full = kw_composeDirfdPath(dirfd, path);
+    if (full && (JIsJailbreakPath(full.fileSystemRepresentation) ||
+                 kw_isCrossContainerPath(full.fileSystemRepresentation))) {
+        errno = ENOENT; return -1;
+    }
+    if (!full && path && path[0] != '/' && strstr(path, "..")) {
+        errno = ENOENT; return -1;         // 相对路径含 .. 直接拦
+    }
+    return orig_fstatat_d ? orig_fstatat_d(dirfd, path, buf, flag) : -1;
+}
+
+static int kw_faccessat_d(int dirfd, const char *path, int mode, int flag) {
+    NSString *full = kw_composeDirfdPath(dirfd, path);
+    if (full && (JIsJailbreakPath(full.fileSystemRepresentation) ||
+                 kw_isCrossContainerPath(full.fileSystemRepresentation))) {
+        errno = ENOENT; return -1;
+    }
+    if (!full && path && path[0] != '/' && strstr(path, "..")) {
+        errno = ENOENT; return -1;
+    }
+    return orig_faccessat_d ? orig_faccessat_d(dirfd, path, mode, flag) : -1;
+}
+
+// ---- readlink / realpath ----
+static ssize_t (*orig_readlink_d)(const char *, char *, size_t) = NULL;
+static char *(*orig_realpath_d)(const char *, char *) = NULL;
+
+static ssize_t kw_readlink_d(const char *p, char *buf, size_t sz) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    return orig_readlink_d ? orig_readlink_d(p, buf, sz) : -1;
+}
+static char *kw_realpath_d(const char *p, char *resolved) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return NULL; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return NULL; }
+    return orig_realpath_d ? orig_realpath_d(p, resolved) : NULL;
+}
+
+// ---- scandir ----
+typedef int (*scandir_filter_fn)(const struct dirent *);
+typedef int (*scandir_cmp_fn)(const struct dirent **, const struct dirent **);
+static int (*orig_scandir_d)(const char *, struct dirent ***,
+                             scandir_filter_fn, scandir_cmp_fn) = NULL;
+static int kw_scandir_d(const char *p, struct dirent ***namelist,
+                        scandir_filter_fn filter, scandir_cmp_fn compar) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    return orig_scandir_d ? orig_scandir_d(p, namelist, filter, compar) : -1;
+}
+
+// ---- fdopendir ----
+static DIR *(*orig_fdopendir_d)(int) = NULL;
+static DIR *kw_fdopendir_d(int fd) {
+    char buf[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, buf) == 0 && buf[0]) {
+        if (JIsJailbreakPath(buf) || kw_isCrossContainerPath(buf)) {
+            errno = ENOENT; return NULL;
+        }
+    }
+    return orig_fdopendir_d ? orig_fdopendir_d(fd) : NULL;
+}
+
+// ---- statfs64 / fstatfs / getmntinfo（同时接 v50 的容量伪造）----
+static int (*orig_statfs64_iso)(const char *, struct statfs *) = NULL;
+static int (*orig_fstatfs_iso)(int, struct statfs *) = NULL;
+static int (*orig_getmntinfo_iso)(struct statfs **, int) = NULL;
+
+static int kw_statfs64_iso(const char *p, struct statfs *buf) {
+    if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
+    int r = orig_statfs64_iso ? orig_statfs64_iso(p, buf) : -1;
+    if (r == 0 && buf && g_fakeDiskTotal > 0 && kw_isDataVolumePath(p)) {
+        kw_patch_statfs_buf(buf);
+    }
+    return r;
+}
+static int kw_fstatfs_iso(int fd, struct statfs *buf) {
+    int r = orig_fstatfs_iso ? orig_fstatfs_iso(fd, buf) : -1;
+    if (r == 0 && buf && g_fakeDiskTotal > 0) {
+        if (buf->f_blocks && buf->f_bsize) {
+            uint64_t total = buf->f_blocks * (uint64_t)buf->f_bsize;
+            if (total > 4ULL * 1024 * 1024 * 1024) kw_patch_statfs_buf(buf);
+        }
+    }
+    return r;
+}
+static int kw_getmntinfo_iso(struct statfs **mntbufp, int flags) {
+    int n = orig_getmntinfo_iso ? orig_getmntinfo_iso(mntbufp, flags) : -1;
+    if (n > 0 && mntbufp && *mntbufp && g_fakeDiskTotal > 0) {
+        for (int i = 0; i < n; i++) {
+            const char *mn = (*mntbufp)[i].f_mntonname;
+            if (mn && kw_isDataVolumePath(mn)) kw_patch_statfs_buf(&(*mntbufp)[i]);
+        }
+    }
+    return n;
+}
+// ★ v51：抽出公共函数，供 statfs / statfs64 / fstatfs / getmntinfo 共用
+static BOOL kw_isDataVolumePath(const char *path) {
+    if (!path) return NO;
+    if (strcmp(path, "/") == 0) return YES;
+    if (strncmp(path, "/private/var/", 13) == 0) return YES;
+    if (strncmp(path, "/var/", 5) == 0) return YES;
+    if (strstr(path, "/private/var/mobile/Containers/Data/Application")) return YES;
+    if (strstr(path, "/Containers/Data/Application")) return YES;
+    return NO;
+}
+
+// 把 statfs 结构改成伪造容量（保留 2% 预留 + inode 自洽）
+void kw_patch_statfs_buf(struct statfs *buf) {
+    if (!buf || g_fakeDiskTotal <= 0) return;
+    uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
+    buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
+    buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
+    // 2% 预留：真机 bavail < bfree
+    uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
+    buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
+    // inode：APFS 约 4KB 块 / 每 12 块 1 个 inode（256GB ≈ 5.2M，接近真机；
+    // 原 total/128/64 会算出 31M，偏大 5 倍，可被检测）
+    uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 4096.0 / 12.0);
+    if (inodes < 1000) inodes = 1000;
+    buf->f_files = inodes;
+    buf->f_ffree = (uint64_t)((double)inodes * 0.93);
+}
+
 static int (*orig_statfs_d)(const char *, struct statfs *) = NULL;
 static int kw_statfs_d(const char *path, struct statfs *buf) {
+    // ★ v51：statfs 也补跨容器判定（原来只判容量）
+    if (JIsJailbreakPath(path)) { errno = ENOENT; return -1; }
+    if (kw_isCrossContainerPath(path)) { errno = ENOENT; return -1; }
     int r = orig_statfs_d ? orig_statfs_d(path, buf) : -1;
-    if (r == 0 && buf && g_fakeDiskTotal > 0) {
-        // ★ v47.6 修 M2：strncmp(path,"/var",4) 会误命中 /variant、/var-tmp
-        BOOL dataVol = NO;
-        if (path) {
-            if (strcmp(path, "/") == 0) dataVol = YES;
-            else if (strncmp(path, "/private/var/", 13) == 0) dataVol = YES;
-            else if (strncmp(path, "/var/", 5) == 0) dataVol = YES;
-            else if (strstr(path, "/private/var/mobile/Containers/Data/Application")) dataVol = YES;
-        }
-        if (dataVol) {
-            // ★ 修 M11：补 2% 保留块（真机 bavail < bfree）与 inode 数，
-            //   否则风控用 f_files 或 bavail==bfree 即可判定非真机文件系统。
-            //   注意：Darwin 的 struct statfs 既没有 f_bused 也没有 f_frsize 字段。
-            uint32_t bsize = buf->f_bsize ? buf->f_bsize : 4096;
-            buf->f_blocks = (uint64_t)(g_fakeDiskTotal / bsize);
-            buf->f_bfree  = (uint64_t)(g_fakeDiskFree  / bsize);
-            uint64_t reserved = (uint64_t)((double)g_fakeDiskTotal * 0.02 / bsize);
-            buf->f_bavail = (buf->f_bfree > reserved) ? (buf->f_bfree - reserved) : buf->f_bfree;
-            uint64_t inodes = (uint64_t)((double)g_fakeDiskTotal / 128.0 / 64.0);
-            buf->f_files = inodes;
-            buf->f_ffree = (uint64_t)((double)inodes * 0.88);
-        }
+    if (r == 0 && buf && g_fakeDiskTotal > 0 && kw_isDataVolumePath(path)) {
+        kw_patch_statfs_buf(buf);
     }
     return r;
 }
@@ -3844,6 +4008,8 @@ typedef uint32_t SecCSFlags;
 #include <sys/socket.h>
 #include <sys/param.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <errno.h>
 #include "litehook.h"
 
@@ -3913,12 +4079,16 @@ static void KwaiInitContainerRoot(void);
 static NSString *g_myContainerRoot = nil;
 static NSString *g_myGuestUUID = nil;
 static NSString *g_lcHostRoot = nil;
+static NSString *g_siblingParentDir = nil;   // ★ v51 兄弟容器所在目录
 
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
 
 static int kw_stat(const char *p, struct stat *buf) {
     if (JIsJailbreakPath(p)) { errno = ENOENT; return -1; }
+    // ★ v51：原来这里【漏了】跨容器判定（kw_lstat 有、kw_stat 没有）。
+    //   快手用 stat() 就能读到兄弟容器的元数据，绕过 fnstat/lstat 拦截。
+    if (kw_isCrossContainerPath(p)) { errno = ENOENT; return -1; }
     return orig_stat ? orig_stat(p, buf) : -1;
 }
 static int kw_lstat(const char *p, struct stat *buf) {
@@ -4035,6 +4205,35 @@ void KwaiJailbreakInstall(void) {
 
     orig_openat = openat;
     JRebind("openat", (void *)openat, (void *)kw_openat, (void **)&orig_openat);
+
+    // ★ v51：补全其余路径 API 的安装（缺一个就是一个绕过口）
+    {
+        struct { const char *name; void *fn; void *replace; void **orig; } tbl[] = {
+            {"stat64",    dlsym(RTLD_DEFAULT, "stat64"),    (void *)kw_stat64_d,    (void **)&orig_stat64_d},
+            {"lstat64",   dlsym(RTLD_DEFAULT, "lstat64"),   (void *)kw_lstat64_d,   (void **)&orig_lstat64_d},
+            {"fstatat",   dlsym(RTLD_DEFAULT, "fstatat"),   (void *)kw_fstatat_d,   (void **)&orig_fstatat_d},
+            {"faccessat", dlsym(RTLD_DEFAULT, "faccessat"), (void *)kw_faccessat_d, (void **)&orig_faccessat_d},
+            {"readlink",  dlsym(RTLD_DEFAULT, "readlink"),  (void *)kw_readlink_d,  (void **)&orig_readlink_d},
+            {"realpath",  dlsym(RTLD_DEFAULT, "realpath"),  (void *)kw_realpath_d,  (void **)&orig_realpath_d},
+            {"scandir",   dlsym(RTLD_DEFAULT, "scandir"),   (void *)kw_scandir_d,   (void **)&orig_scandir_d},
+            {"fdopendir", dlsym(RTLD_DEFAULT, "fdopendir"), (void *)kw_fdopendir_d, (void **)&orig_fdopendir_d},
+            {"statfs64",  dlsym(RTLD_DEFAULT, "statfs64"),  (void *)kw_statfs64_iso, (void **)&orig_statfs64_iso},
+            {"fstatfs",   dlsym(RTLD_DEFAULT, "fstatfs"),   (void *)kw_fstatfs_iso,  (void **)&orig_fstatfs_iso},
+            {"getmntinfo",dlsym(RTLD_DEFAULT, "getmntinfo"),(void *)kw_getmntinfo_iso,(void **)&orig_getmntinfo_iso},
+        };
+        int okN = 0, missN = 0;
+        for (size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); i++) {
+            if (!tbl[i].fn) { missN++; KWLog(@"[iso] %s NOT FOUND", tbl[i].name); continue; }
+            @try {
+                *tbl[i].orig = tbl[i].fn;
+                litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, tbl[i].fn, tbl[i].replace, NULL);
+                okN++;
+            } @catch (NSException *e) {
+                KWLog(@"[iso] %s rebind ex: %@", tbl[i].name, e);
+            }
+        }
+        KWLog(@"[iso] extra hooks installed=%d missing=%d", okN, missN);
+    }
 
     // ★ v47.7 自检：纯字符串判定，构造路径字符串直接问判定函数。
     //   ⚠️ 绝不能用 contentsOfDirectoryAtPath: —— 它会走我们自己 hook 的 opendir，
@@ -5550,23 +5749,76 @@ static void KwaiInitContainerRoot(void) {
     if (g_myContainerRoot) return;
     NSString *home = NSHomeDirectory();
     if (!home.length) return;
-    NSString *marker = @"/Documents/Data/Application/";
-    NSRange r = [home rangeOfString:marker options:NSBackwardsSearch];
-    if (r.location == NSNotFound) {
-        KWLog(@"[iso] container root not recognised: %@", home);
+
+    // ★★ v51 关键修复 ★★
+    //   LC 的 guest HOME 有 4 条不同分支（见 LC 源码）：
+    //     ① SideStore : HOME = specifiedSideStoreContainerPath 或 <doc>/SideStore
+    //     ② bookmark  : HOME = bookmarkURL.path（用户在文件 App 里自选，路径任意）
+    //     ③ SharedBundle: HOME = <appGroup>/Data/Application/<uuid>
+    //     ④ 默认      : HOME = <doc>/Data/Application/<uuid>
+    //   原实现只认 ④（写死 "/Documents/Data/Application/"），
+    //   走 ①②③ 时找不到 marker → g_myContainerRoot 永远 nil →
+    //   kw_isCrossContainerPath 开头直接 return NO（全放行）→
+    //   【隔离完全失效】→ 快手能读本机所有兄弟容器 → 判定多账号 → 死号。
+    //
+    //   现在按优先级尝试多种布局，最后兜底把 HOME 当容器根。
+
+    NSString *myRoot = nil;
+    NSString *guestUUID = nil;
+    NSString *sibParent = nil;      // 兄弟容器所在目录
+
+    // A) 通用：*/Data/Application/<UUID>（覆盖 ③ 和 ④）
+    {
+        NSRange r = [home rangeOfString:@"/Data/Application/" options:NSBackwardsSearch];
+        if (r.location != NSNotFound) {
+            NSUInteger s = r.location + r.length;
+            NSString *rest = [home substringFromIndex:s];
+            NSString *uuid = [[rest componentsSeparatedByString:@"/"] firstObject];
+            if (uuid.length) {
+                myRoot = [home substringToIndex:s + uuid.length];
+                guestUUID = uuid;
+                sibParent = [home substringToIndex:r.location + r.length - 1]; // 去掉末尾'/'
+            }
+        }
+    }
+
+    // B) SideStore / bookmark 兜底：HOME 本身就是容器根
+    //    判据：末段不是 Application，且路径看起来像一个"容器根"
+    //    （含 Library 或 Documents 子目录，或末段像 UUID/标识符）
+    if (!myRoot) {
+        NSArray *comps = [home pathComponents];
+        if (comps.count >= 2) {
+            myRoot = home;
+            guestUUID = home.lastPathComponent;
+            sibParent = [home stringByDeletingLastPathComponent];
+            KWLog(@"[iso] fallback: HOME treated as container root (%@)", myRoot);
+        }
+    }
+
+    if (!myRoot.length) {
+        KWLog(@"[iso] *** CANNOT determine container root: %@ ***", home);
         return;
     }
-    NSUInteger start = r.location + marker.length;
-    NSString *rest = [home substringFromIndex:start];
-    NSString *uuid = [[rest componentsSeparatedByString:@"/"] firstObject];
-    if (!uuid.length) return;
-    g_myContainerRoot = [home substringToIndex:start + uuid.length];
-    g_myGuestUUID = uuid;
-    // ★ v47.7：同时记录 LC 宿主容器根 —— guest 的 tmp 是指向它的 symlink，
-    //   微信 SDK 授权回调要经由它取临时文件，必须放行（v47 误杀它导致授权失败）。
-    g_lcHostRoot = [home substringToIndex:r.location];
+
+    g_myContainerRoot = myRoot;
+    g_myGuestUUID = guestUUID;
+
+    // LC 宿主根：对有 Data/Application/ 布局的，取 marker 之前；
+    // 否则用兄弟容器的父目录（这样 tmp/Library 白名单判断仍成立）
+    {
+        NSRange r = [home rangeOfString:@"/Data/Application/" options:NSBackwardsSearch];
+        if (r.location != NSNotFound) {
+            g_lcHostRoot = [home substringToIndex:r.location];
+        } else {
+            g_lcHostRoot = sibParent ?: [home stringByDeletingLastPathComponent];
+        }
+    }
+    g_siblingParentDir = sibParent;
+
     KWLog(@"[iso] my container root: %@", g_myContainerRoot);
+    KWLog(@"[iso] guest UUID: %@", g_myGuestUUID ?: @"(none)");
     KWLog(@"[iso] LC host root: %@", g_lcHostRoot);
+    KWLog(@"[iso] sibling parent: %@", g_siblingParentDir ?: @"(none)");
 }
 
 // ★ v47.7 系统路径白名单：不在容器根下但属正常系统访问，必须放行
@@ -5594,7 +5846,19 @@ static BOOL kw_isCrossContainerPath(const char *path) {
         // 相对路径：含 ".." 一律拒绝（沙盒不阻止 .. 穿越）
         return strstr(path, "..") != NULL;
     }
-    if (!g_myContainerRoot.length || !g_lcHostRoot.length) return NO;  // 未初始化不拦
+    if (!g_myContainerRoot.length || !g_lcHostRoot.length) {
+        // ★ v51：原来这里直接 return NO（全放行）—— 一旦路径识别失败，
+        //   隔离就完全失效。改为【保守兜底】：仍然拦截明显的跨容器形态。
+        const char *mk = "/Data/Application/";
+        const char *hit2 = NULL;
+        for (const char *q = strstr(path, mk); q; q = strstr(q + 1, mk))
+            hit2 = q;
+        if (hit2) {
+            KWLog(@"[iso] WARN: roots uninitialised but path hits %s, blocking", path);
+            return YES;
+        }
+        return NO;
+    }
 
     const char *root = g_myContainerRoot.UTF8String;
     size_t rl = strlen(root);
