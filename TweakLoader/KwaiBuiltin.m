@@ -61,7 +61,6 @@ static long long g_fakeDiskFree;
 static int g_fakeFreqMHz;
 static int g_fakeSoCId;
 static int g_fakeArmE;
-static char g_fakeKernelVersion[128];
 static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldlenp);
 
 static NSString * const kApiV2Token = @"eyJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIyMTA1MzE0NDk1MTQ3ODAyNjI0Iiwic3ViIjoiMzc0NDg3NTc0IiwiaWF0IjoxNzkwODc5OTc4LCJyb2xlcyI6IlJPTEVfTk9STUFMIiwiZXhwIjoxNzkzNDcxOTc4fQ.A7ncnsAFqwUTrvGMCBZtJavKQZwaaLYzKFelynN13aU";
@@ -1490,10 +1489,26 @@ static int kw_sysctl_mib(int *name, u_int namelen, void *oldp, size_t *oldlenp,
                          void *newp, size_t newlen) {
     if (name && namelen >= 2 && oldp && oldlenp) {
         // hw.machine = {CTL_HW, HW_MACHINE}; hw.model = {CTL_HW, HW_MODEL}
-        if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[1] == HW_MODEL)) {
+        //
+        // ★★ v51.5 关键修复（同一设备两个答案）★★
+        //   原来这两条 MIB 都返回 g_fakeMachineC（如 "iPhone15,2"），
+        //   但 sysctlbyname("hw.model") 返回的是 g_fakeBoardC（如 "D73AP"）。
+        //   真机语义：
+        //     hw.machine = "iPhone15,2"   （机型标识）
+        //     hw.model   = "D73AP"        （板型内部代号）
+        //   快手分别用 sysctl(mib) 与 sysctlbyname 各问一次，
+        //   拿到的 hw.model 一个 iPhone15,2 一个 D73AP → 立刻判定伪造。
+        if (name[0] == CTL_HW && name[1] == HW_MACHINE) {
             if (g_fakeMachineC[0]) {
                 size_t need = strlen(g_fakeMachineC) + 1;
                 if (*oldlenp >= need) { memcpy(oldp, g_fakeMachineC, need); *oldlenp = need; return 0; }
+            }
+        }
+        if (name[0] == CTL_HW && name[1] == HW_MODEL) {
+            const char *bd = g_fakeBoardC[0] ? g_fakeBoardC : g_fakeProductC;
+            if (bd[0]) {
+                size_t need = strlen(bd) + 1;
+                if (*oldlenp >= need) { memcpy(oldp, bd, need); *oldlenp = need; return 0; }
             }
         }
         if (name[0] == CTL_HW && name[1] == HW_MEMSIZE) {
@@ -4774,10 +4789,7 @@ static int kw_sysctlbyname_air(const char *name, void *oldp, size_t *oldlenp,
                                 void *newp, size_t newlen) {
     if (name && oldp && oldlenp) {
         // 飞行模式：返回 0（关闭）
-        if (strcmp(name, "hw.airplanemode") == 0) {
-            int v = 0;
-            if (*oldlenp >= sizeof(int)) { *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
-        }
+                    // ★ v51.6：删除编造键（真机 sysctlbyname 返回 ENOENT，返回 0 即伪造铁证）
     }
     return orig_sysctlbyname_air ? orig_sysctlbyname_air(name, oldp, oldlenp, newp, newlen) : -1;
 }
@@ -5532,10 +5544,7 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
     }
 
     // ---- ④ 飞行模式 ----
-    if (strcmp(name, "hw.airplanemode") == 0) {
-        if (*oldlenp >= sizeof(int)) { int v = 0; *(int *)oldp=v; *oldlenp=sizeof(int); return 0; }
-    }
-
+                // ★ v51.6：删除编造键（真机 sysctlbyname 返回 ENOENT，返回 0 即伪造铁证）
     // ---- ⑤ 内核版本 ----
     if (g_fakeKernelVersion[0]) {
         if (strcmp(name, "kern.version") == 0) {
@@ -5565,6 +5574,70 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
             *(long long *)oldp = g_fakeMemSize; *oldlenp = sizeof(long long); return 0;
         }
     }
+    // ★★ v51.6：补齐真机存在的高频键（原实现缺失 → 直接回落到宿主真值）★★
+    //   快手 / WeaponDeviceInfoCollector 常用这几个做交叉校验。
+    if (strcmp(name, "hw.optional.arm64") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.optional.neon_fp16") == 0 ||
+        strcmp(name, "hw.optional.neon_hpfp") == 0 ||
+        strcmp(name, "hw.optional.FloatingPoint") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.tbfrequency") == 0) {
+        // 真机统一 24MHz
+        if (*oldlenp >= sizeof(long long)) {
+            long long v = 24000000LL; *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0;
+        }
+    }
+    if (strcmp(name, "hw.cpu_brand") == 0) {
+        const char *brand = kw_cpuBrandForSoC(g_fakeSoCId);
+        if (brand && brand[0]) {
+            size_t need = strlen(brand) + 1;
+            if (*oldlenp >= need) { memcpy(oldp, brand, need); *oldlenp = need; return 0; }
+        }
+    }
+    if (strcmp(name, "hw.packages") == 0) {
+        if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
+    }
+    if (strcmp(name, "hw.targettype") == 0) {
+        const char *v = "iPhone";
+        size_t need = strlen(v) + 1;
+        if (*oldlenp >= need) { memcpy(oldp, v, need); *oldlenp = need; return 0; }
+    }
+    if (strcmp(name, "hw.memsize_usable") == 0) {
+        // 真机 = memsize - 约 1.5%（内核/保留）
+        if (*oldlenp >= sizeof(long long) && g_fakeMemSize > 0) {
+            long long v = g_fakeMemSize - (g_fakeMemSize / 64);
+            *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0;
+        }
+    }
+    // perflevel 缓存（真机存在；A15+ 性能核 192KB，能效核 128KB）
+    if (strcmp(name, "hw.perflevel0.l1icachesize") == 0 ||
+        strcmp(name, "hw.perflevel0.l1dcachesize") == 0) {
+        if (*oldlenp >= sizeof(long long)) {
+            long long v = (g_fakeSoCId >= 0x8110) ? 196608LL : 131072LL;
+            *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0;
+        }
+    }
+    if (strcmp(name, "hw.perflevel1.l1icachesize") == 0 ||
+        strcmp(name, "hw.perflevel1.l1dcachesize") == 0) {
+        if (*oldlenp >= sizeof(long long)) {
+            long long v = 131072LL; *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0;
+        }
+    }
+    if (strcmp(name, "hw.perflevel0.l2cachesize") == 0) {
+        if (*oldlenp >= sizeof(long long)) {
+            long long v = (g_fakeSoCId >= 0x8130) ? 16777216LL : 12582912LL;
+            *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0;
+        }
+    }
+    if (strcmp(name, "hw.perflevel1.l2cachesize") == 0) {
+        if (*oldlenp >= sizeof(long long)) {
+            long long v = (g_fakeSoCId >= 0x8110) ? 4194304LL : 4194304LL;
+            *(long long *)oldp = v; *oldlenp = sizeof(long long); return 0;
+        }
+    }
     if (strcmp(name, "hw.pagesize") == 0) {
         if (*oldlenp >= sizeof(int)) { int v = 16384; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
     }
@@ -5592,9 +5665,7 @@ static int kw_apply_ext_sysctlbyname(const char *name, void *oldp, size_t *oldle
     if (strcmp(name, "kern.hv_vmm_present") == 0) {
         if (*oldlenp >= sizeof(int)) { int v = 0; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
     }
-    if (strcmp(name, "hw.optional.arm64e") == 0) {
-        if (*oldlenp >= sizeof(int)) { int v = g_fakeArmE; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
-    }
+                // ★ v51.6：删除编造键（真机 sysctlbyname 返回 ENOENT，返回 0 即伪造铁证）
     if (strcmp(name, "hw.optional.armv8_1_atomics") == 0) {
         if (*oldlenp >= sizeof(int)) { int v = 1; *(int *)oldp = v; *oldlenp = sizeof(int); return 0; }
     }
@@ -6365,13 +6436,24 @@ static kern_return_t kw_task_info_v19(task_name_t target_task, task_flavor_t fla
 }
 
 // ---------- ③ csops（签名校验）----------
-// ★ v47.5 修复 H8：原代码 *flags &= ~0x10000000 想清 CS_DEBUGGED，
-//   但 CS_DEBUGGED 的真实值是 0x00100000，0x10000000 是保留位 ——
-//   清它毫无意义，「被调试」这一位从未被清掉，检测器读 csops 仍看到 debugged。
-//   同时补齐 CS_HARD / CS_SIGNED / CS_RUNTIME，否则风控看组合位会判非官方签名。
-//   sys/codesign.h 在本 SDK 不存在，直接定义并加 SDK 兜底。
+// ★★ v51.5 关键修复：CS_DEBUGGED 常量写错了 ★★
+//
+//   XNU bsd/sys/codesign.h 的真值：
+//     #define CS_VALID        0x00000001
+//     #define CS_SIGNED       0x00000002
+//     #define CS_HARD         0x00000100
+//     #define CS_KILL         0x00004000
+//     #define CS_REQUIRE_LV   0x00002000
+//     #define CS_RUNTIME      0x00010000
+//     #define CS_DEBUGGED     0x10000000      ← 真值
+//
+//   本文件此前写的是 0x00100000（那其实是 CS_REQUIRE_LV 附近的一位），
+//   于是 `*flags &= ~CS_DEBUGGED` 清错了位，
+//   【「被调试」这一位从未被清除】→ 检测器 csops 仍读到 debugged。
+//
+//   顺带：0x00100000 在 XNU 里没有定义，清它毫无意义。
 #ifndef CS_DEBUGGED
-#define CS_DEBUGGED  0x00100000
+#define CS_DEBUGGED  0x10000000
 #endif
 #ifndef CS_RUNTIME
 #define CS_RUNTIME   0x00010000
@@ -6385,6 +6467,13 @@ static kern_return_t kw_task_info_v19(task_name_t target_task, task_flavor_t fla
 #ifndef CS_HARD
 #define CS_HARD      0x00000100
 #endif
+// ★ v51.5：补两个真机常量，并保证 App Store 版这两个位为 0
+#ifndef CS_KILL
+#define CS_KILL      0x00004000
+#endif
+#ifndef CS_REQUIRE_LV
+#define CS_REQUIRE_LV 0x00002000
+#endif
 
 typedef int (*csops_fn)(pid_t, unsigned int, void *, size_t);
 static csops_fn orig_csops = NULL;
@@ -6394,7 +6483,11 @@ static int kw_csops(pid_t pid, unsigned int ops, void *addr, size_t size) {
     if (addr && size >= sizeof(uint32_t) && ops == 0) {
         uint32_t *flags = (uint32_t *)addr;
         if (r == 0) {
-            *flags &= ~((uint32_t)CS_DEBUGGED);          // ★ 真正的 CS_DEBUGGED
+            // ★ v51.5：清 CS_DEBUGGED（真值 0x10000000），
+            //   同时清 CS_KILL / CS_REQUIRE_LV —— 真机 App Store 版这两位是 0。
+            *flags &= ~((uint32_t)CS_DEBUGGED);
+            *flags &= ~((uint32_t)CS_KILL);
+            *flags &= ~((uint32_t)CS_REQUIRE_LV);
             *flags |= ((uint32_t)CS_VALID) | ((uint32_t)CS_HARD)
                     | ((uint32_t)CS_SIGNED) | ((uint32_t)CS_RUNTIME);
             static int logged = 0;
